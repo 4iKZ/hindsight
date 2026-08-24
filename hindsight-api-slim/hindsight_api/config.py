@@ -888,6 +888,23 @@ ENV_DISPOSITION_SKEPTICISM = "HINDSIGHT_API_DISPOSITION_SKEPTICISM"
 ENV_DISPOSITION_LITERALISM = "HINDSIGHT_API_DISPOSITION_LITERALISM"
 ENV_DISPOSITION_EMPATHY = "HINDSIGHT_API_DISPOSITION_EMPATHY"
 
+# Hyper-Extract integration (fire-and-forget hypergraph extraction + GPU
+# semantic normalization on retained content).
+ENV_HYPER_ENABLED = "HINDSIGHT_API_HYPER_ENABLED"
+ENV_HYPER_PG_HOST = "HINDSIGHT_API_HYPER_PG_HOST"
+ENV_HYPER_PG_PORT = "HINDSIGHT_API_HYPER_PG_PORT"
+ENV_HYPER_PG_DBNAME = "HINDSIGHT_API_HYPER_PG_DBNAME"
+ENV_HYPER_PG_USER = "HINDSIGHT_API_HYPER_PG_USER"
+ENV_HYPER_PG_PASSWORD = "HINDSIGHT_API_HYPER_PG_PASSWORD"
+ENV_HYPER_TEMPLATE = "HINDSIGHT_API_HYPER_TEMPLATE"
+ENV_HYPER_GPU_NORM_URL_BASE = "HINDSIGHT_API_HYPER_GPU_NORM_URL_BASE"
+ENV_HYPER_EMBEDDING_DIM = "HINDSIGHT_API_HYPER_EMBEDDING_DIM"
+ENV_HYPER_HYPERGRAPH_JSON_FILE = "HINDSIGHT_API_HYPER_HYPERGRAPH_JSON_FILE"
+ENV_NORM_THRESHOLD_ENTITY = "HINDSIGHT_API_NORM_THRESHOLD_ENTITY"
+ENV_NORM_THRESHOLD_PREDICATE = "HINDSIGHT_API_NORM_THRESHOLD_PREDICATE"
+ENV_NORM_MAX_ALIASES_PER_CANONICAL = "HINDSIGHT_API_NORM_MAX_ALIASES_PER_CANONICAL"
+ENV_NORM_AUTO_INCREASE_THRESHOLD = "HINDSIGHT_API_NORM_AUTO_INCREASE_THRESHOLD"
+
 # Default values
 DEFAULT_DATABASE_BACKEND = "postgresql"
 DEFAULT_DATABASE_URL = "pg0"
@@ -1582,6 +1599,24 @@ DEFAULT_WEBHOOK_EVENT_TYPES = "consolidation.completed"  # Comma-separated; defa
 DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = 30  # How often to poll for pending deliveries
 DEFAULT_WEBHOOK_ALLOWED_HOSTS: list[str] = []  # Empty = public destinations only (private ranges blocked)
 DEFAULT_WEBHOOK_EXPOSE_RESPONSE_BODY = False  # Don't return raw upstream bodies to API callers
+
+# Hyper-Extract integration defaults. The default PG host points at the
+# pg-ripple host (172.19.19.26) where triple_store / semantic_event_store /
+# hypergraph_json_store live.
+DEFAULT_HYPER_ENABLED = True
+DEFAULT_HYPER_PG_HOST = "172.19.19.26"
+DEFAULT_HYPER_PG_PORT = 5432
+DEFAULT_HYPER_PG_DBNAME = "postgres"
+DEFAULT_HYPER_PG_USER = "postgres"
+DEFAULT_HYPER_PG_PASSWORD = None
+DEFAULT_HYPER_TEMPLATE = "general/biography_graph"
+DEFAULT_HYPER_GPU_NORM_URL_BASE = "http://10.0.0.8:8010"
+DEFAULT_HYPER_EMBEDDING_DIM = 1024
+DEFAULT_HYPER_HYPERGRAPH_JSON_FILE = "/tmp/hyper_extract_hypergraph.json"
+DEFAULT_NORM_THRESHOLD_ENTITY = 0.70
+DEFAULT_NORM_THRESHOLD_PREDICATE = 0.70
+DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL = 10
+DEFAULT_NORM_AUTO_INCREASE_THRESHOLD = True
 
 
 class JsonFormatter(logging.Formatter):
@@ -2802,6 +2837,23 @@ class HindsightConfig:
     operation_cleanup_interval_seconds: int = DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS
     maintenance_start_jitter_seconds: int = DEFAULT_MAINTENANCE_START_JITTER_SECONDS
 
+    # Hyper-Extract integration (static, server-level only). Drives the
+    # fire-and-forget hypergraph extraction worker in engine/retain/hyper_extract.py.
+    hyper_enabled: bool = DEFAULT_HYPER_ENABLED
+    hyper_pg_host: str = DEFAULT_HYPER_PG_HOST
+    hyper_pg_port: int = DEFAULT_HYPER_PG_PORT
+    hyper_pg_dbname: str = DEFAULT_HYPER_PG_DBNAME
+    hyper_pg_user: str = DEFAULT_HYPER_PG_USER
+    hyper_pg_password: str | None = DEFAULT_HYPER_PG_PASSWORD
+    hyper_template: str = DEFAULT_HYPER_TEMPLATE
+    hyper_gpu_norm_url_base: str = DEFAULT_HYPER_GPU_NORM_URL_BASE
+    hyper_embedding_dim: int = DEFAULT_HYPER_EMBEDDING_DIM
+    hyper_hypergraph_json_file: str = DEFAULT_HYPER_HYPERGRAPH_JSON_FILE
+    norm_threshold_entity: float = DEFAULT_NORM_THRESHOLD_ENTITY
+    norm_threshold_predicate: float = DEFAULT_NORM_THRESHOLD_PREDICATE
+    norm_max_aliases_per_canonical: int = DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL
+    norm_auto_increase_threshold: bool = DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
+
     # Class-level sets for configuration categorization
 
     # CREDENTIAL_FIELDS: Never exposed via API, never configurable per-tenant/bank
@@ -3107,6 +3159,8 @@ class HindsightConfig:
             "graph_seed_min_similarity",
             "temporal_semantic_min_similarity",
             "semantic_link_min_similarity",
+            "norm_threshold_entity",
+            "norm_threshold_predicate",
         ):
             value = getattr(self, field_name)
             if not 0.0 <= value <= 1.0:
@@ -4161,6 +4215,27 @@ class HindsightConfig:
             extension_passthrough_headers=[
                 h.lower() for h in _parse_str_list(os.getenv(ENV_EXTENSION_PASSTHROUGH_HEADERS, ""))
             ],
+            # Hyper-Extract integration
+            hyper_enabled=_parse_boolean_env(ENV_HYPER_ENABLED, DEFAULT_HYPER_ENABLED),
+            hyper_pg_host=os.getenv(ENV_HYPER_PG_HOST, DEFAULT_HYPER_PG_HOST),
+            hyper_pg_port=int(os.getenv(ENV_HYPER_PG_PORT, str(DEFAULT_HYPER_PG_PORT))),
+            hyper_pg_dbname=os.getenv(ENV_HYPER_PG_DBNAME, DEFAULT_HYPER_PG_DBNAME),
+            hyper_pg_user=os.getenv(ENV_HYPER_PG_USER, DEFAULT_HYPER_PG_USER),
+            hyper_pg_password=os.getenv(ENV_HYPER_PG_PASSWORD) or DEFAULT_HYPER_PG_PASSWORD,
+            hyper_template=os.getenv(ENV_HYPER_TEMPLATE, DEFAULT_HYPER_TEMPLATE),
+            hyper_gpu_norm_url_base=os.getenv(ENV_HYPER_GPU_NORM_URL_BASE, DEFAULT_HYPER_GPU_NORM_URL_BASE),
+            hyper_embedding_dim=int(os.getenv(ENV_HYPER_EMBEDDING_DIM, str(DEFAULT_HYPER_EMBEDDING_DIM))),
+            hyper_hypergraph_json_file=os.getenv(ENV_HYPER_HYPERGRAPH_JSON_FILE, DEFAULT_HYPER_HYPERGRAPH_JSON_FILE),
+            norm_threshold_entity=float(os.getenv(ENV_NORM_THRESHOLD_ENTITY, str(DEFAULT_NORM_THRESHOLD_ENTITY))),
+            norm_threshold_predicate=float(
+                os.getenv(ENV_NORM_THRESHOLD_PREDICATE, str(DEFAULT_NORM_THRESHOLD_PREDICATE))
+            ),
+            norm_max_aliases_per_canonical=int(
+                os.getenv(ENV_NORM_MAX_ALIASES_PER_CANONICAL, str(DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL))
+            ),
+            norm_auto_increase_threshold=_parse_boolean_env(
+                ENV_NORM_AUTO_INCREASE_THRESHOLD, DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
+            ),
         )
         config.validate()
         return config
