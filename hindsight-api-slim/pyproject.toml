@@ -102,6 +102,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+hypergraph = [
+    # Hyper-Extract library for the fire-and-forget hypergraph extraction
+    # worker (engine/retain/hyper_extract.py). Optional: when absent the
+    # worker degrades gracefully and retain is unaffected.
+    "hyperextract>=0.4.0",
+]
 local-ml = [
     # Local ML models for embeddings/reranking
     # 5.0 is the floor: LocalSTEmbeddings calls SentenceTransformer.encode_query()
