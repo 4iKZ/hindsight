@@ -282,6 +282,15 @@ from . import (
     fact_storage,
     link_creation,
 )
+
+# Re-exported for backwards compatibility: hyper_direct.py and
+# test_reconstruct.py import hyper_extract_worker / reconstruct_sentence_from_sem_event
+# from this module.
+from .hyper_extract import (  # noqa: F401
+    dispatch_hyper_extract,
+    hyper_extract_worker,
+    reconstruct_sentence_from_sem_event,
+)
 from .types import (
     CausalRelation,
     ChunkMetadata,
@@ -1399,6 +1408,11 @@ async def retain_batch(
     from ..memories import get_memories
 
     await get_memories().assert_writable(bank_id)
+
+    # Hyper-Extract: fire-and-forget a daemon thread for hypergraph extraction
+    # on the first content item. Kept separate from the retain pipeline —
+    # hyper failures must never affect the retain itself.
+    dispatch_hyper_extract(contents_dicts, bank_id, config)
 
     start_time = time.time()
     total_chars = sum(len(item.get("content", "")) for item in contents_dicts)
