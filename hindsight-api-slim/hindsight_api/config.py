@@ -904,6 +904,7 @@ ENV_NORM_THRESHOLD_ENTITY = "HINDSIGHT_API_NORM_THRESHOLD_ENTITY"
 ENV_NORM_THRESHOLD_PREDICATE = "HINDSIGHT_API_NORM_THRESHOLD_PREDICATE"
 ENV_NORM_MAX_ALIASES_PER_CANONICAL = "HINDSIGHT_API_NORM_MAX_ALIASES_PER_CANONICAL"
 ENV_NORM_AUTO_INCREASE_THRESHOLD = "HINDSIGHT_API_NORM_AUTO_INCREASE_THRESHOLD"
+ENV_NORM_USE_CONTEXT_TOKEN = "HINDSIGHT_API_NORM_USE_CONTEXT_TOKEN"
 
 # Default values
 DEFAULT_DATABASE_BACKEND = "postgresql"
@@ -1617,6 +1618,7 @@ DEFAULT_NORM_THRESHOLD_ENTITY = 0.70
 DEFAULT_NORM_THRESHOLD_PREDICATE = 0.70
 DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL = 10
 DEFAULT_NORM_AUTO_INCREASE_THRESHOLD = True
+DEFAULT_NORM_USE_CONTEXT_TOKEN = True
 
 
 class JsonFormatter(logging.Formatter):
@@ -2853,6 +2855,7 @@ class HindsightConfig:
     norm_threshold_predicate: float = DEFAULT_NORM_THRESHOLD_PREDICATE
     norm_max_aliases_per_canonical: int = DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL
     norm_auto_increase_threshold: bool = DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
+    norm_use_context_token: bool = DEFAULT_NORM_USE_CONTEXT_TOKEN
 
     # Class-level sets for configuration categorization
 
@@ -4235,6 +4238,9 @@ class HindsightConfig:
             ),
             norm_auto_increase_threshold=_parse_boolean_env(
                 ENV_NORM_AUTO_INCREASE_THRESHOLD, DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
+            ),
+            norm_use_context_token=_parse_boolean_env(
+                ENV_NORM_USE_CONTEXT_TOKEN, DEFAULT_NORM_USE_CONTEXT_TOKEN
             ),
         )
         config.validate()
