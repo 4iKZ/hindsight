@@ -59,6 +59,7 @@ class _RuntimeConfig:
     norm_threshold_predicate: float = 0.70
     norm_max_aliases_per_canonical: int = 10
     norm_auto_increase_threshold: bool = True
+    norm_use_context_token: bool = True
     embedding_dim: int = 1024
     hypergraph_json_file: str = "/tmp/hyper_extract_hypergraph.json"
 
@@ -81,6 +82,7 @@ _CONFIG_FIELD_MAP = {
     "norm_threshold_predicate": "norm_threshold_predicate",
     "norm_max_aliases_per_canonical": "norm_max_aliases_per_canonical",
     "norm_auto_increase_threshold": "norm_auto_increase_threshold",
+    "norm_use_context_token": "norm_use_context_token",
 }
 
 
@@ -138,10 +140,39 @@ def _gpu_norm_url(term_type: str) -> str:
     return f"{_runtime.gpu_norm_url_base}/normalize/{endpoint}"
 
 
-def normalize_with_gpu(term: str, term_type: str = "predicate", threshold: float = 0.93, conn=None) -> str:
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?;；\n])")
+
+
+def _sentence_containing(text: str, term: str, max_len: int = 512) -> str:
+    """Return the first local sentence containing ``term`` as context for the
+    /normalize/token endpoint. Returns ``""`` when the term does not literally
+    appear in the text (e.g. LLM-rewritten phrases) so callers fall back to the
+    sentence-level endpoint."""
+    if not text or not term:
+        return ""
+    for part in _SENTENCE_SPLIT_RE.split(text):
+        part = part.strip()
+        if part and term in part:
+            if len(part) > max_len:
+                idx = part.find(term)
+                start = max(0, idx - (max_len - len(term)) // 2)
+                part = part[start : start + max_len]
+            return part
+    return ""
+
+
+def normalize_with_gpu(
+    term: str, term_type: str = "predicate", threshold: float = 0.93, conn=None, context_sentence: str = ""
+) -> str:
     """Dynamic entity/predicate normalization: exact alias lookup first, then
     GPU embedding service for vector similarity, with structural-term guard and
-    alias-count quality gating."""
+    alias-count quality gating.
+
+    When ``context_sentence`` is provided and the term is an entity that
+    literally appears in it, the context-aware /normalize/token endpoint is
+    used (multi-sense disambiguation). Any failure on that path falls back to
+    the sentence-level /normalize/entity endpoint.
+    """
     if not term or not term.strip():
         return term
     if conn is None:
@@ -183,64 +214,113 @@ def normalize_with_gpu(term: str, term_type: str = "predicate", threshold: float
         return term
 
     # 2. GPU service embedding + vector similarity lookup
-    try:
+    def _post_embedding(url: str, payload: dict) -> list | None:
         try:
-            resp = httpx.post(
-                _gpu_norm_url(term_type),
-                json={"term": term, "threshold": threshold},
-                timeout=2.0,
-            )
+            resp = httpx.post(url, json=payload, timeout=2.0)
         except httpx.TimeoutException:
             logger.warning(f"[HyperExtract] GPU timeout for {term}, retrying...")
-            resp = httpx.post(
-                _gpu_norm_url(term_type),
-                json={"term": term, "threshold": threshold},
-                timeout=2.0,
+            resp = httpx.post(url, json=payload, timeout=2.0)
+        if resp.status_code != 200:
+            return None
+        emb = resp.json().get("embedding")
+        return emb if emb else None
+
+    # Entities with a local sentence containing the term route through the
+    # context-aware /normalize/token endpoint (multi-sense disambiguation);
+    # any failure falls back to the sentence-level /normalize/entity endpoint.
+    # TODO(阶段8.1): evaluate /normalize/token for predicate normalization
+    # (generic-verb over-merge risk per A/B separation study; needs predicate
+    # threshold recalibration before enabling).
+    use_token = (
+        _runtime.norm_use_context_token
+        and context_sentence
+        and term_type == "entity"
+        and term in context_sentence
+    )
+    if use_token:
+        emb = _post_embedding(
+            f"{_runtime.gpu_norm_url_base}/normalize/token",
+            {"word": term, "sentence": context_sentence, "threshold": threshold},
+        )
+        if not emb:
+            logger.warning(
+                f"[HyperExtract] /normalize/token failed for {term}, "
+                f"falling back to /normalize/entity"
             )
+            emb = _post_embedding(_gpu_norm_url("entity"), {"term": term, "threshold": threshold})
+    else:
+        emb = _post_embedding(_gpu_norm_url(term_type), {"term": term, "threshold": threshold})
 
-        if resp.status_code == 200:
-            data = resp.json()
-            emb = data.get("embedding")
-            if emb:
+    if not emb:
+        logger.warning(f"[HyperExtract] GPU service returned no embedding for {term}")
+        emb = [0.0] * _runtime.embedding_dim
+
+    try:
+        if emb:
+            cur.execute(
+                f"SELECT canonical_name, 1 - (alias_embedding <=> %s::vector) as similarity "
+                f"FROM {table} "
+                f"WHERE 1 - (alias_embedding <=> %s::vector) > {threshold} "
+                "ORDER BY similarity DESC LIMIT 1",
+                (emb, emb),
+            )
+            row = cur.fetchone()
+            if row:
+                canonical = row[0]
+
+                # Quality gating: check alias count for this canonical.
                 cur.execute(
-                    f"SELECT canonical_name, 1 - (alias_embedding <=> %s::vector) as similarity "
-                    f"FROM {table} "
-                    f"WHERE 1 - (alias_embedding <=> %s::vector) > {threshold} "
-                    "ORDER BY similarity DESC LIMIT 1",
-                    (emb, emb),
+                    f"SELECT count(*) FROM {table} WHERE canonical_name = %s",
+                    (canonical,),
                 )
-                row = cur.fetchone()
-                if row:
-                    canonical = row[0]
+                alias_count_row = cur.fetchone()
+                alias_count = alias_count_row[0] if alias_count_row else 0
 
-                    # Quality gating: check alias count for this canonical.
-                    cur.execute(
-                        f"SELECT count(*) FROM {table} WHERE canonical_name = %s",
-                        (canonical,),
+                # Dynamic threshold: raise the merge bar as a canonical
+                # approaches its alias cap.
+                effective_threshold = threshold
+                if (
+                    _runtime.norm_auto_increase_threshold
+                    and alias_count >= _runtime.norm_max_aliases_per_canonical * 0.8
+                ):
+                    effective_threshold = min(threshold + 0.05, 0.99)
+                    logger.info(
+                        f"[HyperExtract] Auto-increase threshold for canonical '{canonical}': "
+                        f"{threshold} -> {effective_threshold} (aliases={alias_count})"
                     )
-                    alias_count_row = cur.fetchone()
-                    alias_count = alias_count_row[0] if alias_count_row else 0
 
-                    # Dynamic threshold: raise the merge bar as a canonical
-                    # approaches its alias cap.
-                    effective_threshold = threshold
-                    if (
-                        _runtime.norm_auto_increase_threshold
-                        and alias_count >= _runtime.norm_max_aliases_per_canonical * 0.8
-                    ):
-                        effective_threshold = min(threshold + 0.05, 0.99)
+                if alias_count >= _runtime.norm_max_aliases_per_canonical:
+                    # Over cap: refuse merge, insert term as a new canonical.
+                    logger.warning(
+                        f"[HyperExtract] Normalization rejected: canonical '{canonical}' "
+                        f"has {alias_count} aliases "
+                        f"(max={_runtime.norm_max_aliases_per_canonical}). "
+                        f"Term '{term}' will be created as new canonical."
+                    )
+                    cur.execute(
+                        f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
+                        "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
+                        (term, term, emb),
+                    )
+                    conn.commit()
+                    return term
+
+                # Re-check similarity against the effective threshold.
+                if effective_threshold != threshold:
+                    cur.execute(
+                        f"SELECT canonical_name, 1 - (alias_embedding <=> %s::vector) as similarity "
+                        f"FROM {table} "
+                        f"WHERE canonical_name = %s "
+                        f"AND 1 - (alias_embedding <=> %s::vector) > %s "
+                        "ORDER BY similarity DESC LIMIT 1",
+                        (emb, canonical, emb, effective_threshold),
+                    )
+                    row = cur.fetchone()
+                    if not row:
                         logger.info(
-                            f"[HyperExtract] Auto-increase threshold for canonical '{canonical}': "
-                            f"{threshold} -> {effective_threshold} (aliases={alias_count})"
-                        )
-
-                    if alias_count >= _runtime.norm_max_aliases_per_canonical:
-                        # Over cap: refuse merge, insert term as a new canonical.
-                        logger.warning(
-                            f"[HyperExtract] Normalization rejected: canonical '{canonical}' "
-                            f"has {alias_count} aliases "
-                            f"(max={_runtime.norm_max_aliases_per_canonical}). "
-                            f"Term '{term}' will be created as new canonical."
+                            f"[HyperExtract] Normalization rejected by dynamic threshold: "
+                            f"term='{term}', canonical='{canonical}', "
+                            f"effective_threshold={effective_threshold}"
                         )
                         cur.execute(
                             f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
@@ -250,46 +330,21 @@ def normalize_with_gpu(term: str, term_type: str = "predicate", threshold: float
                         conn.commit()
                         return term
 
-                    # Re-check similarity against the effective threshold.
-                    if effective_threshold != threshold:
-                        cur.execute(
-                            f"SELECT canonical_name, 1 - (alias_embedding <=> %s::vector) as similarity "
-                            f"FROM {table} "
-                            f"WHERE canonical_name = %s "
-                            f"AND 1 - (alias_embedding <=> %s::vector) > %s "
-                            "ORDER BY similarity DESC LIMIT 1",
-                            (emb, canonical, emb, effective_threshold),
-                        )
-                        row = cur.fetchone()
-                        if not row:
-                            logger.info(
-                                f"[HyperExtract] Normalization rejected by dynamic threshold: "
-                                f"term='{term}', canonical='{canonical}', "
-                                f"effective_threshold={effective_threshold}"
-                            )
-                            cur.execute(
-                                f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
-                                "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
-                                (term, term, emb),
-                            )
-                            conn.commit()
-                            return term
-
-                    cur.execute(
-                        f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
-                        "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
-                        (canonical, term, emb),
-                    )
-                    conn.commit()
-                    return canonical
-                else:
-                    cur.execute(
-                        f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
-                        "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
-                        (term, term, emb),
-                    )
-                    conn.commit()
-                    return term
+                cur.execute(
+                    f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
+                    "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
+                    (canonical, term, emb),
+                )
+                conn.commit()
+                return canonical
+            else:
+                cur.execute(
+                    f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
+                    "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
+                    (term, term, emb),
+                )
+                conn.commit()
+                return term
     except Exception as e:
         logger.warning(f"[HyperExtract] GPU service call failed: {e}")
         cur.execute(
@@ -553,7 +608,11 @@ def _convert_to_triples(result, text, context, conn=None):
                     if hasattr(edge, "description") and edge.description:
                         ctx["description"] = edge.description
                     participant_norm = normalize_with_gpu(
-                        participant, "entity", conn=conn, threshold=_runtime.norm_threshold_entity
+                        participant,
+                        "entity",
+                        conn=conn,
+                        threshold=_runtime.norm_threshold_entity,
+                        context_sentence=_sentence_containing(text, participant),
                     )
                     triples.append((participant_norm, action, edge_name, ctx))
             else:
@@ -575,10 +634,18 @@ def _convert_to_triples(result, text, context, conn=None):
                     ctx["role"] = ""
                     ctx["weight"] = getattr(edge, "confidence", 1.0)
                     source_norm = normalize_with_gpu(
-                        source, "entity", conn=conn, threshold=_runtime.norm_threshold_entity
+                        source,
+                        "entity",
+                        conn=conn,
+                        threshold=_runtime.norm_threshold_entity,
+                        context_sentence=_sentence_containing(text, source),
                     )
                     target_norm = normalize_with_gpu(
-                        target, "entity", conn=conn, threshold=_runtime.norm_threshold_entity
+                        target,
+                        "entity",
+                        conn=conn,
+                        threshold=_runtime.norm_threshold_entity,
+                        context_sentence=_sentence_containing(text, target),
                     )
                     rel_type_norm = normalize_with_gpu(
                         rel_type, "predicate", conn=conn, threshold=_runtime.norm_threshold_predicate
