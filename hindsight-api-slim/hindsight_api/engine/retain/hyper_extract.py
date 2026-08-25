@@ -135,6 +135,56 @@ def is_structural_term(term: str) -> bool:
     return bool(STRUCTURAL_TERM_RE.match(term.strip()))
 
 
+# Generic-verb guard for predicate normalization. High-frequency Chinese verbs
+# (是/有/属于/包含/导致/...) collapse toward each other in the embedding space
+# (A/B separation study: 是~有 0.768, 属于~包含 0.647 at sentence level; higher
+# with context-token vectors). A single threshold cannot both merge true
+# synonym predicates and keep these apart, so they are refused merge here and
+# stay their own canonical. Only affects merge decisions — the term is still
+# stored as its own canonical.
+GENERIC_VERB_BLOCKLIST = frozenset(
+    {
+        "是",
+        "有",
+        "属于",
+        "包含",
+        "导致",
+        "引发",
+        "发生",
+        "使用",
+        "出现",
+        "存在",
+        "进行",
+        "达到",
+        "成为",
+        "具有",
+        "位于",
+        "来自",
+        "通过",
+        "变成",
+        "需要",
+        "支持",
+        "影响",
+        "调用",
+        "执行",
+        "返回",
+        "运行",
+        "启动",
+        "停止",
+        "连接",
+        "断开",
+    }
+)
+
+
+def is_generic_verb(term: str) -> bool:
+    """Return True when ``term`` is a blocked generic verb (predicate side)
+    that must not be merged with similar predicates."""
+    if not term or not term.strip():
+        return False
+    return term.strip() in GENERIC_VERB_BLOCKLIST
+
+
 def _gpu_norm_url(term_type: str) -> str:
     endpoint = "predicate" if term_type == "predicate" else "entity"
     return f"{_runtime.gpu_norm_url_base}/normalize/{endpoint}"
@@ -197,6 +247,32 @@ def normalize_with_gpu(
                 # but the term stays its own canonical.
                 resp = httpx.post(
                     _gpu_norm_url(term_type),
+                    json={"term": term, "threshold": threshold},
+                    timeout=2.0,
+                )
+                emb = resp.json().get("embedding") if resp.status_code == 200 else None
+            except Exception:
+                emb = None
+            if not emb:
+                emb = [0.0] * _runtime.embedding_dim
+            cur.execute(
+                f"INSERT INTO {table} (canonical_name, alias, alias_embedding) "
+                "VALUES (%s, %s, %s::vector) ON CONFLICT (alias) DO NOTHING",
+                (term, term, emb),
+            )
+            conn.commit()
+        return term
+
+    # 1.6 Generic-verb guard (predicates only): refuse merge for high-frequency
+    #     verbs (是/有/属于/包含/导致/...) that collapse together in embedding
+    #     space. Term stays its own canonical.
+    if term_type == "predicate" and is_generic_verb(term):
+        cur.execute(f"SELECT canonical_name FROM {table} WHERE canonical_name = %s LIMIT 1", (term,))
+        exists_verb = cur.fetchone()
+        if not exists_verb:
+            try:
+                resp = httpx.post(
+                    _gpu_norm_url("predicate"),
                     json={"term": term, "threshold": threshold},
                     timeout=2.0,
                 )
@@ -590,6 +666,12 @@ def _convert_to_triples(result, text, context, conn=None):
                     roles.extend([""] * (len(participants) - len(roles)))
                 edge_name = getattr(edge, "name", "")
                 action = getattr(edge, "action", "") or getattr(edge, "name", "") or hyperedge_type
+                # Normalize the predicate (action) once per edge, before the
+                # participant loop, so triples, ctx["action"], canonical text
+                # and semantic-event dedup all use the same normalized value.
+                action_norm = normalize_with_gpu(
+                    action, "predicate", conn=conn, threshold=_runtime.norm_threshold_predicate
+                )
                 for idx, participant in enumerate(participants):
                     if not participant:
                         continue
@@ -599,7 +681,7 @@ def _convert_to_triples(result, text, context, conn=None):
                     ctx["role"] = roles[idx] if idx < len(roles) else ""
                     ctx["edge_name"] = edge_name
                     ctx["weight"] = getattr(edge, "confidence", 1.0)
-                    ctx["action"] = action
+                    ctx["action"] = action_norm
                     edge_time = getattr(edge, "time", None)
                     if edge_time and ("T" in edge_time or ":" in edge_time):
                         ctx["time"] = edge_time
@@ -614,7 +696,7 @@ def _convert_to_triples(result, text, context, conn=None):
                         threshold=_runtime.norm_threshold_entity,
                         context_sentence=_sentence_containing(text, participant),
                     )
-                    triples.append((participant_norm, action, edge_name, ctx))
+                    triples.append((participant_norm, action_norm, edge_name, ctx))
             else:
                 # Plain binary edge
                 source = getattr(edge, "source", "")
@@ -661,10 +743,13 @@ def _convert_to_triples(result, text, context, conn=None):
         normalized_triples = []
         for sub, pred, obj, ctx in triples:
             sub_norm = normalize_with_gpu(sub, "entity", conn=conn, threshold=_runtime.norm_threshold_entity)
+            pred_norm = normalize_with_gpu(
+                pred, "predicate", conn=conn, threshold=_runtime.norm_threshold_predicate
+            )
             obj_norm = normalize_with_gpu(obj, "entity", conn=conn, threshold=_runtime.norm_threshold_entity)
             ctx["semantic_event_id"] = sem_event_id
             ctx["hyperedge_id"] = occurrence_hyperedge_id
-            normalized_triples.append((sub_norm, pred, obj_norm, ctx))
+            normalized_triples.append((sub_norm, pred_norm, obj_norm, ctx))
         return normalized_triples
 
     return triples
