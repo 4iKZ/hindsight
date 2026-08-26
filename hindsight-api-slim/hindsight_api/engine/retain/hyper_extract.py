@@ -59,7 +59,7 @@ class _RuntimeConfig:
     norm_threshold_predicate: float = 0.70
     norm_max_aliases_per_canonical: int = 10
     norm_auto_increase_threshold: bool = True
-    norm_use_context_token: bool = True
+    norm_use_context_token: bool = False
     embedding_dim: int = 1024
     hypergraph_json_file: str = "/tmp/hyper_extract_hypergraph.json"
 
@@ -220,8 +220,9 @@ def normalize_with_gpu(
 
     When ``context_sentence`` is provided and the term is an entity that
     literally appears in it, the context-aware /normalize/token endpoint is
-    used (multi-sense disambiguation). Any failure on that path falls back to
-    the sentence-level /normalize/entity endpoint.
+    used (multi-sense disambiguation) when ``norm_use_context_token`` is
+    enabled. It is off by default; any failure on that path falls back to the
+    sentence-level /normalize/entity endpoint.
     """
     if not term or not term.strip():
         return term
@@ -301,12 +302,10 @@ def normalize_with_gpu(
         emb = resp.json().get("embedding")
         return emb if emb else None
 
-    # Entities with a local sentence containing the term route through the
-    # context-aware /normalize/token endpoint (multi-sense disambiguation);
-    # any failure falls back to the sentence-level /normalize/entity endpoint.
-    # TODO(阶段8.1): evaluate /normalize/token for predicate normalization
-    # (generic-verb over-merge risk per A/B separation study; needs predicate
-    # threshold recalibration before enabling).
+    # Context-aware word-level routing (config-gated, off by default): when
+    # enabled, entities with a local sentence containing the term go through
+    # the /normalize/token endpoint for multi-sense disambiguation, falling
+    # back to the sentence-level /normalize/entity endpoint on any failure.
     use_token = (
         _runtime.norm_use_context_token
         and context_sentence
