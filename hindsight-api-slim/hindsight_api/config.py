@@ -888,23 +888,16 @@ ENV_DISPOSITION_SKEPTICISM = "HINDSIGHT_API_DISPOSITION_SKEPTICISM"
 ENV_DISPOSITION_LITERALISM = "HINDSIGHT_API_DISPOSITION_LITERALISM"
 ENV_DISPOSITION_EMPATHY = "HINDSIGHT_API_DISPOSITION_EMPATHY"
 
-# Hyper-Extract integration (fire-and-forget hypergraph extraction + GPU
-# semantic normalization on retained content).
-ENV_HYPER_ENABLED = "HINDSIGHT_API_HYPER_ENABLED"
-ENV_HYPER_PG_HOST = "HINDSIGHT_API_HYPER_PG_HOST"
-ENV_HYPER_PG_PORT = "HINDSIGHT_API_HYPER_PG_PORT"
-ENV_HYPER_PG_DBNAME = "HINDSIGHT_API_HYPER_PG_DBNAME"
-ENV_HYPER_PG_USER = "HINDSIGHT_API_HYPER_PG_USER"
-ENV_HYPER_PG_PASSWORD = "HINDSIGHT_API_HYPER_PG_PASSWORD"
-ENV_HYPER_TEMPLATE = "HINDSIGHT_API_HYPER_TEMPLATE"
-ENV_HYPER_GPU_NORM_URL_BASE = "HINDSIGHT_API_HYPER_GPU_NORM_URL_BASE"
-ENV_HYPER_EMBEDDING_DIM = "HINDSIGHT_API_HYPER_EMBEDDING_DIM"
-ENV_HYPER_HYPERGRAPH_JSON_FILE = "HINDSIGHT_API_HYPER_HYPERGRAPH_JSON_FILE"
-ENV_NORM_THRESHOLD_ENTITY = "HINDSIGHT_API_NORM_THRESHOLD_ENTITY"
-ENV_NORM_THRESHOLD_PREDICATE = "HINDSIGHT_API_NORM_THRESHOLD_PREDICATE"
-ENV_NORM_MAX_ALIASES_PER_CANONICAL = "HINDSIGHT_API_NORM_MAX_ALIASES_PER_CANONICAL"
-ENV_NORM_AUTO_INCREASE_THRESHOLD = "HINDSIGHT_API_NORM_AUTO_INCREASE_THRESHOLD"
-ENV_NORM_USE_CONTEXT_TOKEN = "HINDSIGHT_API_NORM_USE_CONTEXT_TOKEN"
+# Noesis event ingestion (requirement 02 §14). Deployment switch + dedicated
+# noesis_core storage; disabled by default so plain Hindsight installs see a
+# strict no-op. The extraction LLM reuses the retain LLM configuration.
+ENV_NOESIS_ENABLED = "HINDSIGHT_API_NOESIS_ENABLED"
+ENV_NOESIS_DATABASE_URL = "HINDSIGHT_API_NOESIS_DATABASE_URL"
+ENV_NOESIS_SCHEMA = "HINDSIGHT_API_NOESIS_SCHEMA"
+ENV_NOESIS_TIMEZONE = "HINDSIGHT_API_NOESIS_TIMEZONE"
+ENV_NOESIS_POOL_MIN_SIZE = "HINDSIGHT_API_NOESIS_POOL_MIN_SIZE"
+ENV_NOESIS_POOL_MAX_SIZE = "HINDSIGHT_API_NOESIS_POOL_MAX_SIZE"
+ENV_NOESIS_COMMAND_TIMEOUT = "HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT"
 
 # Default values
 DEFAULT_DATABASE_BACKEND = "postgresql"
@@ -1601,24 +1594,15 @@ DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = 30  # How often to poll for pen
 DEFAULT_WEBHOOK_ALLOWED_HOSTS: list[str] = []  # Empty = public destinations only (private ranges blocked)
 DEFAULT_WEBHOOK_EXPOSE_RESPONSE_BODY = False  # Don't return raw upstream bodies to API callers
 
-# Hyper-Extract integration defaults. The default PG host points at the
-# pg-ripple host (172.19.19.26) where triple_store / semantic_event_store /
-# hypergraph_json_store live.
-DEFAULT_HYPER_ENABLED = True
-DEFAULT_HYPER_PG_HOST = "172.19.19.26"
-DEFAULT_HYPER_PG_PORT = 5432
-DEFAULT_HYPER_PG_DBNAME = "postgres"
-DEFAULT_HYPER_PG_USER = "postgres"
-DEFAULT_HYPER_PG_PASSWORD = None
-DEFAULT_HYPER_TEMPLATE = "general/biography_graph"
-DEFAULT_HYPER_GPU_NORM_URL_BASE = "http://10.0.0.8:8010"
-DEFAULT_HYPER_EMBEDDING_DIM = 1024
-DEFAULT_HYPER_HYPERGRAPH_JSON_FILE = "/tmp/hyper_extract_hypergraph.json"
-DEFAULT_NORM_THRESHOLD_ENTITY = 0.70
-DEFAULT_NORM_THRESHOLD_PREDICATE = 0.70
-DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL = 10
-DEFAULT_NORM_AUTO_INCREASE_THRESHOLD = True
-DEFAULT_NORM_USE_CONTEXT_TOKEN = False
+# Noesis event ingestion defaults (requirement 02 §14). URL carries no
+# password by default; deployments inject credentials through the environment.
+DEFAULT_NOESIS_ENABLED = False
+DEFAULT_NOESIS_DATABASE_URL = "postgresql://postgres@localhost:5432/noesis"
+DEFAULT_NOESIS_SCHEMA = "noesis_core"
+DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
+DEFAULT_NOESIS_POOL_MIN_SIZE = 1
+DEFAULT_NOESIS_POOL_MAX_SIZE = 5
+DEFAULT_NOESIS_COMMAND_TIMEOUT = 10
 
 
 class JsonFormatter(logging.Formatter):
@@ -2253,6 +2237,25 @@ def _parse_default_bank_template(raw: str | None) -> dict | None:
     return parsed
 
 
+_NOESIS_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def noesis_schema_is_valid(schema: str) -> bool:
+    """True when the configured Noesis schema is a plain SQL identifier (R02-09)."""
+    return bool(isinstance(schema, str) and _NOESIS_IDENTIFIER_RE.fullmatch(schema))
+
+
+def noesis_timezone_is_valid(timezone_name: str) -> bool:
+    """True when the configured Noesis timezone is a usable IANA name (R02-09)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(timezone_name)
+        return True
+    except Exception:
+        return False
+
+
 @dataclass
 class HindsightConfig:
     """Configuration container for Hindsight API."""
@@ -2839,23 +2842,16 @@ class HindsightConfig:
     operation_cleanup_interval_seconds: int = DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS
     maintenance_start_jitter_seconds: int = DEFAULT_MAINTENANCE_START_JITTER_SECONDS
 
-    # Hyper-Extract integration (static, server-level only). Drives the
-    # fire-and-forget hypergraph extraction worker in engine/retain/hyper_extract.py.
-    hyper_enabled: bool = DEFAULT_HYPER_ENABLED
-    hyper_pg_host: str = DEFAULT_HYPER_PG_HOST
-    hyper_pg_port: int = DEFAULT_HYPER_PG_PORT
-    hyper_pg_dbname: str = DEFAULT_HYPER_PG_DBNAME
-    hyper_pg_user: str = DEFAULT_HYPER_PG_USER
-    hyper_pg_password: str | None = DEFAULT_HYPER_PG_PASSWORD
-    hyper_template: str = DEFAULT_HYPER_TEMPLATE
-    hyper_gpu_norm_url_base: str = DEFAULT_HYPER_GPU_NORM_URL_BASE
-    hyper_embedding_dim: int = DEFAULT_HYPER_EMBEDDING_DIM
-    hyper_hypergraph_json_file: str = DEFAULT_HYPER_HYPERGRAPH_JSON_FILE
-    norm_threshold_entity: float = DEFAULT_NORM_THRESHOLD_ENTITY
-    norm_threshold_predicate: float = DEFAULT_NORM_THRESHOLD_PREDICATE
-    norm_max_aliases_per_canonical: int = DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL
-    norm_auto_increase_threshold: bool = DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
-    norm_use_context_token: bool = DEFAULT_NORM_USE_CONTEXT_TOKEN
+    # Noesis event ingestion (static, server-level only). Drives the
+    # event-closure ingestion in engine/retain/noesis_ingest.py. Disabled is a
+    # strict no-op on the retain path — it never falls back to old chains.
+    noesis_enabled: bool = DEFAULT_NOESIS_ENABLED
+    noesis_database_url: str = DEFAULT_NOESIS_DATABASE_URL
+    noesis_schema: str = DEFAULT_NOESIS_SCHEMA
+    noesis_timezone: str = DEFAULT_NOESIS_TIMEZONE
+    noesis_pool_min_size: int = DEFAULT_NOESIS_POOL_MIN_SIZE
+    noesis_pool_max_size: int = DEFAULT_NOESIS_POOL_MAX_SIZE
+    noesis_command_timeout: int = DEFAULT_NOESIS_COMMAND_TIMEOUT
 
     # Class-level sets for configuration categorization
 
@@ -2866,6 +2862,8 @@ class HindsightConfig:
         "retain_llm_api_key",
         "reflect_llm_api_key",
         "consolidation_llm_api_key",
+        # Noesis dedicated database URL may embed credentials (R02-09)
+        "noesis_database_url",
         # LiteLLM Router chains — entries embed api_keys and base_urls
         "llm_litellmrouter_config",
         "retain_llm_litellmrouter_config",
@@ -3111,7 +3109,6 @@ class HindsightConfig:
         """Validate configuration values and raise errors for invalid combinations."""
         # Validate vector_extension
         validate_extension(self.vector_extension)
-
         if self.ann_iterative_scan and self.ann_max_scan_tuples < 1:
             raise ValueError(
                 f"Invalid ann_max_scan_tuples: {self.ann_max_scan_tuples}. Must be >= 1 when "
@@ -3162,8 +3159,6 @@ class HindsightConfig:
             "graph_seed_min_similarity",
             "temporal_semantic_min_similarity",
             "semantic_link_min_similarity",
-            "norm_threshold_entity",
-            "norm_threshold_predicate",
         ):
             value = getattr(self, field_name)
             if not 0.0 <= value <= 1.0:
@@ -3266,6 +3261,33 @@ class HindsightConfig:
         if self.operation_cleanup_batch_size < 1:
             raise ValueError(
                 f"{ENV_OPERATION_CLEANUP_BATCH_SIZE} must be >= 1, got {self.operation_cleanup_batch_size}"
+            )
+
+        # Noesis event ingestion fail-fast validation (requirement 02 §14 / R02-09).
+        # A schema that is not a plain SQL identifier would break quoting at use
+        # time, and the URL/pool knobs are validated up front so a misconfigured
+        # deployment never fails on the first business write.
+        if not noesis_schema_is_valid(self.noesis_schema):
+            raise ValueError(
+                f"Invalid noesis_schema: {self.noesis_schema!r}. Must be a plain SQL identifier "
+                f"(letters, digits, underscore; not starting with a digit)."
+            )
+        if self.noesis_enabled and not self.noesis_database_url.strip():
+            raise ValueError("noesis_database_url must not be empty when Noesis ingestion is enabled")
+        if not noesis_timezone_is_valid(self.noesis_timezone):
+            raise ValueError(
+                f"Invalid noesis_timezone: {self.noesis_timezone!r}. Must be a valid IANA timezone name."
+            )
+        if self.noesis_pool_min_size < 1:
+            raise ValueError(f"noesis_pool_min_size must be >= 1, got {self.noesis_pool_min_size}")
+        if self.noesis_pool_max_size < self.noesis_pool_min_size:
+            raise ValueError(
+                f"noesis_pool_max_size ({self.noesis_pool_max_size}) must be >= noesis_pool_min_size "
+                f"({self.noesis_pool_min_size})"
+            )
+        if self.noesis_command_timeout <= 0:
+            raise ValueError(
+                f"noesis_command_timeout must be > 0, got {self.noesis_command_timeout}"
             )
 
     @classmethod
@@ -4218,30 +4240,14 @@ class HindsightConfig:
             extension_passthrough_headers=[
                 h.lower() for h in _parse_str_list(os.getenv(ENV_EXTENSION_PASSTHROUGH_HEADERS, ""))
             ],
-            # Hyper-Extract integration
-            hyper_enabled=_parse_boolean_env(ENV_HYPER_ENABLED, DEFAULT_HYPER_ENABLED),
-            hyper_pg_host=os.getenv(ENV_HYPER_PG_HOST, DEFAULT_HYPER_PG_HOST),
-            hyper_pg_port=int(os.getenv(ENV_HYPER_PG_PORT, str(DEFAULT_HYPER_PG_PORT))),
-            hyper_pg_dbname=os.getenv(ENV_HYPER_PG_DBNAME, DEFAULT_HYPER_PG_DBNAME),
-            hyper_pg_user=os.getenv(ENV_HYPER_PG_USER, DEFAULT_HYPER_PG_USER),
-            hyper_pg_password=os.getenv(ENV_HYPER_PG_PASSWORD) or DEFAULT_HYPER_PG_PASSWORD,
-            hyper_template=os.getenv(ENV_HYPER_TEMPLATE, DEFAULT_HYPER_TEMPLATE),
-            hyper_gpu_norm_url_base=os.getenv(ENV_HYPER_GPU_NORM_URL_BASE, DEFAULT_HYPER_GPU_NORM_URL_BASE),
-            hyper_embedding_dim=int(os.getenv(ENV_HYPER_EMBEDDING_DIM, str(DEFAULT_HYPER_EMBEDDING_DIM))),
-            hyper_hypergraph_json_file=os.getenv(ENV_HYPER_HYPERGRAPH_JSON_FILE, DEFAULT_HYPER_HYPERGRAPH_JSON_FILE),
-            norm_threshold_entity=float(os.getenv(ENV_NORM_THRESHOLD_ENTITY, str(DEFAULT_NORM_THRESHOLD_ENTITY))),
-            norm_threshold_predicate=float(
-                os.getenv(ENV_NORM_THRESHOLD_PREDICATE, str(DEFAULT_NORM_THRESHOLD_PREDICATE))
-            ),
-            norm_max_aliases_per_canonical=int(
-                os.getenv(ENV_NORM_MAX_ALIASES_PER_CANONICAL, str(DEFAULT_NORM_MAX_ALIASES_PER_CANONICAL))
-            ),
-            norm_auto_increase_threshold=_parse_boolean_env(
-                ENV_NORM_AUTO_INCREASE_THRESHOLD, DEFAULT_NORM_AUTO_INCREASE_THRESHOLD
-            ),
-            norm_use_context_token=_parse_boolean_env(
-                ENV_NORM_USE_CONTEXT_TOKEN, DEFAULT_NORM_USE_CONTEXT_TOKEN
-            ),
+            # Noesis event ingestion
+            noesis_enabled=_parse_boolean_env(ENV_NOESIS_ENABLED, DEFAULT_NOESIS_ENABLED),
+            noesis_database_url=os.getenv(ENV_NOESIS_DATABASE_URL, DEFAULT_NOESIS_DATABASE_URL),
+            noesis_schema=os.getenv(ENV_NOESIS_SCHEMA, DEFAULT_NOESIS_SCHEMA),
+            noesis_timezone=os.getenv(ENV_NOESIS_TIMEZONE, DEFAULT_NOESIS_TIMEZONE),
+            noesis_pool_min_size=int(os.getenv(ENV_NOESIS_POOL_MIN_SIZE, str(DEFAULT_NOESIS_POOL_MIN_SIZE))),
+            noesis_pool_max_size=int(os.getenv(ENV_NOESIS_POOL_MAX_SIZE, str(DEFAULT_NOESIS_POOL_MAX_SIZE))),
+            noesis_command_timeout=int(os.getenv(ENV_NOESIS_COMMAND_TIMEOUT, str(DEFAULT_NOESIS_COMMAND_TIMEOUT))),
         )
         config.validate()
         return config

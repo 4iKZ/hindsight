@@ -4525,6 +4525,15 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception as e:
             logger.warning(f"Error shutting down memories store: {e}")
 
+        # Close the Noesis ingestion pool (no-op when Noesis is disabled or the
+        # pool was never opened). Requirement 02 §14.3.
+        try:
+            from .retain.noesis_ingest import close_noesis_pool
+
+            await close_noesis_pool()
+        except Exception as e:
+            logger.warning(f"Error closing noesis pool: {e}")
+
         # Close HTTP client used for webhook delivery
         if self._http_client is not None:
             await self._http_client.aclose()
@@ -17928,6 +17937,13 @@ class MemoryEngine(MemoryEngineInterface):
                 f"workers that process them. To fold several items into one document, send the "
                 f"batch synchronously (async=false), which processes them sequentially."
             )
+
+        # Persist Noesis's fallback observation time in the queued payload.
+        # Worker retries and process restarts must reuse it; an in-process cache
+        # is neither bounded nor durable enough for ingestion identity.
+        from .retain.noesis_ingest import stamp_noesis_queue_metadata  # noqa: PLC0415
+
+        stamp_noesis_queue_metadata(contents)
 
         # Calculate total token count and determine if we need to split
         total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)

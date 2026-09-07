@@ -93,6 +93,8 @@ async def test_submit_async_retain_includes_document_tags_in_task_payload():
     assert full_payload["type"] == "batch_retain"
     assert full_payload["bank_id"] == "bank-1"
     assert full_payload["contents"] == contents
+    assert full_payload["contents"][0]["_noesis_item_index"] == 0
+    assert full_payload["contents"][0]["_noesis_observed_at"].endswith("Z")
     assert full_payload["document_tags"] == document_tags
     assert full_payload["_tenant_id"] == "tenant-a"
     assert full_payload["_api_key_id"] == "key-a"
@@ -107,6 +109,7 @@ async def test_submit_async_retain_includes_document_tags_in_task_payload():
     assert child_task_payload["document_tags"] == document_tags
     assert child_task_payload["_tenant_id"] == "tenant-a"
     assert child_task_payload["_api_key_id"] == "key-a"
+    assert child_task_payload["contents"][0]["_noesis_observed_at"] == full_payload["contents"][0]["_noesis_observed_at"]
 
 
 @pytest.mark.asyncio

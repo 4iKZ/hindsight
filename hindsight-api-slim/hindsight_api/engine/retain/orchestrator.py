@@ -282,15 +282,7 @@ from . import (
     fact_storage,
     link_creation,
 )
-
-# Re-exported for backwards compatibility: hyper_direct.py and
-# test_reconstruct.py import hyper_extract_worker / reconstruct_sentence_from_sem_event
-# from this module.
-from .hyper_extract import (  # noqa: F401
-    dispatch_hyper_extract,
-    hyper_extract_worker,
-    reconstruct_sentence_from_sem_event,
-)
+from .noesis_ingest import ingest_noesis_batch
 from .types import (
     CausalRelation,
     ChunkMetadata,
@@ -1409,10 +1401,12 @@ async def retain_batch(
 
     await get_memories().assert_writable(bank_id)
 
-    # Hyper-Extract: fire-and-forget a daemon thread for hypergraph extraction
-    # on the first content item. Kept separate from the retain pipeline —
-    # hyper failures must never affect the retain itself.
-    dispatch_hyper_extract(contents_dicts, bank_id, config)
+    # Freeze the caller's original batch position before document grouping or
+    # Memory Defense removes items. Internal metadata survives queued retries
+    # and recursive per-document calls but is never persisted as an atom.
+    for _original_index, _entry in enumerate(contents_dicts):
+        if isinstance(_entry, dict):
+            _entry.setdefault("_noesis_item_index", _original_index)
 
     start_time = time.time()
     total_chars = sum(len(item.get("content", "")) for item in contents_dicts)
@@ -1565,6 +1559,46 @@ async def retain_batch(
             # If nothing survives, return empty results immediately.
             if not contents:
                 return [[] for _ in contents_dicts], TokenUsage(), 0
+
+    # Noesis event ingestion (requirement 02, R02-D1). Runs AFTER Memory Defense
+    # screening/redaction so Noesis and the native retain consume the same
+    # approved content — a redacted/blocked item never produces an unapproved
+    # copy in noesis_core. Multi-document batches recurse per group above; each
+    # group therefore reaches this point exactly once with its own items. Noesis
+    # failures are alerts inside ingest_noesis_batch — they never break the
+    # native retain path.
+    try:
+        # Consume the Memory-Defense-approved RetainContent objects (their
+        # .content was redacted in place above; contents_dicts may be
+        # stripped of "content" by later pipeline steps). This guarantees
+        # Noesis and the native retain share the exact approved text.
+        noesis_items = [
+            {
+                "content": rc.content,
+                "event_date": rc.event_date,
+                "document_id": (
+                    contents_dicts[idx].get("document_id")
+                    if idx < len(contents_dicts) and isinstance(contents_dicts[idx], dict)
+                    else document_id
+                )
+                or document_id,
+                "_noesis_item_index": contents_dicts[idx].get("_noesis_item_index", idx),
+                "_noesis_observed_at": contents_dicts[idx].get("_noesis_observed_at"),
+            }
+            for idx, rc in enumerate(contents)
+        ]
+        await ingest_noesis_batch(
+            noesis_items,
+            bank_id,
+            config,
+            llm_config=llm_config,
+            operation_id=operation_id,
+            document_id=document_id,
+        )
+    except Exception as error:
+        # ingest_noesis_batch is designed to never raise; this guard keeps
+        # an unexpected regression there from failing the native retain.
+        logger.error("noesis ingestion crashed without isolation: %s", type(error).__name__)
 
     # Resolve effective document_id early so both delta and streaming paths
     # can find existing chunks from a prior attempt. On retry, a generated

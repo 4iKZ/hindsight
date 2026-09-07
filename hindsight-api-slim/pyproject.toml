@@ -103,10 +103,9 @@ dependencies = [
 
 [project.optional-dependencies]
 hypergraph = [
-    # Hyper-Extract library for the fire-and-forget hypergraph extraction
-    # worker (engine/retain/hyper_extract.py). Optional: when absent the
-    # worker degrades gracefully and retain is unaffected.
-    "hyperextract>=0.4.0",
+    # Requirement-01 authoritative Noesis contract. Production resolution is
+    # immutable and intentionally has no sibling editable source override.
+    "hyperextract @ git+https://github.com/4iKZ/Hyper-Extract.git@ebbf1078c11420e76968619926bfead85b963d43",
 ]
 local-ml = [
     # Local ML models for embeddings/reranking
@@ -173,6 +172,9 @@ packages = ["hindsight_api"]
 [tool.hatch.build.targets.wheel.sources]
 "hindsight_api" = "hindsight_api"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.sdist]
 include = [
     "hindsight_api/**/*",
@@ -218,6 +220,8 @@ dev = [
     "ruff>=0.8.0",
     "ty>=0.0.1",
     "testcontainers>=4.0.0",
+    # Noesis remote smoke test SSH tunnel (tests/integration/test_noesis_remote_pg.py)
+    "paramiko>=3.5.0",
 ]
 
 [tool.ruff]

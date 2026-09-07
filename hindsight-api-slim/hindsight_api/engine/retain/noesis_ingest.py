@@ -1,0 +1,993 @@
+"""Noesis Stage 1 event ingestion (requirement 02).
+
+Replaces the old hyper_extract directed-graph side path on the Hindsight
+production retain main chain. For every non-empty content item this module:
+
+1. builds a ``NoesisInputItem`` envelope (content + observed_at + identity);
+2. awaits the authoritative ``hyperextract.noesis`` extraction off the event
+   loop (``asyncio.to_thread`` — no daemon threads, no fire-and-forget);
+3. routes the outcome: ``[]`` is a silent success, hyper-extract alerts and
+   hypotheses are recorded in ``noesis_core.ingestion_alerts``, and every fact
+   component is written inside one short transaction to ``noesis_core.events``
+   / ``atoms`` / ``event_atoms`` with idempotent keys;
+4. isolates every failure from the native Hindsight retain: failures become
+   alerts (never exceptions) and the retain pipeline continues untouched.
+
+The Noesis database is a dedicated asyncpg pool against ``noesis`` /
+``noesis_core``; LLM calls and deterministic validation always run outside any
+database transaction. Application startup never executes DDL.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
+
+import asyncpg
+
+try:  # hyperextract is an optional dependency; the public API is imported, never copied
+    from hyperextract.noesis import extract_noesis_components
+except ImportError:  # pragma: no cover - surfaced as a noesis_llm_config_invalid alert
+    extract_noesis_components = None
+
+logger = logging.getLogger(__name__)
+
+CONTRACT_VERSION = "noesis-event-closure-v1"
+DEFAULT_NOESIS_SCHEMA = "noesis_core"
+DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Providers whose native clients cannot be built by Hyper-Extract's
+# create_llm (openai-compatible and anthropic providers can). Anything here
+# yields a noesis_llm_config_invalid alert instead of a silently swapped model.
+_UNSAFE_PROVIDERS = frozenset({"gemini", "vertexai", "bedrock"})
+
+
+class NoesisConfigError(Exception):
+    """The retain LLM / Noesis deployment configuration cannot run extraction."""
+
+
+class SchemaPreflightError(Exception):
+    """A required object is missing from the target schema (R02-06).
+
+    Raised only when the probe can name the exact missing object, so the
+    process is flagged as not-ready instead of silently skipping ingestion.
+    """
+
+
+class NoesisKeyCollision(Exception):
+    """Replay under the same ingestion_key with a different component payload."""
+
+    def __init__(self, *, existing_event_id: int) -> None:
+        super().__init__("ingestion_key replay payload mismatch")
+        self.existing_event_id = existing_event_id
+
+
+@dataclass(frozen=True)
+class NoesisInputItem:
+    """Per-item ingestion envelope (requirement 02 §6)."""
+
+    bank_id: str
+    content: str
+    observed_at: datetime
+    operation_id: str | None
+    document_id: str | None
+    item_index: int
+    source: str = "hindsight_retain"
+
+
+@dataclass(frozen=True)
+class TimeResolution:
+    """Result of the frozen event_time algorithm (requirement 02 §9.2)."""
+
+    event_time: datetime
+    metadata: dict[str, Any] = field(default_factory=dict)
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: canonical JSON, keys, envelopes
+# ---------------------------------------------------------------------------
+
+def validate_schema_identifier(schema: str) -> bool:
+    """Only plain SQL identifiers are accepted for the application schema."""
+    return bool(isinstance(schema, str) and _IDENTIFIER_RE.fullmatch(schema))
+
+
+def canonical_json_bytes(payload: Any) -> bytes:
+    """UTF-8, ensure_ascii=False, sorted keys, no insignificant whitespace."""
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _iso_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def stamp_noesis_queue_metadata(contents: list[dict[str, Any]], *, captured_at: datetime | None = None) -> None:
+    """Freeze retry-sensitive Noesis identity fields in a queued task payload."""
+    observed_at = _iso_utc(captured_at or _utc_now())
+    for index, item in enumerate(contents):
+        item.setdefault("_noesis_item_index", index)
+        if item.get("event_date") is None:
+            item.setdefault("_noesis_observed_at", observed_at)
+
+
+def _content_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def compute_ingestion_key(*, item: NoesisInputItem, component_index: int, component_json: dict) -> str:
+    """Stable fact key — requirement 02 §11.1 (canonical JSON sha256)."""
+    payload = {
+        "contract_version": CONTRACT_VERSION,
+        "bank_id": item.bank_id,
+        "operation_id": item.operation_id,
+        "document_id": item.document_id,
+        "item_index": item.item_index,
+        "observed_at": _iso_utc(item.observed_at),
+        "content_sha256": _content_sha256(item.content),
+        "component_index": component_index,
+        "component_sha256": hashlib.sha256(canonical_json_bytes(component_json)).hexdigest(),
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def compute_alert_dedupe_key(
+    *, item: NoesisInputItem, stage: str, alert_code: str, component_index: int | None
+) -> str:
+    """One open alert per retried input problem — requirement 02 §13.1."""
+    payload = {
+        "bank_id": item.bank_id,
+        "operation_id": item.operation_id,
+        "document_id": item.document_id,
+        "item_index": item.item_index,
+        "observed_at": _iso_utc(item.observed_at),
+        "content_sha256": _content_sha256(item.content),
+        "stage": stage,
+        "alert_code": alert_code,
+        "component_index": component_index if component_index is not None else -1,
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def build_source_envelope(*, item: NoesisInputItem, attempts: int) -> dict[str, Any]:
+    """Safe alert envelope: identity + hashes only, never content or secrets."""
+    return {
+        "bank_id": item.bank_id,
+        "operation_id": item.operation_id,
+        "document_id": item.document_id,
+        "item_index": item.item_index,
+        "content_sha256": _content_sha256(item.content),
+        "attempts": attempts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# event_time resolution (requirement 02 §9.2)
+# ---------------------------------------------------------------------------
+
+def resolve_event_time(*, observed_at: datetime, atoms: Any, analyzer: Any, timezone_name: str) -> TimeResolution:
+    """Frozen algorithm: observed_at + modifier atoms, analyzer injected, no LLM."""
+    try:
+        business_tz = ZoneInfo(timezone_name)
+        reference_naive = observed_at.astimezone(business_tz).replace(tzinfo=None)
+    except Exception:
+        return _time_fallback(observed_at, [], "event_time_parse_failed", "configured noesis timezone is unusable")
+
+    modifiers = [atom.text for atom in atoms if getattr(atom, "role", None) == "modifier"]
+    constraints: list[tuple[datetime, datetime | None, str]] = []
+    for text in modifiers:
+        try:
+            analysis = analyzer.analyze(text, reference_date=reference_naive)
+        except Exception as error:
+            return _time_fallback(
+                observed_at, modifiers, "event_time_parse_failed", f"time analyzer failed: {type(error).__name__}"
+            )
+        constraint = getattr(analysis, "temporal_constraint", None)
+        if constraint is None and getattr(analysis, "start_date", None) is not None:
+            constraint = analysis  # analyzers may hand back the constraint object itself
+        if constraint is None:
+            continue  # not a temporal modifier — leaves event_time untouched
+        constraints.append(
+            (
+                _as_utc(constraint.start_date, business_tz),
+                _as_utc(constraint.end_date, business_tz) if constraint.end_date is not None else None,
+                text,
+            )
+        )
+
+    if not constraints:
+        return TimeResolution(
+            event_time=observed_at,
+            metadata={
+                "strategy": "observed_at",
+                "matched_atoms": [],
+                "start": None,
+                "end": None,
+                "fallback_reason": None,
+            },
+            warnings=[],
+        )
+
+    # Multiple atoms resolving to the same start are one constraint (§9.2 #3).
+    deduped: dict[datetime, tuple[datetime | None, list[str]]] = {}
+    for start, end, text in constraints:
+        entry = deduped.setdefault(start, (end, []))
+        entry[1].append(text)
+
+    if len(deduped) > 1:
+        return _time_fallback(
+            observed_at,
+            [text for _, (_, texts) in deduped.items() for text in texts],
+            "event_time_conflict",
+            "conflicting time constraints resolved from modifier atoms",
+        )
+
+    start, (end, matched) = next(iter(deduped.items()))
+    if start > observed_at + timedelta(hours=24):
+        return _time_fallback(
+            observed_at, matched, "event_time_out_of_range", "resolved event time is more than 24h in the future"
+        )
+    return TimeResolution(
+        event_time=start,
+        metadata={
+            "strategy": "modifier_atom",
+            "matched_atoms": matched,
+            "start": _iso_utc(start),
+            "end": _iso_utc(end),
+            "fallback_reason": None,
+        },
+        warnings=[],
+    )
+
+
+def _time_fallback(observed_at: datetime, matched_atoms: list[str], alert_code: str, reason: str) -> TimeResolution:
+    return TimeResolution(
+        event_time=observed_at,
+        metadata={
+            "strategy": "fallback",
+            "matched_atoms": matched_atoms,
+            "start": None,
+            "end": None,
+            "fallback_reason": reason,
+        },
+        warnings=[
+            {
+                "alert_code": alert_code,
+                "message": reason,
+                "details": {"matched_atoms": matched_atoms, "reason": reason},
+            }
+        ],
+    )
+
+
+def _as_utc(value: datetime, business_tz: ZoneInfo) -> datetime:
+    """Naive parse results are business-timezone wall times; aware ones convert."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=business_tz).astimezone(UTC)
+    return value.astimezone(UTC)
+
+
+# ---------------------------------------------------------------------------
+# Batch normalization (requirement 02 §6)
+# ---------------------------------------------------------------------------
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_observed_at(value: Any) -> datetime:
+    """Mirror orchestrator.parse_datetime_flexible for raw dicts (no import cycle)."""
+    if isinstance(value, datetime):
+        return (value.replace(tzinfo=UTC) if value.tzinfo is None else value).astimezone(UTC)
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed).astimezone(UTC)
+    raise TypeError(f"Expected datetime or string, got {type(value).__name__}")
+
+
+async def normalize_items(
+    contents_dicts: Any,
+    *,
+    bank_id: str,
+    operation_id: str | None,
+    batch_document_id: str | None,
+    clock: Callable[[], datetime] | None = None,
+) -> list[NoesisInputItem]:
+    """One NoesisInputItem per non-empty dict; blank items are silent skips."""
+    items: list[NoesisInputItem] = []
+    for index, entry in enumerate(contents_dicts or []):
+        content = entry.get("content") if isinstance(entry, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            continue
+        observed_at = await _resolve_observed_at(
+            operation_id=operation_id,
+            document_id=entry.get("document_id") or batch_document_id,
+            content=content,
+            explicit=entry.get("event_date", entry.get("_noesis_observed_at")),
+            clock=clock,
+        )
+        items.append(
+            NoesisInputItem(
+                bank_id=bank_id,
+                content=content,
+                observed_at=observed_at,
+                operation_id=operation_id,
+                document_id=entry.get("document_id") or batch_document_id,
+                item_index=(
+                    entry["_noesis_item_index"]
+                    if isinstance(entry.get("_noesis_item_index"), int) and entry["_noesis_item_index"] >= 0
+                    else index
+                ),
+            )
+        )
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Extraction client (requirement 02 §7)
+# ---------------------------------------------------------------------------
+
+def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
+    config = llm_config
+    members = getattr(llm_config, "members", None)
+    if members:
+        config = members[0]  # multi-LLM chains: extraction uses the primary member
+    return (
+        getattr(config, "provider", "") or "",
+        getattr(config, "model", "") or "",
+        getattr(config, "base_url", "") or "",
+        getattr(config, "api_key", "") or "",
+    )
+
+
+def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]:
+    """Reuse the resolved retain LLM through Hyper-Extract's public API only."""
+    provider, model, base_url, api_key = _resolve_llm_spec(llm_config)
+    if not provider or not model:
+        raise NoesisConfigError("noesis extraction requires a resolved retain LLM provider and model")
+    if provider.lower() in _UNSAFE_PROVIDERS:
+        raise NoesisConfigError(f"retain LLM provider '{provider}' cannot be created by the Hyper-Extract client")
+    try:
+        from hyperextract import create_llm as he_create_llm
+        from hyperextract.noesis import create_noesis_extractor
+    except ImportError as error:
+        raise NoesisConfigError(f"hyperextract.noesis is unavailable: {error}") from error
+    client = he_create_llm(
+        {"provider": provider, "model": model, "base_url": base_url},
+        api_key=api_key,
+        temperature=0,
+    )
+    return create_noesis_extractor(llm_client=client)
+
+
+# ---------------------------------------------------------------------------
+# asyncpg pool lifecycle (requirement 02 §14.3)
+# ---------------------------------------------------------------------------
+
+_pool: Any | None = None
+_pool_lock = asyncio.Lock()
+
+async def _resolve_observed_at(
+    *,
+    operation_id: str | None,
+    document_id: str | None,
+    content: str,
+    explicit: Any,
+    clock: Callable[[], datetime] | None = None,
+) -> datetime:
+    """Return the item's observed_at.
+
+    An explicit ``event_date`` (or queue-persisted internal timestamp) wins.
+    Otherwise the caller's batch-boundary clock is used once for this call.
+    """
+    if explicit is not None:
+        return _parse_observed_at(explicit)
+    return (clock or _utc_now)()
+
+
+
+async def _open_pool(config: Any) -> Any:
+    return await asyncpg.create_pool(
+        dsn=config.noesis_database_url,
+        min_size=config.noesis_pool_min_size,
+        max_size=config.noesis_pool_max_size,
+        command_timeout=config.noesis_command_timeout,
+    )
+
+
+async def _get_pool(config: Any) -> Any:
+    global _pool
+    async with _pool_lock:
+        if _pool is None:
+            _pool = await _open_pool(config)
+        elif getattr(_pool, "is_closed", lambda: False)():
+            _pool = await _open_pool(config)
+        return _pool
+
+
+async def close_noesis_pool() -> None:
+    """Idempotent shutdown, called from MemoryEngine.close()."""
+    global _pool
+    async with _pool_lock:
+        if _pool is not None and not getattr(_pool, "is_closed", lambda: False)():
+            try:
+                await _pool.close()
+            except Exception as error:
+                logger.error("noesis pool close failed: %s", type(error).__name__)
+        _pool = None
+        _preflight_cache.clear()
+
+
+async def _acquire_pool(config: Any, pool_factory: Any) -> Any:
+    if pool_factory is not None:
+        return await pool_factory(config)
+    return await _get_pool(config)
+
+
+# ---------------------------------------------------------------------------
+# Read-only schema preflight (requirement 02 §12 / R02-06)
+# ---------------------------------------------------------------------------
+
+_preflight_lock = asyncio.Lock()
+_preflight_cache: dict[tuple[int, str], bool] = {}
+
+# The object identity the application depends on for the four ingest tables.
+_PREFLIGHT_TABLES = ("atoms", "events", "event_atoms", "ingestion_alerts")
+_PREFLIGHT_EXTENSIONS = ("vector", "roaringbitmap", "timescaledb", "pg_ripple")
+_PREFLIGHT_COLUMNS = {
+    "atoms": ("text", "atom_type"),
+    "events": ("event_time", "ingestion_key", "data"),
+    "event_atoms": ("event_id", "occurrence_id", "atom_id", "role_type", "head_occurrence_id"),
+    "ingestion_alerts": ("dedupe_key", "stage", "alert_code", "severity", "message", "details"),
+}
+
+
+async def _run_schema_preflight(pool: Any, schema: str) -> None:
+    """Verify the target schema is usable by this ingestion module.
+
+    Read-only (SELECT on information_schema / pg_catalog). Raises
+    SchemaPreflightError naming the first missing object; never ALTERs, never
+    prints a DSN or password.
+    """
+    async with pool.acquire() as conn:
+        for extension in _PREFLIGHT_EXTENSIONS:
+            installed = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1)", extension
+            )
+            if not installed:
+                raise SchemaPreflightError(f"required extension '{extension}' is not installed")
+
+        schema_exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)", schema
+        )
+        if not schema_exists:
+            raise SchemaPreflightError(f"schema '{schema}' does not exist")
+
+        for table in _PREFLIGHT_TABLES:
+            exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = $1 AND table_name = $2)",
+                schema,
+                table,
+            )
+            if not exists:
+                raise SchemaPreflightError(f"table '{schema}.{table}' does not exist")
+            for column in _PREFLIGHT_COLUMNS[table]:
+                col = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
+                    schema,
+                    table,
+                    column,
+                )
+                if not col:
+                    raise SchemaPreflightError(f"column '{schema}.{table}.{column}' does not exist")
+
+        event_unique = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'events_ingestion_key_time_unique' "
+            "AND conrelid = to_regclass($1))",
+            f"{schema}.events",
+        )
+        if not event_unique:
+            raise SchemaPreflightError(
+                f"unique constraint 'events_ingestion_key_time_unique' missing on '{schema}.events'"
+            )
+
+        dedupe_not_null = await conn.fetchval(
+            "SELECT (is_nullable = 'NO') FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = 'ingestion_alerts' AND column_name = 'dedupe_key'",
+            schema,
+        )
+        dedupe_unique = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'ingestion_alerts_dedupe_key_unique' "
+            "AND conrelid = to_regclass($1))",
+            f"{schema}.ingestion_alerts",
+        )
+        if dedupe_not_null is not True or not dedupe_unique:
+            raise SchemaPreflightError(
+                f"ingestion_alerts.dedupe_key is not NOT NULL+UNIQUE on '{schema}.ingestion_alerts'"
+            )
+
+        atom_pair_unique = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conname = 'atoms_text_type_unique' AND conrelid = to_regclass($1))",
+            f"{schema}.atoms",
+        )
+        if not atom_pair_unique:
+            raise SchemaPreflightError(f"unique constraint 'atoms_text_type_unique' missing on '{schema}.atoms'")
+
+        hypertable = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM timescaledb_information.hypertables "
+            "WHERE hypertable_schema = $1 AND hypertable_name = 'events')",
+            schema,
+        )
+        if not hypertable:
+            raise SchemaPreflightError(f"'{schema}.events' is not a TimescaleDB hypertable")
+
+        retention = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM timescaledb_information.jobs "
+            "WHERE hypertable_schema = $1 AND hypertable_name = 'events' "
+            "AND proc_name = 'policy_retention' AND config->>'drop_after' = '90 days')",
+            schema,
+        )
+        if not retention:
+            raise SchemaPreflightError(f"90-day retention policy missing on '{schema}.events'")
+
+
+async def _ensure_schema_ready(pool: Any, schema: str) -> bool:
+    """Probe once per pool/schema. Unknown failures skip Noesis for this call
+    and are deliberately not cached, so the next batch retries the probe."""
+    cache_key = (id(pool), schema)
+    async with _preflight_lock:
+        if cache_key in _preflight_cache:
+            return _preflight_cache[cache_key]
+        try:
+            await _run_schema_preflight(pool, schema)
+        except SchemaPreflightError as error:
+            logger.error("noesis schema preflight failed (ingestion disabled): %s", error)
+            _preflight_cache[cache_key] = False
+            return False
+        except Exception as error:
+            logger.warning("noesis schema preflight could not be completed: %s", type(error).__name__)
+            return False
+        _preflight_cache[cache_key] = True
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Store layer: the only SQL this module runs
+# ---------------------------------------------------------------------------
+
+def _sql(schema: str, statement: str) -> str:
+    return statement.format(s=schema)
+
+
+_EVENT_INSERT = (
+    "INSERT INTO {s}.events (event_time, ingestion_key, data, source, category) "
+    "VALUES ($1, $2, $3::jsonb, $4, $5) "
+    "ON CONFLICT (ingestion_key, event_time) DO NOTHING RETURNING event_id"
+)
+_EVENT_REPLAY_SELECT = "SELECT event_id, data FROM {s}.events WHERE ingestion_key = $1 AND event_time = $2"
+_ATOM_UPSERT = (
+    "INSERT INTO {s}.atoms (text, atom_type, status, support_count) VALUES ($1, $2, 'active', 1) "
+    "ON CONFLICT (text, atom_type) DO UPDATE SET support_count = {s}.atoms.support_count + 1 "
+    "RETURNING atom_id"
+)
+_EVENT_ATOM_INSERT = (
+    "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, head_occurrence_id) "
+    "VALUES ($1, $2, $3, $4, $5)"
+)
+_ALERT_INSERT = (
+    "INSERT INTO {s}.ingestion_alerts (dedupe_key, event_id, stage, alert_code, severity, message, details, status) "
+    "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'open') "
+    "ON CONFLICT (dedupe_key) DO NOTHING RETURNING alert_id"
+)
+
+
+def _build_event_data(
+    *, item: NoesisInputItem, component_index: int, component_json: dict, time_metadata: dict
+) -> dict:
+    """Canonical envelope — requirement 02 §10.4."""
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "bank_id": item.bank_id,
+        "operation_id": item.operation_id,
+        "document_id": item.document_id,
+        "item_index": item.item_index,
+        "component_index": component_index,
+        "source_text": item.content,
+        "observed_at": _iso_utc(item.observed_at),
+        "time_resolution": time_metadata,
+        "component": component_json,
+    }
+
+
+async def _write_alert(
+    conn: Any,
+    schema: str,
+    *,
+    dedupe_key: str,
+    event_id: int | None,
+    stage: str,
+    alert_code: str,
+    severity: str,
+    message: str,
+    details: dict,
+) -> None:
+    await conn.fetchrow(
+        _sql(schema, _ALERT_INSERT),
+        dedupe_key,
+        event_id,
+        stage,
+        alert_code,
+        severity,
+        message,
+        json.dumps(details, ensure_ascii=False),
+    )
+
+
+async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwargs: Any) -> None:
+    """Independent-connection alert write; failure is logged, never raised."""
+    dedupe_key = compute_alert_dedupe_key(
+        item=item,
+        stage=kwargs["stage"],
+        alert_code=kwargs["alert_code"],
+        component_index=kwargs.pop("component_index", None),
+    )
+    details = kwargs.pop("details")
+    try:
+        async with pool.acquire() as conn:
+            await _write_alert(conn, schema, dedupe_key=dedupe_key, details=details, **kwargs)
+    except Exception as error:
+        logger.error(
+            "noesis alert write failed (%s/%s): %s",
+            kwargs.get("stage"),
+            kwargs.get("alert_code"),
+            type(error).__name__,
+        )
+
+
+async def _ingest_fact(
+    *,
+    pool: Any,
+    schema: str,
+    item: NoesisInputItem,
+    component_index: int,
+    component: Any,
+    component_sha256: str,
+    ingestion_key: str,
+    data: dict,
+    resolution: TimeResolution,
+) -> int:
+    """One fact, one short transaction. Returns the (new or replayed) event_id."""
+    event_time = resolution.event_time
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                _sql(schema, _EVENT_INSERT),
+                event_time,
+                ingestion_key,
+                json.dumps(data, ensure_ascii=False),
+                item.source,
+                "fact",
+            )
+            if row is None:
+                # Replay: verify the stored component hash, never touch atoms.
+                existing = await conn.fetchrow(
+                    _sql(schema, _EVENT_REPLAY_SELECT), ingestion_key, event_time
+                )
+                if existing is None:
+                    raise RuntimeError("event insert conflicted without a replayable row")
+                stored = existing["data"]
+                stored = json.loads(stored) if isinstance(stored, str) else stored
+                stored_sha = hashlib.sha256(canonical_json_bytes(stored["component"])).hexdigest()
+                if stored_sha != component_sha256:
+                    raise NoesisKeyCollision(existing_event_id=existing["event_id"])
+                return existing["event_id"]
+
+            event_id = row["event_id"]
+            for warning in resolution.warnings:
+                await _write_alert(
+                    conn,
+                    schema,
+                    dedupe_key=compute_alert_dedupe_key(
+                        item=item,
+                        stage="event_time",
+                        alert_code=warning["alert_code"],
+                        component_index=component_index,
+                    ),
+                    event_id=event_id,
+                    stage="event_time",
+                    alert_code=warning["alert_code"],
+                    severity="warning",
+                    message=warning["message"],
+                    details=warning["details"],
+                )
+
+            atom_ids: dict[tuple[str, str], int] = {}
+            for atom in component.atoms:
+                literal = (atom.text, atom.type)
+                if literal in atom_ids:
+                    continue  # one support increment per typed literal per event
+                atom_row = await conn.fetchrow(_sql(schema, _ATOM_UPSERT), atom.text, atom.type)
+                atom_ids[literal] = atom_row["atom_id"]
+            for atom in component.atoms:
+                await conn.execute(
+                    _sql(schema, _EVENT_ATOM_INSERT),
+                    event_id,
+                    atom.pos,
+                    atom_ids[(atom.text, atom.type)],
+                    atom.role,
+                    atom.target_occ,
+                )
+            return event_id
+
+
+# ---------------------------------------------------------------------------
+# Routing (requirement 02 §8)
+# ---------------------------------------------------------------------------
+
+async def _route_component(
+    *,
+    pool: Any,
+    schema: str,
+    item: NoesisInputItem,
+    component_index: int,
+    component: Any,
+    resolution: TimeResolution,
+    attempts: int,
+) -> None:
+    component_json = component.model_dump(mode="json")
+    component_sha256 = hashlib.sha256(canonical_json_bytes(component_json)).hexdigest()
+    ingestion_key = compute_ingestion_key(item=item, component_index=component_index, component_json=component_json)
+    data = _build_event_data(
+        item=item, component_index=component_index, component_json=component_json, time_metadata=resolution.metadata
+    )
+    try:
+        await _ingest_fact(
+            pool=pool,
+            schema=schema,
+            item=item,
+            component_index=component_index,
+            component=component,
+            component_sha256=component_sha256,
+            ingestion_key=ingestion_key,
+            data=data,
+            resolution=resolution,
+        )
+    except NoesisKeyCollision as collision:
+        await _write_alert_safe(
+            pool,
+            schema,
+            item,
+            stage="event_ingest",
+            alert_code="ingestion_key_collision",
+            severity="error",
+            message="same ingestion_key replayed with a different component payload",
+            component_index=component_index,
+            event_id=collision.existing_event_id or None,
+            details={
+                **build_source_envelope(item=item, attempts=attempts),
+                "ingestion_key": ingestion_key,
+                "expected_component_sha256": component_sha256,
+            },
+        )
+    except Exception as error:
+        await _write_alert_safe(
+            pool,
+            schema,
+            item,
+            stage="event_ingest",
+            alert_code="event_ingest_failed",
+            severity="error",
+            message=f"noesis fact transaction failed: {type(error).__name__}",
+            component_index=component_index,
+            event_id=None,
+            details={**build_source_envelope(item=item, attempts=attempts), "ingestion_key": ingestion_key},
+        )
+
+
+async def _ingest_item(
+    *,
+    item: NoesisInputItem,
+    schema: str,
+    timezone_name: str,
+    extract_once: Callable[[str], object],
+    analyzer: Any,
+    pool_factory: Any,
+    config: Any,
+) -> None:
+    """Process one item; never raises to the batch loop. Only business/dependency
+    failures are isolated — cancellation propagates. (R02-04)"""
+    try:
+        try:
+            outcome = await asyncio.to_thread(extract_noesis_components, item.content, extract_once=extract_once)
+        except Exception as error:
+            logger.error("noesis extraction crashed for item %s: %s", item.item_index, type(error).__name__)
+            await _item_alert_safe(
+                schema, item, config, pool_factory,
+                stage="hyper_extract", alert_code="extraction_failed", severity="error",
+                message=f"noesis extraction crashed: {type(error).__name__}", component_index=None,
+                event_id=None, details=build_source_envelope(item=item, attempts=0),
+            )
+            return
+
+        # Validate the outcome shape so an unexpected return type surfaces as an
+        # observable per-item failure instead of an AttributeError mid-loop.
+        if not hasattr(outcome, "components") or not hasattr(outcome, "alerts") or not hasattr(outcome, "attempts"):
+            raise NoesisConfigError(f"unexpected extraction outcome type: {type(outcome).__name__}")
+
+        pool = await _acquire_pool(config, pool_factory)
+        envelope = build_source_envelope(item=item, attempts=outcome.attempts)
+        for alert in outcome.alerts:
+            await _write_alert_safe(
+                pool, schema, item, stage=alert.stage, alert_code=alert.alert_code, severity=alert.severity,
+                message=alert.message, component_index=None, event_id=None,
+                details={**envelope, **(alert.details or {})},
+            )
+        for component_index, component in enumerate(outcome.components):
+            if component.utterance_type == "hypothesis":
+                await _write_alert_safe(
+                    pool, schema, item, stage="hypothesis_routing", alert_code="hypothesis_deferred",
+                    severity="info", message="valid hypothesis deferred until rule-ingestion stage",
+                    component_index=component_index, event_id=None,
+                    details={**envelope, "component": component.model_dump(mode="json")},
+                )
+                continue
+            resolution = resolve_event_time(
+                observed_at=item.observed_at,
+                atoms=component.atoms,
+                analyzer=analyzer,
+                timezone_name=timezone_name,
+            )
+            await _route_component(
+                pool=pool, schema=schema, item=item, component_index=component_index,
+                component=component, resolution=resolution, attempts=outcome.attempts,
+            )
+    except asyncio.CancelledError:
+        raise  # never swallow cancellation semantics
+    except Exception as error:
+        logger.error("noesis item %s failed: %s", item.item_index, type(error).__name__)
+        await _item_alert_safe(
+            schema, item, config, pool_factory,
+            stage="event_ingest", alert_code="event_ingest_failed", severity="error",
+            message=f"noesis item processing failed: {type(error).__name__}", component_index=None,
+            event_id=None, details=build_source_envelope(item=item, attempts=0),
+        )
+
+
+async def _item_alert_safe(
+    schema: str,
+    item: NoesisInputItem,
+    config: Any,
+    pool_factory: Any,
+    **kwargs: Any,
+) -> None:
+    """Best-effort alert for a per-item failure; never raises, never recurses."""
+    try:
+        pool = await _acquire_pool(config, pool_factory)
+        await _write_alert_safe(pool, schema, item, **kwargs)
+    except Exception as error:
+        logger.error(
+            "noesis item alert could not be written (%s/%s): %s",
+            kwargs.get("stage"), kwargs.get("alert_code"), type(error).__name__,
+        )
+
+
+async def ingest_noesis_batch(
+    contents_dicts: Any,
+    bank_id: str,
+    config: Any,
+    *,
+    llm_config: Any = None,
+    operation_id: str | None = None,
+    document_id: str | None = None,
+    analyzer: Any = None,
+    extract_once_factory: Callable[[Any], Callable[[str], object]] | None = None,
+    pool_factory: Callable[[Any], Any] | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    """Production entry point: never raises, never blocks the native retain."""
+    if not getattr(config, "noesis_enabled", False):
+        return  # deployment switch: a strict no-op, never a fallback to old chains
+
+    schema = getattr(config, "noesis_schema", DEFAULT_NOESIS_SCHEMA) or DEFAULT_NOESIS_SCHEMA
+    if not validate_schema_identifier(schema):
+        logger.error("noesis ingest skipped: configured noesis_schema %r is not a valid SQL identifier", schema)
+        return
+
+    items = await normalize_items(
+        contents_dicts,
+        bank_id=bank_id,
+        operation_id=operation_id,
+        batch_document_id=document_id,
+        clock=clock,
+    )
+    if not items:
+        return
+
+    # Read-only schema preflight (once per process). If a required object is
+    # missing we disable this process's Noesis ingestion (fail-closed to native
+    # retain); a transient probe failure skips this batch and retries later.
+    # Never ALTERs.
+    try:
+        ready_pool = await _acquire_pool(config, pool_factory)
+    except Exception as error:
+        logger.error("noesis pool unavailable: %s", type(error).__name__)
+        return
+    if not await _ensure_schema_ready(ready_pool, schema):
+        return
+
+    try:
+        extract_once = (extract_once_factory or _production_extract_once_factory)(llm_config)
+    except Exception as error:
+        logger.error("noesis extraction client unavailable: %s", type(error).__name__)
+        try:
+            pool = await _acquire_pool(config, pool_factory)
+            await _write_alert_safe(
+                pool,
+                schema,
+                items[0],
+                stage="noesis_config",
+                alert_code="noesis_llm_config_invalid",
+                severity="error",
+                message=f"noesis extraction LLM configuration is unusable: {type(error).__name__}",
+                component_index=None,
+                event_id=None,
+                details=build_source_envelope(item=items[0], attempts=0),
+            )
+        except Exception as pool_error:
+            logger.error("noesis config alert could not be written: %s", type(pool_error).__name__)
+        return
+
+    try:
+        if analyzer is None:
+            from ..query_analyzer import DateparserQueryAnalyzer
+
+            analyzer = DateparserQueryAnalyzer()
+    except Exception as error:
+        logger.error("noesis analyzer construction failed: %s", type(error).__name__)
+        try:
+            pool = await _acquire_pool(config, pool_factory)
+            await _write_alert_safe(
+                pool,
+                schema,
+                items[0],
+                stage="noesis_config",
+                alert_code="noesis_llm_config_invalid",
+                severity="error",
+                message=f"noesis time analyzer is unusable: {type(error).__name__}",
+                component_index=None,
+                event_id=None,
+                details=build_source_envelope(item=items[0], attempts=0),
+            )
+        except Exception as pool_error:
+            logger.error("noesis analyzer alert could not be written: %s", type(pool_error).__name__)
+        return
+
+    timezone_name = getattr(config, "noesis_timezone", DEFAULT_NOESIS_TIMEZONE) or DEFAULT_NOESIS_TIMEZONE
+    for item in items:
+        await _ingest_item(
+            item=item,
+            schema=schema,
+            timezone_name=timezone_name,
+            extract_once=extract_once,
+            analyzer=analyzer,
+            pool_factory=pool_factory,
+            config=config,
+        )

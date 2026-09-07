@@ -758,6 +758,31 @@ class MemoryItem(BaseModel):
         raise ValueError(f"timestamp must be a string or datetime, got {type(v).__name__}")
 
 
+def _memory_item_to_content_dict(item: MemoryItem) -> dict:
+    """Map the public retain item to the engine payload used by both sync and async paths."""
+    content_dict: dict = {"content": item.content}
+    if item.timestamp == "unset":
+        content_dict["event_date"] = None
+    elif item.timestamp:
+        content_dict["event_date"] = item.timestamp
+    if item.context:
+        content_dict["context"] = item.context
+    if item.metadata:
+        content_dict["metadata"] = item.metadata
+    if item.document_id:
+        content_dict["document_id"] = item.document_id
+    if item.entities:
+        content_dict["entities"] = [{"text": entity.text, "type": entity.type or "CONCEPT"} for entity in item.entities]
+        content_dict["resolve_entities"] = item.resolve_entities
+    if item.tags:
+        content_dict["tags"] = item.tags
+    if item.observation_scopes is not None:
+        content_dict["observation_scopes"] = item.observation_scopes
+    if item.update_mode is not None:
+        content_dict["update_mode"] = item.update_mode
+    return content_dict
+
+
 class RetainRequest(BaseModel):
     """Request model for retain endpoint."""
 
@@ -8134,27 +8159,7 @@ def _register_routes(app: FastAPI):
                 effective = item.strategy
                 if effective not in strategy_groups:
                     strategy_groups[effective] = []
-                content_dict: dict = {"content": item.content}
-                if item.timestamp == "unset":
-                    content_dict["event_date"] = None
-                elif item.timestamp:
-                    content_dict["event_date"] = item.timestamp
-                if item.context:
-                    content_dict["context"] = item.context
-                if item.metadata:
-                    content_dict["metadata"] = item.metadata
-                if item.document_id:
-                    content_dict["document_id"] = item.document_id
-                if item.entities:
-                    content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
-                    content_dict["resolve_entities"] = item.resolve_entities
-                if item.tags:
-                    content_dict["tags"] = item.tags
-                if item.observation_scopes is not None:
-                    content_dict["observation_scopes"] = item.observation_scopes
-                if item.update_mode is not None:
-                    content_dict["update_mode"] = item.update_mode
-                strategy_groups[effective].append(content_dict)
+                strategy_groups[effective].append(_memory_item_to_content_dict(item))
 
             if request.async_:
                 if request.operation_id is not None and len(strategy_groups) != 1:

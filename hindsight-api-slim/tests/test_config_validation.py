@@ -977,3 +977,198 @@ def test_worker_reserved_and_legacy_both_set_is_rejected(monkeypatch):
 
     with pytest.raises(ValueError, match="RESERVED_SLOTS"):
         HindsightConfig.from_env()
+
+
+# ---------------------------------------------------------------------------
+# Noesis ingestion config (requirement 02 §14)
+# ---------------------------------------------------------------------------
+
+_OLD_HYPER_FIELDS = [
+    "hyper_enabled",
+    "hyper_pg_host",
+    "hyper_pg_port",
+    "hyper_pg_dbname",
+    "hyper_pg_user",
+    "hyper_pg_password",
+    "hyper_template",
+    "hyper_gpu_norm_url_base",
+    "hyper_embedding_dim",
+    "hyper_hypergraph_json_file",
+    "norm_threshold_entity",
+    "norm_threshold_predicate",
+    "norm_max_aliases_per_canonical",
+    "norm_auto_increase_threshold",
+    "norm_use_context_token",
+]
+
+_OLD_HYPER_MODULE_CONSTANTS = [
+    "ENV_HYPER_ENABLED",
+    "ENV_HYPER_PG_HOST",
+    "ENV_HYPER_PG_PORT",
+    "ENV_HYPER_PG_DBNAME",
+    "ENV_HYPER_PG_USER",
+    "ENV_HYPER_PG_PASSWORD",
+    "ENV_HYPER_TEMPLATE",
+    "ENV_HYPER_GPU_NORM_URL_BASE",
+    "ENV_HYPER_EMBEDDING_DIM",
+    "ENV_HYPER_HYPERGRAPH_JSON_FILE",
+    "ENV_NORM_THRESHOLD_ENTITY",
+    "ENV_NORM_THRESHOLD_PREDICATE",
+    "ENV_NORM_MAX_ALIASES_PER_CANONICAL",
+    "ENV_NORM_AUTO_INCREASE_THRESHOLD",
+    "ENV_NORM_USE_CONTEXT_TOKEN",
+    "DEFAULT_HYPER_ENABLED",
+    "DEFAULT_HYPER_PG_HOST",
+    "DEFAULT_NORM_THRESHOLD_ENTITY",
+]
+
+
+def test_noesis_config_defaults():
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    assert config.noesis_enabled is False
+    assert config.noesis_database_url == "postgresql://postgres@localhost:5432/noesis"
+    assert config.noesis_schema == "noesis_core"
+    assert config.noesis_timezone == "Asia/Shanghai"
+    assert config.noesis_pool_min_size == 1
+    assert config.noesis_pool_max_size == 5
+    assert config.noesis_command_timeout == 10
+
+
+def test_noesis_config_env_overrides(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ENABLED", "true")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_DATABASE_URL", "postgresql://u@h:5432/noesis")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_SCHEMA", "noesis_core")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_TIMEZONE", "UTC")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "2")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MAX_SIZE", "9")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "30")
+
+    config = HindsightConfig.from_env()
+    assert config.noesis_enabled is True
+    assert config.noesis_database_url == "postgresql://u@h:5432/noesis"
+    assert config.noesis_timezone == "UTC"
+    assert config.noesis_pool_min_size == 2
+    assert config.noesis_pool_max_size == 9
+    assert config.noesis_command_timeout == 30
+
+
+def test_old_hyper_norm_config_removed():
+    from hindsight_api import config as config_module
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    for field in _OLD_HYPER_FIELDS:
+        assert not hasattr(config, field), f"stale config field: {field}"
+    for constant in _OLD_HYPER_MODULE_CONSTANTS:
+        assert not hasattr(config_module, constant), f"stale config constant: {constant}"
+
+
+def test_orchestrator_no_longer_exports_old_symbols():
+    from hindsight_api.engine.retain import orchestrator
+
+    for symbol in ("dispatch_hyper_extract", "hyper_extract_worker", "reconstruct_sentence_from_sem_event"):
+        assert not hasattr(orchestrator, symbol), f"stale orchestrator re-export: {symbol}"
+
+
+def test_schema_identifier_validation():
+    from hindsight_api.engine.retain.noesis_ingest import validate_schema_identifier
+
+    assert validate_schema_identifier("noesis_core") is True
+    for bad in ("bad name", "noesis-core", "", "1core", 'core"; DROP TABLE atoms', "noesis.core", "表"):
+        assert validate_schema_identifier(bad) is False, f"invalid identifier accepted: {bad!r}"
+
+
+# ---------------------------------------------------------------------------
+# R02-09: Noesis config fail-fast validation
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def noesis_env_base(monkeypatch):
+    """Start from a config that enables Noesis with valid values."""
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ENABLED", "true")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_DATABASE_URL", "postgresql://u@h:5432/noesis")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_SCHEMA", "noesis_core")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_TIMEZONE", "Asia/Shanghai")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "1")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MAX_SIZE", "5")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "10")
+
+
+def test_noesis_validate_invalid_schema(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_SCHEMA", "bad name")
+    with pytest.raises(ValueError, match="noesis_schema"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_invalid_timezone(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_TIMEZONE", "Mars/Olympus")
+    with pytest.raises(ValueError, match="noesis_timezone"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_pool_min_below_one(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "0")
+    with pytest.raises(ValueError, match="noesis_pool_min_size"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_pool_max_below_min(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "4")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MAX_SIZE", "2")
+    with pytest.raises(ValueError, match="noesis_pool_max_size"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_timeout_not_positive(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "0")
+    with pytest.raises(ValueError, match="noesis_command_timeout"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_empty_url_when_enabled(noesis_env_base, monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_DATABASE_URL", "")
+    with pytest.raises(ValueError, match="noesis_database_url"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_validate_bounds_ok(noesis_env_base):
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    assert config.noesis_pool_min_size == 1
+    assert config.noesis_pool_max_size == 5
+    assert config.noesis_timezone == "Asia/Shanghai"
+
+
+def test_noesis_config_secret_handling(noesis_env_base, monkeypatch):
+    """The Noesis database URL may embed credentials: it must be flagged as a
+    credential field (never exposed via API/tenant config), and validation
+    errors must not echo the URL/password back."""
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_DATABASE_URL", "postgresql://user:super-secret-pw@host:5432/noesis")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "0")  # force a validation error
+
+    from hindsight_api.config import HindsightConfig
+
+    assert "noesis_database_url" in HindsightConfig._CREDENTIAL_FIELDS
+
+    with pytest.raises(ValueError) as exc_info:
+        HindsightConfig.from_env()
+    message = str(exc_info.value)
+    assert "super-secret-pw" not in message
+    assert "postgresql://user:super-secret-pw" not in message
