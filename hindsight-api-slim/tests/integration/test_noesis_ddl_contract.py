@@ -38,6 +38,7 @@ _EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
 _REPO_ROOT = Path(__file__).resolve().parents[4]  # wxs-noesis/
 _BASE_SQL_PATH = _REPO_ROOT / "docs" / "db" / "noesis-stage1-schema.sql"
 _MIGRATION_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "002-noesis-ingest-idempotency.sql"
+_MIGRATION_003_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
 
 
 def _enabled() -> bool:
@@ -249,6 +250,53 @@ def test_migration_002_repairs_existing_nullable_identity_columns():
             )
             with pytest.raises(RuntimeError, match="ingestion_key.*NULL"):
                 remote.run_file(_MIGRATION_PATH, remap=schema)
+        finally:
+            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    finally:
+        remote.close()
+
+
+@requires_remote
+def test_migration_003_idempotent_creates_identity_profile_gate():
+    """Req-03 §11: migration 003 is idempotent and only creates the single-row
+    model-generation gate — never an index on atoms.embedding (IVFFlat deferred
+    to req-04), never a fabricated profile row, and no changes to fact tables."""
+    schema = f"nz3_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
+    remote = _Remote()
+    try:
+        remote.query(f"CREATE SCHEMA {schema}")
+        try:
+            # Baseline must already expose atoms.embedding VECTOR(1024).
+            remote.run_file(_BASE_SQL_PATH, remap=schema)
+
+            # Run migration 003 twice: both succeed (idempotent).
+            remote.run_file(_MIGRATION_003_PATH, remap=schema)
+            remote.run_file(_MIGRATION_003_PATH, remap=schema)
+
+            # Table exists with the frozen columns.
+            cols = remote.query(
+                f"SELECT column_name FROM information_schema.columns "
+                f"WHERE table_schema='{schema}' AND table_name='embedding_profiles' ORDER BY ordinal_position"
+            )
+            assert cols == [
+                "embedding_kind",
+                "model_name",
+                "model_revision",
+                "dimension",
+                "status",
+                "updated_at",
+            ], cols
+
+            # No profile row fabricated by the migration (online claim only).
+            rows = remote.query(f"SELECT count(*) FROM {schema}.embedding_profiles")
+            assert rows == ["0"], f"migration fabricated a profile row: {rows}"
+
+            # No IVFFlat/HNSW index on atoms.embedding was created.
+            indexes = remote.query(
+                f"SELECT indexdef FROM pg_indexes WHERE schemaname='{schema}' AND tablename='atoms' "
+                f"AND indexdef ILIKE '%embedding%'"
+            )
+            assert indexes == [], f"req-04 index leaked by migration 003: {indexes}"
         finally:
             remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     finally:

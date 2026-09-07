@@ -21,6 +21,7 @@ import os
 import socket
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -32,13 +33,16 @@ pytest.importorskip("asyncpg")
 from hindsight_api.engine.retain import noesis_ingest  # noqa: E402
 from tests.noesis_fakes import (  # noqa: E402
     FakeExtractOnceFactory,
+    FakeIdentityClient,
     golden_fact_recursive,
     golden_fact_time,
+    identity_factory_for,
     llm_config,
     noesis_config,
 )
 
 _EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _remote_enabled() -> bool:
@@ -176,6 +180,9 @@ async def _ingest_two_golden_facts(pool, analyzer):
 
     original = noesis_ingest.extract_noesis_components
     noesis_ingest.extract_noesis_components = fake_extract
+    # A fake identity client keeps this requirement-02 smoke deterministic and
+    # offline: real bge + PG coverage lives in test_noesis_identity_remote.py.
+    # Req-03 embeds every new E/P atom, so atoms.embedding is now non-NULL.
     try:
         await noesis_ingest.ingest_noesis_batch(
             [
@@ -191,6 +198,7 @@ async def _ingest_two_golden_facts(pool, analyzer):
             analyzer=analyzer,
             extract_once_factory=FakeExtractOnceFactory(),
             pool_factory=_async_return(pool),
+            identity_client_factory=identity_factory_for(FakeIdentityClient()),
         )
     finally:
         noesis_ingest.extract_noesis_components = original
@@ -229,6 +237,20 @@ async def test_remote_noesis_smoke():
     conn = None
     try:
         conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
+
+        # 0. Requirement 03: migration 003 is idempotent (CREATE TABLE IF NOT
+        #    EXISTS). Ensured once here so the ingest preflight sees the profile
+        #    gate table. (Its two-run idempotency is asserted separately in
+        #    test_noesis_ddl_contract.py; a second multi-statement CREATE on the
+        #    same connection trips pg_type_typname_nsp_index, so we skip when the
+        #    table already exists.)
+        exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='noesis_core' AND table_name='embedding_profiles')"
+        )
+        if not exists:
+            migration_003 = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
+            await conn.execute(migration_003.read_text(encoding="utf-8"))
 
         # 1. Extensions
         extensions = {
@@ -294,7 +316,11 @@ async def test_remote_noesis_smoke():
         # 揍-fact: 小明 E, 没写 P, 作业 E, 揍 P
         assert set(atoms) == {"昨天E", "妈妈E", "在超市E", "买P", "苹果E", "小明E", "没写P", "作业E", "揍P"}
         assert all(row["support_count"] == 1 for row in atoms.values())  # repeated 小明 → one support
-        assert all(row["embedding"] is None for row in atoms.values())
+        # Requirement 03: every new E/P atom now embeds BGE(pure literal) on
+        # creation (the fake identity client yields a deterministic 1024-dim
+        # vector), so embedding is non-NULL for E/P. Real-bge coverage is in
+        # test_noesis_identity_remote.py; G atoms stay NULL by contract.
+        assert all(row["embedding"] is not None for row in atoms.values()), "E/P atoms must carry a vector"
 
         beat_atoms = await conn.fetch(
             "SELECT occurrence_id, atom_id, anchor_id, role_type, head_occurrence_id "
@@ -340,6 +366,7 @@ async def test_remote_noesis_smoke():
                 analyzer=_YesterdayAnalyzer(),
                 extract_once_factory=FakeExtractOnceFactory(),
                 pool_factory=_async_return(pool),
+                identity_client_factory=identity_factory_for(FakeIdentityClient()),
             )
         finally:
             noesis_ingest._EVENT_ATOM_INSERT = original_sql
