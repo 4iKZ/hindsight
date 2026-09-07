@@ -27,6 +27,11 @@ class _CatalogConn:
 
     async def fetchval(self, sql, *args):
         self.sqls.append(sql)
+        if "format_type" in sql:
+            # Requirement 03 §11: the declared atoms.embedding width. The fake
+            # catalog models the fully migrated VECTOR(1024) column; tests can
+            # override with ``missing={"atoms_embedding_dimension"}``.
+            return "vector(768)" if "atoms_embedding_dimension" in self.missing else "vector(1024)"
         if "pg_extension" in sql:
             return args[0] not in self.missing
         if "timescaledb_information.hypertables" in sql:

@@ -32,6 +32,15 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from ...utils import mask_network_location
+from .noesis_identity_vector import (
+    IdentityConfigInvalid,
+    IdentityEmbedError,
+    IdentityServiceUnavailable,
+    NoesisIdentityClient,
+    is_transport_kind,
+)
+
 try:  # hyperextract is an optional dependency; the public API is imported, never copied
     from hyperextract.noesis import extract_noesis_components
 except ImportError:  # pragma: no cover - surfaced as a noesis_llm_config_invalid alert
@@ -419,8 +428,12 @@ async def _get_pool(config: Any) -> Any:
 
 
 async def close_noesis_pool() -> None:
-    """Idempotent shutdown, called from MemoryEngine.close()."""
-    global _pool
+    """Idempotent shutdown, called from MemoryEngine.close().
+
+    Closes the dedicated asyncpg pool AND the shared identity-vector client
+    (requirement 03 §5.3: one lazy client per process, retired together).
+    """
+    global _pool, _identity_client, _identity_client_key
     async with _pool_lock:
         if _pool is not None and not getattr(_pool, "is_closed", lambda: False)():
             try:
@@ -429,6 +442,14 @@ async def close_noesis_pool() -> None:
                 logger.error("noesis pool close failed: %s", type(error).__name__)
         _pool = None
         _preflight_cache.clear()
+    async with _identity_client_lock:
+        if _identity_client is not None:
+            try:
+                await _identity_client.aclose()
+            except Exception as error:
+                logger.error("noesis identity client close failed: %s", type(error).__name__)
+        _identity_client = None
+        _identity_client_key = None
 
 
 async def _acquire_pool(config: Any, pool_factory: Any) -> Any:
@@ -438,29 +459,318 @@ async def _acquire_pool(config: Any, pool_factory: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Identity-vector client lifecycle (requirement 03 §5.3/§10)
+# ---------------------------------------------------------------------------
+
+_IDENTITY_KIND = "identity"
+
+
+@dataclass(frozen=True)
+class IdentitySpec:
+    """The configured identity-vector generation (model/revision/dimension)."""
+
+    base_url: str
+    model: str
+    revision: str
+    dimension: int
+
+
+def _identity_spec_from_config(config: Any) -> IdentitySpec:
+    from ... import config as hindsight_config
+
+    return IdentitySpec(
+        base_url=(
+            getattr(config, "noesis_embedding_base_url", None)
+            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_BASE_URL
+        ),
+        model=(
+            getattr(config, "noesis_embedding_model", None)
+            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_MODEL
+        ),
+        revision=(
+            getattr(config, "noesis_embedding_revision", None)
+            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_REVISION
+        ),
+        dimension=int(
+            getattr(config, "noesis_embedding_dimension", None)
+            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_DIMENSION
+        ),
+    )
+
+
+_identity_client: Any | None = None
+_identity_client_key: tuple | None = None
+_identity_client_lock = asyncio.Lock()
+
+
+def _identity_client_key_from_config(config: Any, spec: IdentitySpec) -> tuple:
+    return (
+        spec.base_url,
+        spec.model,
+        spec.revision,
+        spec.dimension,
+        float(getattr(config, "noesis_embedding_timeout_seconds", 2.0) or 2.0),
+        int(getattr(config, "noesis_embedding_max_retries", 1) or 0),
+        getattr(config, "noesis_embedding_api_key", "") or "",
+    )
+
+
+async def _get_identity_client(config: Any, spec: IdentitySpec) -> Any:
+    """One shared lazily-built client per process; a config change builds a
+    fresh client (whose /health cache is naturally cold) and retires the old."""
+    global _identity_client, _identity_client_key
+    key = _identity_client_key_from_config(config, spec)
+    async with _identity_client_lock:
+        if _identity_client is None or _identity_client_key != key:
+            stale = _identity_client
+            _identity_client = NoesisIdentityClient(
+                base_url=spec.base_url,
+                model=spec.model,
+                revision=spec.revision,
+                dimension=spec.dimension,
+                timeout_seconds=float(getattr(config, "noesis_embedding_timeout_seconds", 2.0) or 2.0),
+                max_retries=int(getattr(config, "noesis_embedding_max_retries", 1) or 0),
+                api_key=getattr(config, "noesis_embedding_api_key", "") or "",
+            )
+            _identity_client_key = key
+            if stale is not None:
+                try:
+                    await stale.aclose()
+                except Exception as error:
+                    logger.error("stale noesis identity client close failed: %s", type(error).__name__)
+        return _identity_client
+
+
+async def _acquire_identity_client(config: Any, spec: IdentitySpec, factory: Any) -> Any:
+    if factory is not None:
+        return await factory(config)
+    return await _get_identity_client(config, spec)
+
+
+# ---------------------------------------------------------------------------
+# Identity profile gate + pre-transaction vector preparation (requirement 03
+# §8.1/§10.3). Everything here is read-only or a tiny independent claim
+# transaction; bge HTTP happens outside any business transaction.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _ProfileGate:
+    allowed: bool
+    db_profile: dict[str, Any] | None
+
+
+async def _identity_profile_gate(pool: Any, schema: str, spec: IdentitySpec) -> _ProfileGate:
+    """Config, live service, and DB profile must agree before vectors flow.
+
+    Missing profile + zero existing E/P vectors → safe claim (§10.3.1).
+    Missing profile + existing vectors → refuse to guess their source (§10.3.2).
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(_sql(schema, _PROFILE_SELECT), _IDENTITY_KIND)
+        if row is None:
+            non_null = await conn.fetchval(_sql(schema, _EP_NON_NULL_COUNT))
+            if non_null:
+                return _ProfileGate(allowed=False, db_profile=None)
+            async with conn.transaction():
+                await conn.fetchrow(_sql(schema, _PROFILE_CLAIM), spec.model, spec.revision, spec.dimension)
+            row = await conn.fetchrow(_sql(schema, _PROFILE_SELECT), _IDENTITY_KIND)
+            if row is None:  # pragma: no cover - claim is atomic with its conflict rule
+                raise RuntimeError("identity profile claim did not produce a row")
+        profile = {
+            "model_name": row["model_name"],
+            "model_revision": row["model_revision"],
+            "dimension": int(row["dimension"]),
+            "status": row["status"],
+        }
+    matches = (profile["model_name"], profile["model_revision"], profile["dimension"]) == (
+        spec.model,
+        spec.revision,
+        spec.dimension,
+    )
+    return _ProfileGate(allowed=matches and profile["status"] == "ready", db_profile=profile)
+
+
+def _identity_alert(
+    *,
+    stage: str,
+    alert_code: str,
+    severity: str,
+    message: str,
+    spec: IdentitySpec,
+    attempted: int = 0,
+    succeeded: int = 0,
+    failed_atoms: list[dict[str, Any]] | None = None,
+    db_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Aggregate alert payload; never carries credentials, bodies, or stacks."""
+    details: dict[str, Any] = {
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "failed_atoms": list(failed_atoms or []),
+        "model": spec.model,
+        "revision": spec.revision,
+        "base_url": mask_network_location(spec.base_url),
+    }
+    if db_profile is not None:
+        details["db_profile"] = db_profile
+        details["config_profile"] = {"model_name": spec.model, "model_revision": spec.revision, "dimension": spec.dimension}
+    return {"stage": stage, "alert_code": alert_code, "severity": severity, "message": message, "details": details}
+
+
+@dataclass(frozen=True)
+class _VectorPrep:
+    vectors: dict[tuple[str, str], list[float]]
+    alert: dict[str, Any] | None
+
+
+async def _prepare_identity_vectors(
+    *,
+    pool: Any,
+    schema: str,
+    client: Any,
+    spec: IdentitySpec,
+    literals: list[tuple[str, str]],
+) -> _VectorPrep:
+    """Health gate → profile gate → atom-state precheck → sequential bge calls.
+
+    All HTTP and probes happen before (and outside) the fact transaction.
+    """
+    if client is None:
+        return _VectorPrep(
+            {},
+            _identity_alert(
+                stage="identity_vector",
+                alert_code="identity_vector_unavailable",
+                severity="warning",
+                message="identity vector client could not be constructed; literals register with NULL vectors",
+                spec=spec,
+            ),
+        )
+    try:
+        await client.ensure_ready()
+    except IdentityConfigInvalid:
+        return _VectorPrep(
+            {},
+            _identity_alert(
+                stage="noesis_config",
+                alert_code="identity_vector_config_invalid",
+                severity="error",
+                message="identity service /health contradicts the configured generation; vectors disabled for this process",
+                spec=spec,
+            ),
+        )
+    except IdentityServiceUnavailable:
+        return _VectorPrep(
+            {},
+            _identity_alert(
+                stage="identity_vector",
+                alert_code="identity_vector_unavailable",
+                severity="warning",
+                message="identity service /health unreachable; literals register with NULL vectors",
+                spec=spec,
+            ),
+        )
+
+    gate = await _identity_profile_gate(pool, schema, spec)
+    if not gate.allowed:
+        return _VectorPrep(
+            {},
+            _identity_alert(
+                stage="identity_vector",
+                alert_code="identity_vector_profile_mismatch",
+                severity="error",
+                message="database identity profile does not match the running config or is rebuilding; vector writes suspended",
+                spec=spec,
+                db_profile=gate.db_profile,
+            ),
+        )
+
+    vectors: dict[tuple[str, str], list[float]] = {}
+    failed: list[dict[str, Any]] = []
+    if literals:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                _sql(schema, _ATOM_STATE_SELECT),
+                [text for text, _ in literals],
+                [atom_type for _, atom_type in literals],
+            )
+        state = {(row["text"], row["atom_type"]): row for row in rows}
+        need = [literal for literal in literals if not state[literal]["has_embedding"]]
+        for text, atom_type in need:  # sequential by design (§5.3): no GPU fan-out
+            if not text.strip():
+                failed.append({"text": text, "atom_type": atom_type, "error_kind": "empty_literal"})
+                continue
+            try:
+                vectors[(text, atom_type)] = await client.embed(text, atom_type)
+            except IdentityEmbedError as error:
+                failed.append({"text": text, "atom_type": atom_type, "error_kind": error.error_kind})
+    if not failed:
+        return _VectorPrep(vectors, None)
+
+    attempted = len(vectors) + len(failed)
+    if not vectors and all(is_transport_kind(entry["error_kind"]) for entry in failed):
+        return _VectorPrep(
+            vectors,
+            _identity_alert(
+                stage="identity_vector",
+                alert_code="identity_vector_unavailable",
+                severity="warning",
+                message="identity service unreachable for the whole batch; literals register with NULL vectors",
+                spec=spec,
+                attempted=attempted,
+                succeeded=len(vectors),
+                failed_atoms=failed,
+            ),
+        )
+    return _VectorPrep(
+        vectors,
+        _identity_alert(
+            stage="identity_vector",
+            alert_code="identity_vector_failed",
+            severity="warning",
+            message="some literals could not be embedded; they register with NULL vectors and self-heal on recurrence",
+            spec=spec,
+            attempted=attempted,
+            succeeded=len(vectors),
+            failed_atoms=failed,
+        ),
+    )
+
+
+def _vector_literal(vector: Any) -> str:
+    """asyncpg speaks to pgvector through an explicit ``$3::vector`` cast of a
+    text literal; ``repr(float(...))`` keeps full precision and valid syntax."""
+    return "[" + ",".join(repr(float(component)) for component in vector) + "]"
+
+
+# ---------------------------------------------------------------------------
 # Read-only schema preflight (requirement 02 §12 / R02-06)
 # ---------------------------------------------------------------------------
 
 _preflight_lock = asyncio.Lock()
 _preflight_cache: dict[tuple[int, str], bool] = {}
 
-# The object identity the application depends on for the four ingest tables.
-_PREFLIGHT_TABLES = ("atoms", "events", "event_atoms", "ingestion_alerts")
+# The object identity the application depends on for the four ingest tables
+# plus the requirement 03 identity profile gate.
+_PREFLIGHT_TABLES = ("atoms", "events", "event_atoms", "ingestion_alerts", "embedding_profiles")
 _PREFLIGHT_EXTENSIONS = ("vector", "roaringbitmap", "timescaledb", "pg_ripple")
 _PREFLIGHT_COLUMNS = {
-    "atoms": ("text", "atom_type"),
+    "atoms": ("text", "atom_type", "embedding"),
     "events": ("event_time", "ingestion_key", "data"),
     "event_atoms": ("event_id", "occurrence_id", "atom_id", "role_type", "head_occurrence_id"),
     "ingestion_alerts": ("dedupe_key", "stage", "alert_code", "severity", "message", "details"),
+    "embedding_profiles": ("embedding_kind", "model_name", "model_revision", "dimension", "status", "updated_at"),
 }
 
 
-async def _run_schema_preflight(pool: Any, schema: str) -> None:
+async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int = 1024) -> None:
     """Verify the target schema is usable by this ingestion module.
 
     Read-only (SELECT on information_schema / pg_catalog). Raises
     SchemaPreflightError naming the first missing object; never ALTERs, never
-    prints a DSN or password.
+    prints a DSN or password. ``expected_dimension`` pins the declared width
+    of atoms.embedding (requirement 03 §11), verified against the live
+    catalog as ``vector(N)`` (format confirmed against the remote database).
     """
     async with pool.acquire() as conn:
         for extension in _PREFLIGHT_EXTENSIONS:
@@ -548,16 +858,29 @@ async def _run_schema_preflight(pool: Any, schema: str) -> None:
         if not retention:
             raise SchemaPreflightError(f"90-day retention policy missing on '{schema}.events'")
 
+        # Requirement 03 §11: the declared embedding width must match the
+        # configured generation, so a wrong-dimension schema can never be
+        # silently written.
+        declared = await conn.fetchval(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+            "WHERE a.attrelid = to_regclass($1) AND a.attname = 'embedding'",
+            f"{schema}.atoms",
+        )
+        if declared != f"vector({expected_dimension})":
+            raise SchemaPreflightError(
+                f"'{schema}.atoms.embedding' declares {declared!r}, expected 'vector({expected_dimension})'"
+            )
 
-async def _ensure_schema_ready(pool: Any, schema: str) -> bool:
+
+async def _ensure_schema_ready(pool: Any, schema: str, expected_dimension: int = 1024) -> bool:
     """Probe once per pool/schema. Unknown failures skip Noesis for this call
     and are deliberately not cached, so the next batch retries the probe."""
-    cache_key = (id(pool), schema)
+    cache_key = (id(pool), schema, expected_dimension)
     async with _preflight_lock:
         if cache_key in _preflight_cache:
             return _preflight_cache[cache_key]
         try:
-            await _run_schema_preflight(pool, schema)
+            await _run_schema_preflight(pool, schema, expected_dimension=expected_dimension)
         except SchemaPreflightError as error:
             logger.error("noesis schema preflight failed (ingestion disabled): %s", error)
             _preflight_cache[cache_key] = False
@@ -583,11 +906,42 @@ _EVENT_INSERT = (
     "ON CONFLICT (ingestion_key, event_time) DO NOTHING RETURNING event_id"
 )
 _EVENT_REPLAY_SELECT = "SELECT event_id, data FROM {s}.events WHERE ingestion_key = $1 AND event_time = $2"
+# Requirement 03 §8.3: the only write statement this requirement changes.
+# New rows carry the freshly computed vector (or NULL on bge failure); an
+# existing non-NULL embedding is never overwritten; a NULL embedding is
+# backfilled (self-heal) when a vector arrives.
 _ATOM_UPSERT = (
-    "INSERT INTO {s}.atoms (text, atom_type, status, support_count) VALUES ($1, $2, 'active', 1) "
-    "ON CONFLICT (text, atom_type) DO UPDATE SET support_count = {s}.atoms.support_count + 1 "
+    "INSERT INTO {s}.atoms (text, atom_type, embedding, status, support_count) "
+    "VALUES ($1, $2, $3::vector, 'active', 1) "
+    "ON CONFLICT (text, atom_type) DO UPDATE SET "
+    "support_count = {s}.atoms.support_count + 1, "
+    "embedding = CASE "
+    "WHEN {s}.atoms.embedding IS NULL AND EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding "
+    "ELSE {s}.atoms.embedding END "
     "RETURNING atom_id"
 )
+# Requirement 03 §8.2: pre-transaction read-only atom state probe.
+_ATOM_STATE_SELECT = (
+    "SELECT t.text, t.atom_type, "
+    "(a.atom_id IS NOT NULL) AS atom_exists, (a.embedding IS NOT NULL) AS has_embedding "
+    "FROM unnest($1::text[], $2::text[]) AS t(text, atom_type) "
+    "LEFT JOIN {s}.atoms a ON a.text = t.text AND a.atom_type = t.atom_type"
+)
+# Requirement 03 §10.3: the single-row identity model-generation gate.
+_PROFILE_SELECT = (
+    "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles "
+    "WHERE embedding_kind = $1"
+)
+_PROFILE_WRITE_GUARD = (
+    "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles "
+    "WHERE embedding_kind = $1 FOR SHARE"
+)
+_PROFILE_CLAIM = (
+    "INSERT INTO {s}.embedding_profiles (embedding_kind, model_name, model_revision, dimension, status) "
+    "VALUES ('identity', $1, $2, $3, 'ready') "
+    "ON CONFLICT (embedding_kind) DO NOTHING RETURNING embedding_kind"
+)
+_EP_NON_NULL_COUNT = "SELECT count(*) FROM {s}.atoms WHERE embedding IS NOT NULL AND atom_type IN ('E', 'P')"
 _EVENT_ATOM_INSERT = (
     "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, head_occurrence_id) "
     "VALUES ($1, $2, $3, $4, $5)"
@@ -662,6 +1016,16 @@ async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwa
         )
 
 
+def _replay_event_id(existing: Any, component_sha256: str) -> int:
+    """Verify a replayed event's stored component hash; fail closed on drift."""
+    stored = existing["data"]
+    stored = json.loads(stored) if isinstance(stored, str) else stored
+    stored_sha = hashlib.sha256(canonical_json_bytes(stored["component"])).hexdigest()
+    if stored_sha != component_sha256:
+        raise NoesisKeyCollision(existing_event_id=existing["event_id"])
+    return existing["event_id"]
+
+
 async def _ingest_fact(
     *,
     pool: Any,
@@ -673,11 +1037,88 @@ async def _ingest_fact(
     ingestion_key: str,
     data: dict,
     resolution: TimeResolution,
-) -> int:
-    """One fact, one short transaction. Returns the (new or replayed) event_id."""
+    identity_client: Any,
+    identity_spec: IdentitySpec,
+) -> tuple[int, dict[str, Any] | None]:
+    """One fact, one short transaction.
+
+    Returns ``(event_id, vector_alert)`` where ``vector_alert`` is the
+    post-commit aggregate identity-vector alert payload (or None). Requirement
+    03 §8.1 order: committed-replay fast path → health/profile gates → atom
+    precheck → sequential bge (all outside the transaction) → the requirement
+    02 short transaction with the vector-carrying upsert.
+    """
     event_time = resolution.event_time
+
+    # 1. Committed-replay fast path (§8.5): zero bge, zero atom precheck,
+    #    zero atom writes. The in-transaction ON CONFLICT path below remains
+    #    the final arbiter for first-time concurrent duplicates.
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(_sql(schema, _EVENT_REPLAY_SELECT), ingestion_key, event_time)
+    if existing is not None:
+        return _replay_event_id(existing, component_sha256), None
+
+    # 2. Ordered unique E/P literals of this component (G never gets a vector).
+    literals: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for atom in component.atoms:
+        literal = (atom.text, atom.type)
+        if atom.type in ("E", "P") and literal not in seen:
+            seen.add(literal)
+            literals.append(literal)
+
+    # 3-5. Health gate, profile gate, atom-state precheck, sequential bge.
+    prep = await _prepare_identity_vectors(
+        pool=pool, schema=schema, client=identity_client, spec=identity_spec, literals=literals
+    )
+
+    # 6. The requirement 02 short transaction (unchanged boundaries).
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Fence the transaction against a rebuild that starts after the
+            # transaction-external profile check and BGE calls. FOR SHARE is
+            # held until commit, so a rebuild status UPDATE must wait. If the
+            # rebuild/new generation already won, discard the prepared vectors
+            # while preserving the fact-only degradation path.
+            transaction_vectors = prep.vectors
+            transaction_alert = prep.alert
+            if transaction_vectors:
+                profile_row = await conn.fetchrow(
+                    _sql(schema, _PROFILE_WRITE_GUARD), _IDENTITY_KIND
+                )
+                db_profile = None
+                if profile_row is not None:
+                    db_profile = {
+                        "model_name": profile_row["model_name"],
+                        "model_revision": profile_row["model_revision"],
+                        "dimension": int(profile_row["dimension"]),
+                        "status": profile_row["status"],
+                    }
+                expected = (
+                    identity_spec.model,
+                    identity_spec.revision,
+                    identity_spec.dimension,
+                    "ready",
+                )
+                actual = None if db_profile is None else (
+                    db_profile["model_name"],
+                    db_profile["model_revision"],
+                    db_profile["dimension"],
+                    db_profile["status"],
+                )
+                if actual != expected:
+                    transaction_vectors = {}
+                    transaction_alert = _identity_alert(
+                        stage="identity_vector",
+                        alert_code="identity_vector_profile_mismatch",
+                        severity="error",
+                        message=(
+                            "database identity profile changed before commit; "
+                            "prepared vectors were discarded"
+                        ),
+                        spec=identity_spec,
+                        db_profile=db_profile,
+                    )
             row = await conn.fetchrow(
                 _sql(schema, _EVENT_INSERT),
                 event_time,
@@ -687,18 +1128,14 @@ async def _ingest_fact(
                 "fact",
             )
             if row is None:
-                # Replay: verify the stored component hash, never touch atoms.
+                # Concurrent first-time replay: verify and return without
+                # touching atoms or vectors (§8.5).
                 existing = await conn.fetchrow(
                     _sql(schema, _EVENT_REPLAY_SELECT), ingestion_key, event_time
                 )
                 if existing is None:
                     raise RuntimeError("event insert conflicted without a replayable row")
-                stored = existing["data"]
-                stored = json.loads(stored) if isinstance(stored, str) else stored
-                stored_sha = hashlib.sha256(canonical_json_bytes(stored["component"])).hexdigest()
-                if stored_sha != component_sha256:
-                    raise NoesisKeyCollision(existing_event_id=existing["event_id"])
-                return existing["event_id"]
+                return _replay_event_id(existing, component_sha256), None
 
             event_id = row["event_id"]
             for warning in resolution.warnings:
@@ -724,7 +1161,13 @@ async def _ingest_fact(
                 literal = (atom.text, atom.type)
                 if literal in atom_ids:
                     continue  # one support increment per typed literal per event
-                atom_row = await conn.fetchrow(_sql(schema, _ATOM_UPSERT), atom.text, atom.type)
+                vector = transaction_vectors.get(literal)
+                atom_row = await conn.fetchrow(
+                    _sql(schema, _ATOM_UPSERT),
+                    atom.text,
+                    atom.type,
+                    _vector_literal(vector) if vector is not None else None,
+                )
                 atom_ids[literal] = atom_row["atom_id"]
             for atom in component.atoms:
                 await conn.execute(
@@ -735,7 +1178,7 @@ async def _ingest_fact(
                     atom.role,
                     atom.target_occ,
                 )
-            return event_id
+            return event_id, transaction_alert
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +1194,8 @@ async def _route_component(
     component: Any,
     resolution: TimeResolution,
     attempts: int,
+    identity_client: Any,
+    identity_spec: IdentitySpec,
 ) -> None:
     component_json = component.model_dump(mode="json")
     component_sha256 = hashlib.sha256(canonical_json_bytes(component_json)).hexdigest()
@@ -759,7 +1204,7 @@ async def _route_component(
         item=item, component_index=component_index, component_json=component_json, time_metadata=resolution.metadata
     )
     try:
-        await _ingest_fact(
+        event_id, vector_alert = await _ingest_fact(
             pool=pool,
             schema=schema,
             item=item,
@@ -769,6 +1214,8 @@ async def _route_component(
             ingestion_key=ingestion_key,
             data=data,
             resolution=resolution,
+            identity_client=identity_client,
+            identity_spec=identity_spec,
         )
     except NoesisKeyCollision as collision:
         await _write_alert_safe(
@@ -800,6 +1247,22 @@ async def _route_component(
             event_id=None,
             details={**build_source_envelope(item=item, attempts=attempts), "ingestion_key": ingestion_key},
         )
+    else:
+        # 7. Post-commit aggregate identity-vector alert (§8.1). The fact is
+        # already committed; this alert's own failure only logs (§3.2.10).
+        if vector_alert is not None:
+            await _write_alert_safe(
+                pool,
+                schema,
+                item,
+                stage=vector_alert["stage"],
+                alert_code=vector_alert["alert_code"],
+                severity=vector_alert["severity"],
+                message=vector_alert["message"],
+                component_index=component_index,
+                event_id=event_id,
+                details={**build_source_envelope(item=item, attempts=attempts), **vector_alert["details"]},
+            )
 
 
 async def _ingest_item(
@@ -811,6 +1274,8 @@ async def _ingest_item(
     analyzer: Any,
     pool_factory: Any,
     config: Any,
+    identity_client: Any,
+    identity_spec: IdentitySpec,
 ) -> None:
     """Process one item; never raises to the batch loop. Only business/dependency
     failures are isolated — cancellation propagates. (R02-04)"""
@@ -858,6 +1323,7 @@ async def _ingest_item(
             await _route_component(
                 pool=pool, schema=schema, item=item, component_index=component_index,
                 component=component, resolution=resolution, attempts=outcome.attempts,
+                identity_client=identity_client, identity_spec=identity_spec,
             )
     except asyncio.CancelledError:
         raise  # never swallow cancellation semantics
@@ -901,6 +1367,7 @@ async def ingest_noesis_batch(
     extract_once_factory: Callable[[Any], Callable[[str], object]] | None = None,
     pool_factory: Callable[[Any], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
+    identity_client_factory: Callable[[Any], Any] | None = None,
 ) -> None:
     """Production entry point: never raises, never blocks the native retain."""
     if not getattr(config, "noesis_enabled", False):
@@ -921,16 +1388,19 @@ async def ingest_noesis_batch(
     if not items:
         return
 
+    identity_spec = _identity_spec_from_config(config)
+
     # Read-only schema preflight (once per process). If a required object is
     # missing we disable this process's Noesis ingestion (fail-closed to native
     # retain); a transient probe failure skips this batch and retries later.
-    # Never ALTERs.
+    # Never ALTERs. The declared atoms.embedding width must match the
+    # configured identity generation (requirement 03 §11).
     try:
         ready_pool = await _acquire_pool(config, pool_factory)
     except Exception as error:
         logger.error("noesis pool unavailable: %s", type(error).__name__)
         return
-    if not await _ensure_schema_ready(ready_pool, schema):
+    if not await _ensure_schema_ready(ready_pool, schema, expected_dimension=identity_spec.dimension):
         return
 
     try:
@@ -980,6 +1450,16 @@ async def ingest_noesis_batch(
             logger.error("noesis analyzer alert could not be written: %s", type(pool_error).__name__)
         return
 
+    # One shared identity-vector client for the whole batch (lazy singleton in
+    # production; factory seam in tests). Construction is trivial and must
+    # never block retain — a failure here degrades to NULL vectors plus the
+    # per-fact aggregate alert (requirement 03 §5.4/§9).
+    try:
+        identity_client = await _acquire_identity_client(config, identity_spec, identity_client_factory)
+    except Exception as error:  # pragma: no cover - construction never fails in practice
+        logger.error("noesis identity client unavailable: %s", type(error).__name__)
+        identity_client = None
+
     timezone_name = getattr(config, "noesis_timezone", DEFAULT_NOESIS_TIMEZONE) or DEFAULT_NOESIS_TIMEZONE
     for item in items:
         await _ingest_item(
@@ -990,4 +1470,6 @@ async def ingest_noesis_batch(
             analyzer=analyzer,
             pool_factory=pool_factory,
             config=config,
+            identity_client=identity_client,
+            identity_spec=identity_spec,
         )

@@ -1172,3 +1172,130 @@ def test_noesis_config_secret_handling(noesis_env_base, monkeypatch):
     message = str(exc_info.value)
     assert "super-secret-pw" not in message
     assert "postgresql://user:super-secret-pw" not in message
+
+
+# ---------------------------------------------------------------------------
+# Requirement 03 §10.1/§15.4: identity embedding (bge) config
+# ---------------------------------------------------------------------------
+
+def test_noesis_embedding_config_defaults():
+    from hindsight_api.config import HindsightConfig
+
+    config = HindsightConfig.from_env()
+    assert config.noesis_embedding_base_url == "http://10.0.0.8:8010"
+    assert config.noesis_embedding_model == "bge-m3"
+    assert config.noesis_embedding_revision == "bge-m3-1024-v1"
+    assert config.noesis_embedding_dimension == 1024
+    assert config.noesis_embedding_timeout_seconds == 2.0
+    assert config.noesis_embedding_max_retries == 1
+    assert config.noesis_embedding_api_key == ""
+
+
+def test_noesis_embedding_config_env_overrides(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL", "http://embedding.internal:9000")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_MODEL", "bge-m3-next")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_REVISION", "bge-m3-next-1024-v2")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_DIMENSION", "1024")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_TIMEOUT_SECONDS", "3.5")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_MAX_RETRIES", "2")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_API_KEY", "embed-secret")
+
+    config = HindsightConfig.from_env()
+    assert config.noesis_embedding_base_url == "http://embedding.internal:9000"
+    assert config.noesis_embedding_model == "bge-m3-next"
+    assert config.noesis_embedding_revision == "bge-m3-next-1024-v2"
+    assert config.noesis_embedding_dimension == 1024
+    assert config.noesis_embedding_timeout_seconds == 3.5
+    assert config.noesis_embedding_max_retries == 2
+    assert config.noesis_embedding_api_key == "embed-secret"
+
+
+def test_noesis_embedding_base_url_trailing_slash_normalized(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL", "http://embedding.internal:9000/")
+    config = HindsightConfig.from_env()
+    assert config.noesis_embedding_base_url == "http://embedding.internal:9000"
+
+
+def test_noesis_embedding_validate_empty_base_url(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL", "  ")
+    with pytest.raises(ValueError, match="noesis_embedding_base_url"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_base_url_scheme(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL", "10.0.0.8:8010")
+    with pytest.raises(ValueError, match="noesis_embedding_base_url"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_base_url_has_hostname(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL", "http:///missing-host")
+    with pytest.raises(ValueError, match="noesis_embedding_base_url"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_empty_model(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_MODEL", "")
+    with pytest.raises(ValueError, match="noesis_embedding_model"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_empty_revision(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_REVISION", "  ")
+    with pytest.raises(ValueError, match="noesis_embedding_revision"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_dimension_must_be_1024(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    for bad in ("0", "-1", "512", "768"):
+        monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_DIMENSION", bad)
+        with pytest.raises(ValueError, match="noesis_embedding_dimension"):
+            HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_timeout_positive(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    for bad in ("0", "-0.5"):
+        monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_TIMEOUT_SECONDS", bad)
+        with pytest.raises(ValueError, match="noesis_embedding_timeout_seconds"):
+            HindsightConfig.from_env()
+
+
+def test_noesis_embedding_validate_max_retries_nonnegative(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_MAX_RETRIES", "-1")
+    with pytest.raises(ValueError, match="noesis_embedding_max_retries"):
+        HindsightConfig.from_env()
+
+
+def test_noesis_embedding_api_key_secret_handling(monkeypatch):
+    """The embedding API key is a credential: flagged as such, never echoed in
+    validation error messages, never exposed via config repr surfaces."""
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_API_KEY", "embed-super-secret")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_EMBEDDING_MAX_RETRIES", "-1")  # force a validation error
+
+    from hindsight_api.config import HindsightConfig
+
+    assert "noesis_embedding_api_key" in HindsightConfig._CREDENTIAL_FIELDS
+
+    with pytest.raises(ValueError) as exc_info:
+        HindsightConfig.from_env()
+    assert "embed-super-secret" not in str(exc_info.value)

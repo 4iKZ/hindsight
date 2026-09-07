@@ -24,9 +24,11 @@ from tests.noesis_fakes import (
     GOLDEN_FACT_RECURSIVE_JSON,
     OBSERVED_AT,
     FakeExtractOnceFactory,
+    FakeIdentityClient,
     FakeStore,
     golden_fact_recursive,
     golden_fact_time,
+    identity_factory_for,
     llm_config,
     noesis_config,
     outcome,
@@ -39,6 +41,9 @@ async def run(store, contents, components=None, **kwargs):
         return outcome(list(components or []))
 
     noesis_ingest.extract_noesis_components = fake_extract
+    # Default fake identity client: keeps these tests offline and alert-quiet;
+    # requirement-03 vector behavior itself lives in test_noesis_identity_vector.py.
+    kwargs.setdefault("identity_client_factory", identity_factory_for(FakeIdentityClient()))
     try:
         await ingest_noesis_batch(
             contents,
@@ -57,7 +62,14 @@ _ORIGINAL_EXTRACT = noesis_ingest.extract_noesis_components
 
 
 def atom_upsert_args(store):
-    return [args for kind, sql, args in store.calls if kind == "fetchrow" and ".atoms" in sql]
+    """(text, atom_type) pairs of the atom upserts, in call order.
+
+    The requirement-03 ``$3::vector`` third parameter is intentionally
+    projected away here — its exact value is asserted by
+    test_noesis_identity_vector.py; these requirement-02 assertions only pin
+    which typed literals were upserted.
+    """
+    return [(args[0], args[1]) for kind, sql, args in store.calls if kind == "fetchrow" and ".atoms" in sql]
 
 
 def event_atom_args(store):
@@ -319,6 +331,7 @@ async def test_extraction_error_retry_single_alert(monkeypatch):
             llm_config=llm_config(),
             extract_once_factory=FakeExtractOnceFactory(),
             pool_factory=pool_factory_for(store),
+            identity_client_factory=identity_factory_for(FakeIdentityClient()),
         )
 
     assert len(store.alerts_by_code("extraction_failed")) == 1  # deduped by key

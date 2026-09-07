@@ -17,9 +17,11 @@ from hindsight_api.engine.retain.noesis_ingest import ingest_noesis_batch
 from tests.noesis_fakes import (
     CONTENT,
     FakeExtractOnceFactory,
+    FakeIdentityClient,
     FakePool,
     FakeStore,
     golden_fact_recursive,
+    identity_factory_for,
     llm_config,
     noesis_config,
     outcome,
@@ -46,6 +48,7 @@ async def _run(store, contents, monkeypatch, *, components=None, **kwargs):
         llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=kwargs.pop("pool_factory", pool_factory_for(store)),
+        identity_client_factory=kwargs.pop("identity_client_factory", identity_factory_for(FakeIdentityClient())),
         **kwargs,
     )
 
@@ -137,6 +140,7 @@ async def test_unexpected_outcome_type_isolated(monkeypatch):
         [_contents(document_id="doc-a"), _contents(document_id="doc-b")],
         "bank-1", noesis_config(), llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(), pool_factory=pool_factory_for(store),
+        identity_client_factory=identity_factory_for(FakeIdentityClient()),
     )
     assert store.events == {}
 
@@ -151,6 +155,7 @@ async def test_cancellation_propagates(monkeypatch):
         await ingest_noesis_batch(
             [_contents()], "bank-1", noesis_config(), llm_config=llm_config(),
             extract_once_factory=FakeExtractOnceFactory(), pool_factory=pool_factory_for(FakeStore()),
+            identity_client_factory=identity_factory_for(FakeIdentityClient()),
         )
 
 
@@ -178,6 +183,7 @@ async def test_component1_rollback_component2_commits(monkeypatch):
     await ingest_noesis_batch(
         [_contents()], "bank-1", noesis_config(), llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(), pool_factory=pool_factory_for(store),
+        identity_client_factory=identity_factory_for(FakeIdentityClient()),
     )
     # One component succeeded, one failed and rolled back.
     assert len(store.events) == 1

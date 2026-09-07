@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -899,6 +900,17 @@ ENV_NOESIS_POOL_MIN_SIZE = "HINDSIGHT_API_NOESIS_POOL_MIN_SIZE"
 ENV_NOESIS_POOL_MAX_SIZE = "HINDSIGHT_API_NOESIS_POOL_MAX_SIZE"
 ENV_NOESIS_COMMAND_TIMEOUT = "HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT"
 
+# Noesis identity embedding service (requirement 03 §10.1). The switchable
+# bge-m3 identity-vector service; the model/revision/dimension triple forms
+# the vector generation gate together with noesis_core.embedding_profiles.
+ENV_NOESIS_EMBEDDING_BASE_URL = "HINDSIGHT_API_NOESIS_EMBEDDING_BASE_URL"
+ENV_NOESIS_EMBEDDING_MODEL = "HINDSIGHT_API_NOESIS_EMBEDDING_MODEL"
+ENV_NOESIS_EMBEDDING_REVISION = "HINDSIGHT_API_NOESIS_EMBEDDING_REVISION"
+ENV_NOESIS_EMBEDDING_DIMENSION = "HINDSIGHT_API_NOESIS_EMBEDDING_DIMENSION"
+ENV_NOESIS_EMBEDDING_TIMEOUT_SECONDS = "HINDSIGHT_API_NOESIS_EMBEDDING_TIMEOUT_SECONDS"
+ENV_NOESIS_EMBEDDING_MAX_RETRIES = "HINDSIGHT_API_NOESIS_EMBEDDING_MAX_RETRIES"
+ENV_NOESIS_EMBEDDING_API_KEY = "HINDSIGHT_API_NOESIS_EMBEDDING_API_KEY"
+
 # Default values
 DEFAULT_DATABASE_BACKEND = "postgresql"
 DEFAULT_DATABASE_URL = "pg0"
@@ -1603,6 +1615,18 @@ DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
 DEFAULT_NOESIS_POOL_MIN_SIZE = 1
 DEFAULT_NOESIS_POOL_MAX_SIZE = 5
 DEFAULT_NOESIS_COMMAND_TIMEOUT = 10
+
+# Noesis identity embedding service defaults (requirement 03 §10.1). The
+# revision is the operations-auditable weight/pooling generation identifier;
+# dimension is pinned to the physical VECTOR(1024) column (a non-1024 model
+# is a schema migration, never a hot config switch).
+DEFAULT_NOESIS_EMBEDDING_BASE_URL = "http://10.0.0.8:8010"
+DEFAULT_NOESIS_EMBEDDING_MODEL = "bge-m3"
+DEFAULT_NOESIS_EMBEDDING_REVISION = "bge-m3-1024-v1"
+DEFAULT_NOESIS_EMBEDDING_DIMENSION = 1024
+DEFAULT_NOESIS_EMBEDDING_TIMEOUT_SECONDS = 2.0
+DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES = 1
+DEFAULT_NOESIS_EMBEDDING_API_KEY = ""
 
 
 class JsonFormatter(logging.Formatter):
@@ -2852,6 +2876,15 @@ class HindsightConfig:
     noesis_pool_min_size: int = DEFAULT_NOESIS_POOL_MIN_SIZE
     noesis_pool_max_size: int = DEFAULT_NOESIS_POOL_MAX_SIZE
     noesis_command_timeout: int = DEFAULT_NOESIS_COMMAND_TIMEOUT
+    # Noesis identity embedding service (requirement 03 §10.1). Drives the
+    # bge identity-vector client in engine/retain/noesis_identity_vector.py.
+    noesis_embedding_base_url: str = DEFAULT_NOESIS_EMBEDDING_BASE_URL
+    noesis_embedding_model: str = DEFAULT_NOESIS_EMBEDDING_MODEL
+    noesis_embedding_revision: str = DEFAULT_NOESIS_EMBEDDING_REVISION
+    noesis_embedding_dimension: int = DEFAULT_NOESIS_EMBEDDING_DIMENSION
+    noesis_embedding_timeout_seconds: float = DEFAULT_NOESIS_EMBEDDING_TIMEOUT_SECONDS
+    noesis_embedding_max_retries: int = DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES
+    noesis_embedding_api_key: str = DEFAULT_NOESIS_EMBEDDING_API_KEY
 
     # Class-level sets for configuration categorization
 
@@ -2864,6 +2897,8 @@ class HindsightConfig:
         "consolidation_llm_api_key",
         # Noesis dedicated database URL may embed credentials (R02-09)
         "noesis_database_url",
+        # Noesis identity embedding service bearer token (requirement 03)
+        "noesis_embedding_api_key",
         # LiteLLM Router chains — entries embed api_keys and base_urls
         "llm_litellmrouter_config",
         "retain_llm_litellmrouter_config",
@@ -3288,6 +3323,34 @@ class HindsightConfig:
         if self.noesis_command_timeout <= 0:
             raise ValueError(
                 f"noesis_command_timeout must be > 0, got {self.noesis_command_timeout}"
+            )
+
+        # Noesis identity embedding service fail-fast validation (requirement
+        # 03 §10.2). Values are never echoed: base_url may embed userinfo.
+        embedding_base_url = self.noesis_embedding_base_url.strip()
+        if not embedding_base_url:
+            raise ValueError("noesis_embedding_base_url must not be empty")
+        if not (embedding_base_url.startswith("http://") or embedding_base_url.startswith("https://")):
+            raise ValueError("noesis_embedding_base_url must start with http:// or https://")
+        if not urlsplit(embedding_base_url).hostname:
+            raise ValueError("noesis_embedding_base_url must include a host")
+        if not self.noesis_embedding_model.strip():
+            raise ValueError("noesis_embedding_model must not be empty")
+        if not self.noesis_embedding_revision.strip():
+            raise ValueError("noesis_embedding_revision must not be empty")
+        if self.noesis_embedding_dimension != 1024:
+            raise ValueError(
+                "noesis_embedding_dimension must equal 1024: atoms.embedding is a fixed VECTOR(1024) "
+                "column and a non-1024 model is a schema migration, not a config switch, got "
+                f"{self.noesis_embedding_dimension}"
+            )
+        if self.noesis_embedding_timeout_seconds <= 0:
+            raise ValueError(
+                f"noesis_embedding_timeout_seconds must be > 0, got {self.noesis_embedding_timeout_seconds}"
+            )
+        if self.noesis_embedding_max_retries < 0:
+            raise ValueError(
+                f"noesis_embedding_max_retries must be >= 0, got {self.noesis_embedding_max_retries}"
             )
 
     @classmethod
@@ -4248,6 +4311,23 @@ class HindsightConfig:
             noesis_pool_min_size=int(os.getenv(ENV_NOESIS_POOL_MIN_SIZE, str(DEFAULT_NOESIS_POOL_MIN_SIZE))),
             noesis_pool_max_size=int(os.getenv(ENV_NOESIS_POOL_MAX_SIZE, str(DEFAULT_NOESIS_POOL_MAX_SIZE))),
             noesis_command_timeout=int(os.getenv(ENV_NOESIS_COMMAND_TIMEOUT, str(DEFAULT_NOESIS_COMMAND_TIMEOUT))),
+            # Noesis identity embedding service (trailing "/" on base_url is
+            # normalized away at parse time — requirement 03 §10.1)
+            noesis_embedding_base_url=os.getenv(
+                ENV_NOESIS_EMBEDDING_BASE_URL, DEFAULT_NOESIS_EMBEDDING_BASE_URL
+            ).rstrip("/"),
+            noesis_embedding_model=os.getenv(ENV_NOESIS_EMBEDDING_MODEL, DEFAULT_NOESIS_EMBEDDING_MODEL),
+            noesis_embedding_revision=os.getenv(ENV_NOESIS_EMBEDDING_REVISION, DEFAULT_NOESIS_EMBEDDING_REVISION),
+            noesis_embedding_dimension=int(
+                os.getenv(ENV_NOESIS_EMBEDDING_DIMENSION, str(DEFAULT_NOESIS_EMBEDDING_DIMENSION))
+            ),
+            noesis_embedding_timeout_seconds=float(
+                os.getenv(ENV_NOESIS_EMBEDDING_TIMEOUT_SECONDS, str(DEFAULT_NOESIS_EMBEDDING_TIMEOUT_SECONDS))
+            ),
+            noesis_embedding_max_retries=int(
+                os.getenv(ENV_NOESIS_EMBEDDING_MAX_RETRIES, str(DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES))
+            ),
+            noesis_embedding_api_key=os.getenv(ENV_NOESIS_EMBEDDING_API_KEY, DEFAULT_NOESIS_EMBEDDING_API_KEY),
         )
         config.validate()
         return config

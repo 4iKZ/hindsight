@@ -20,8 +20,10 @@ import hindsight_api.engine.retain.orchestrator as orchestrator
 from tests.noesis_fakes import (
     CONTENT,
     FakeExtractOnceFactory,
+    FakeIdentityClient,
     FakeStore,
     golden_fact_recursive,
+    identity_factory_for,
     llm_config,
     noesis_config,
 )
@@ -180,6 +182,7 @@ async def test_hermes_timestamp_flows_to_noesis_observed_at(monkeypatch):
         llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=_fake_pool_factory(store),
+        identity_client_factory=identity_factory_for(FakeIdentityClient()),
     )
 
     assert seen == [CONTENT]
@@ -210,6 +213,7 @@ async def test_hermes_empty_and_hypothesis_semantics(monkeypatch):
         llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=_fake_pool_factory(store),
+        identity_client_factory=identity_factory_for(FakeIdentityClient()),
     )
     assert store.events == {}
     assert store.alerts == []
@@ -236,6 +240,7 @@ async def test_hermes_hypothesis_only_deferred(monkeypatch):
         llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=_fake_pool_factory(store),
+        identity_client_factory=identity_factory_for(FakeIdentityClient()),
     )
     assert store.events == {}
     assert store.atoms == {}
