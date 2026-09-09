@@ -61,11 +61,10 @@ def _store_with_filled_atoms(profile=True, n_ep=4) -> FakeStore:
     for index, (text, atom_type) in enumerate(literals[:n_ep]):
         store.atoms[(text, atom_type)] = {
             "atom_id": 500 + index,
-            "support_count": 1,
             "embedding": fake_identity_vector(text, atom_type),
         }
     # A G atom must never be touched/encoded.
-    store.atoms[("周末计划", "G")] = {"atom_id": 900, "support_count": 1, "embedding": None}
+    store.atoms[("周末计划", "G")] = {"atom_id": 900, "embedding": None}
     return store
 
 
@@ -162,7 +161,6 @@ async def test_full_switch_includes_atom_created_while_rebuilding():
             inserted = True
             store.atoms[("晚到意元", "E")] = {
                 "atom_id": 999,
-                "support_count": 1,
                 "embedding": None,
             }
         return vector

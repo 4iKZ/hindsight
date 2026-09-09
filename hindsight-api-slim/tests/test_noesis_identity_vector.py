@@ -318,7 +318,6 @@ def test_normalize_model_basename():
 # §15.2 / §15.3 ingest flow + degradation (fake bge + fake store)
 # ---------------------------------------------------------------------------
 
-import asyncio  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
 import hindsight_api.engine.retain.noesis_ingest as noesis_ingest  # noqa: E402
@@ -402,7 +401,7 @@ async def test_existing_vector_never_recomputed_never_overwritten():
     assert client2.embed_calls == []  # precheck saw has_embedding → zero bge
     for literal, vector in original.items():
         assert store.embedding_of(*literal) == vector  # untouched
-    assert store.support_count("小明", "E") == 2
+    assert len(store.atoms) == 4  # upserts stay one row per typed literal
 
 
 async def test_null_embedding_self_heals_on_next_occurrence():
@@ -417,7 +416,7 @@ async def test_null_embedding_self_heals_on_next_occurrence():
     assert sorted(healing.embed_calls) == sorted(_GOLDEN_LITERALS)  # NULL → re-embedded
     for text, atom_type in _GOLDEN_LITERALS:
         assert store.embedding_of(text, atom_type) == fake_identity_vector(text, atom_type)
-    assert store.support_count("小明", "E") == 2
+    assert len(store.atoms) == 4
 
 
 async def test_same_event_same_literal_one_bge_one_upsert():
@@ -427,7 +426,6 @@ async def test_same_event_same_literal_one_bge_one_upsert():
     assert client.embed_calls.count(("小明", "E")) == 1  # 小明 occurs twice in the golden fact
     upserts = [args for kind, sql, args in store.calls if kind == "fetchrow" and "INSERT" in sql and ".atoms" in sql]
     assert len([args for args in upserts if args[0] == "小明" and args[1] == "E"]) == 1
-    assert store.support_count("小明", "E") == 1
 
 
 async def test_g_atom_never_embedded_and_registered_null():
@@ -446,43 +444,23 @@ async def test_g_atom_never_embedded_and_registered_null():
 
     assert ("周末计划", "G") not in client.embed_calls  # G never gets a vector
     assert store.embedding_of("周末计划", "G") is None
-    assert store.support_count("周末计划", "G") == 1
 
 
-async def test_committed_replay_has_zero_vector_side_effects():
+async def test_duplicate_input_new_event_zero_reembed():
+    """04A: the same input again lands a NEW event (sequence number), but the
+    already-embedded atoms are neither re-embedded nor overwritten."""
     store = FakeStore()
     await _run(store, _one_fact_contents(), [golden_fact_recursive()])
-    replay_client = FakeIdentityClient()
-    store.calls.clear()
+    original = {literal: store.embedding_of(*literal) for literal in _GOLDEN_LITERALS}
 
-    await _run(store, _one_fact_contents(), [golden_fact_recursive()], identity=replay_client)
+    duplicate_client = FakeIdentityClient()
+    await _run(store, _one_fact_contents(), [golden_fact_recursive()], identity=duplicate_client)
 
-    assert replay_client.embed_calls == []
-    assert replay_client.ensure_calls == 0  # replay returns before the health gate
-    assert store.fetch_calls("unnest") == []  # zero atom precheck
-    assert [c for c in store.calls if ".atoms" in c[1] and c[0] == "fetchrow"] == []  # zero atom writes
-    assert store.support_count("小明", "E") == 1
-
-
-async def test_concurrent_first_duplicate_single_event_single_support():
-    async def yield_once():
-        await asyncio.sleep(0)
-
-    store = FakeStore()
-    store.interleave = yield_once
-    await asyncio.gather(
-        _run(store, _one_fact_contents(), [golden_fact_recursive()]),
-        _run(store, _one_fact_contents(), [golden_fact_recursive()]),
-    )
-
-    assert len(store.events) == 1
-    assert store.support_count("小明", "E") == 1
-    assert len(store.event_atoms) == 5
-    upserts = [
-        args for kind, sql, args in store.calls
-        if kind == "fetchrow" and "INSERT" in sql and ".atoms" in sql and args[0] == "小明"
-    ]
-    assert len(upserts) == 1  # the loser of the unique-constraint race never upserts
+    assert len(store.events) == 2  # duplicate input is a new event (04A contract)
+    assert duplicate_client.embed_calls == []  # precheck saw has_embedding → zero bge
+    for literal, vector in original.items():
+        assert store.embedding_of(*literal) == vector  # untouched
+    assert len(store.atoms) == 4  # upserts stay one row per typed literal
 
 
 async def test_component_without_ep_literals_no_precheck_no_bge():
@@ -648,7 +626,7 @@ async def test_profile_change_after_bge_is_rechecked_inside_fact_transaction():
 
 async def test_profile_missing_but_vectors_present_refuses_to_guess():
     store = FakeStore()
-    store.atoms[("旧词", "E")] = {"atom_id": 42, "support_count": 3, "embedding": fake_identity_vector("旧词", "E")}
+    store.atoms[("旧词", "E")] = {"atom_id": 42, "embedding": fake_identity_vector("旧词", "E")}
     store.profile = None
     client = await _run(store, _one_fact_contents(), [golden_fact_recursive()])
 

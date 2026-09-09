@@ -230,7 +230,9 @@ async def test_fact_written_to_fact_layer(monkeypatch):
     assert event["data"]["component"]["utterance_type"] == "fact"
 
 
-async def test_hypothesis_deferred_alert_only(monkeypatch):
+async def test_hypothesis_classification_pending_alert_only(monkeypatch):
+    """04A §3.3: hypothesis is an observability signal only — never an event,
+    never a persisted rule; the alert message must not claim persistence."""
     patch_outcomes(monkeypatch, [outcome([golden_hypothesis()])])
     store = FakeStore()
     await run_ingest(store, [content_item()], monkeypatch)
@@ -238,14 +240,16 @@ async def test_hypothesis_deferred_alert_only(monkeypatch):
     assert store.events == {}
     assert store.atoms == {}
     assert store.event_atoms == []
-    deferred = store.alerts_by_code("hypothesis_deferred")
-    assert len(deferred) == 1
-    alert = deferred[0]
+    pending = store.alerts_by_code("hypothesis_classification_pending")
+    assert len(pending) == 1
+    alert = pending[0]
     assert alert["stage"] == "hypothesis_routing"
     assert alert["severity"] == "info"
     assert alert["event_id"] is None
     assert alert["details"]["component"]["utterance_type"] == "hypothesis"
     assert alert["details"]["bank_id"] == "bank-1"
+    message = alert["message"]
+    assert "not" in message and "persisted" in message  # purely observational wording
 
 
 async def test_hyper_extract_alerts_mapped_with_safe_envelope(monkeypatch):
@@ -288,7 +292,7 @@ async def test_mixed_fact_hypothesis_routes_separately(monkeypatch):
     store = FakeStore()
     await run_ingest(store, [content_item()], monkeypatch)
     assert len(store.events) == 1
-    assert len(store.alerts_by_code("hypothesis_deferred")) == 1
+    assert len(store.alerts_by_code("hypothesis_classification_pending")) == 1
 
 
 async def test_multiple_components_in_order(monkeypatch):

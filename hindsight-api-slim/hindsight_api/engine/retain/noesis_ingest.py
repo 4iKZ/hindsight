@@ -1,4 +1,4 @@
-"""Noesis Stage 1 event ingestion (requirement 02).
+"""Noesis Stage 1 event ingestion (requirement 02, 04A latest contract).
 
 Replaces the old hyper_extract directed-graph side path on the Hindsight
 production retain main chain. For every non-empty content item this module:
@@ -9,7 +9,9 @@ production retain main chain. For every non-empty content item this module:
 3. routes the outcome: ``[]`` is a silent success, hyper-extract alerts and
    hypotheses are recorded in ``noesis_core.ingestion_alerts``, and every fact
    component is written inside one short transaction to ``noesis_core.events``
-   / ``atoms`` / ``event_atoms`` with idempotent keys;
+   / ``atoms`` / ``event_atoms`` — events are sequence-numbered via
+   ``INSERT ... RETURNING event_id`` (04A: no ingestion_key, no replay,
+   duplicate input is a new event by contract);
 4. isolates every failure from the native Hindsight retain: failures become
    alerts (never exceptions) and the retain pipeline continues untouched.
 
@@ -72,14 +74,6 @@ class SchemaPreflightError(Exception):
     """
 
 
-class NoesisKeyCollision(Exception):
-    """Replay under the same ingestion_key with a different component payload."""
-
-    def __init__(self, *, existing_event_id: int) -> None:
-        super().__init__("ingestion_key replay payload mismatch")
-        self.existing_event_id = existing_event_id
-
-
 @dataclass(frozen=True)
 class NoesisInputItem:
     """Per-item ingestion envelope (requirement 02 §6)."""
@@ -135,22 +129,6 @@ def stamp_noesis_queue_metadata(contents: list[dict[str, Any]], *, captured_at: 
 
 def _content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
-def compute_ingestion_key(*, item: NoesisInputItem, component_index: int, component_json: dict) -> str:
-    """Stable fact key — requirement 02 §11.1 (canonical JSON sha256)."""
-    payload = {
-        "contract_version": CONTRACT_VERSION,
-        "bank_id": item.bank_id,
-        "operation_id": item.operation_id,
-        "document_id": item.document_id,
-        "item_index": item.item_index,
-        "observed_at": _iso_utc(item.observed_at),
-        "content_sha256": _content_sha256(item.content),
-        "component_index": component_index,
-        "component_sha256": hashlib.sha256(canonical_json_bytes(component_json)).hexdigest(),
-    }
-    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 def compute_alert_dedupe_key(
@@ -756,11 +734,13 @@ _PREFLIGHT_TABLES = ("atoms", "events", "event_atoms", "ingestion_alerts", "embe
 _PREFLIGHT_EXTENSIONS = ("vector", "roaringbitmap", "timescaledb", "pg_ripple")
 _PREFLIGHT_COLUMNS = {
     "atoms": ("text", "atom_type", "embedding"),
-    "events": ("event_time", "ingestion_key", "data"),
-    "event_atoms": ("event_id", "occurrence_id", "atom_id", "role_type", "head_occurrence_id"),
+    "events": ("event_time", "data"),
+    "event_atoms": ("event_id", "occurrence_id", "atom_id", "role_type", "target_occ"),
     "ingestion_alerts": ("dedupe_key", "stage", "alert_code", "severity", "message", "details"),
     "embedding_profiles": ("embedding_kind", "model_name", "model_revision", "dimension", "status", "updated_at"),
 }
+# 04A: JSON role -> event_atoms.role_type "char" enum (requirement 04A §6.4).
+_ROLE_TYPE = {"agent": "A", "patient": "P", "predicate": "R", "modifier": "M"}
 
 
 async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int = 1024) -> None:
@@ -806,16 +786,15 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
                 if not col:
                     raise SchemaPreflightError(f"column '{schema}.{table}.{column}' does not exist")
 
-        event_unique = await conn.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
-            "WHERE conname = 'events_ingestion_key_time_unique' "
-            "AND conrelid = to_regclass($1))",
-            f"{schema}.events",
+        # 04A: events is a sequence-numbered hypertable without a unique key;
+        # the plain event_id index is the object the writer depends on.
+        event_id_index = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes "
+            "WHERE schemaname = $1 AND tablename = 'events' AND indexname = 'idx_events_event_id')",
+            schema,
         )
-        if not event_unique:
-            raise SchemaPreflightError(
-                f"unique constraint 'events_ingestion_key_time_unique' missing on '{schema}.events'"
-            )
+        if not event_id_index:
+            raise SchemaPreflightError(f"index 'idx_events_event_id' missing on '{schema}.events'")
 
         dedupe_not_null = await conn.fetchval(
             "SELECT (is_nullable = 'NO') FROM information_schema.columns "
@@ -900,21 +879,24 @@ def _sql(schema: str, statement: str) -> str:
     return statement.format(s=schema)
 
 
+# 04A: events are sequence-numbered (source 'L' = LLM extraction, category
+# 'R' = raw — the frozen "char" enum values of the latest DDL). No unique key,
+# no replay: a duplicate input lands a new event by contract. The
+# ``::text::"char"`` casts bind Python str parameters to the internal
+# one-byte "char" columns (asyncpg only accepts bytes for a direct bind).
 _EVENT_INSERT = (
-    "INSERT INTO {s}.events (event_time, ingestion_key, data, source, category) "
-    "VALUES ($1, $2, $3::jsonb, $4, $5) "
-    "ON CONFLICT (ingestion_key, event_time) DO NOTHING RETURNING event_id"
+    "INSERT INTO {s}.events (event_time, data, source, category) "
+    "VALUES ($1, $2::jsonb, $3::text::\"char\", $4::text::\"char\") "
+    "RETURNING event_id"
 )
-_EVENT_REPLAY_SELECT = "SELECT event_id, data FROM {s}.events WHERE ingestion_key = $1 AND event_time = $2"
-# Requirement 03 §8.3: the only write statement this requirement changes.
-# New rows carry the freshly computed vector (or NULL on bge failure); an
-# existing non-NULL embedding is never overwritten; a NULL embedding is
-# backfilled (self-heal) when a vector arrives.
+# Requirement 03 §8.3 + 04A: new rows carry the freshly computed vector (or
+# NULL on bge failure); an existing non-NULL embedding is never overwritten; a
+# NULL embedding is backfilled (self-heal) when a vector arrives. Atoms carry
+# no support_count (support is derived from the Cooccurrence Bitmap later).
 _ATOM_UPSERT = (
-    "INSERT INTO {s}.atoms (text, atom_type, embedding, status, support_count) "
-    "VALUES ($1, $2, $3::vector, 'active', 1) "
+    "INSERT INTO {s}.atoms (text, atom_type, embedding, status) "
+    "VALUES ($1, $2::text::\"char\", $3::vector, 'A') "
     "ON CONFLICT (text, atom_type) DO UPDATE SET "
-    "support_count = {s}.atoms.support_count + 1, "
     "embedding = CASE "
     "WHEN {s}.atoms.embedding IS NULL AND EXCLUDED.embedding IS NOT NULL THEN EXCLUDED.embedding "
     "ELSE {s}.atoms.embedding END "
@@ -942,9 +924,11 @@ _PROFILE_CLAIM = (
     "ON CONFLICT (embedding_kind) DO NOTHING RETURNING embedding_kind"
 )
 _EP_NON_NULL_COUNT = "SELECT count(*) FROM {s}.atoms WHERE embedding IS NOT NULL AND atom_type IN ('E', 'P')"
+# 04A: target_occ is the atoms[].target_occ value verbatim; role_type carries
+# the mapped "char" value (see _ROLE_TYPE) bound via the text cast.
 _EVENT_ATOM_INSERT = (
-    "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, head_occurrence_id) "
-    "VALUES ($1, $2, $3, $4, $5)"
+    "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, target_occ) "
+    "VALUES ($1, $2, $3, $4::text::\"char\", $5)"
 )
 _ALERT_INSERT = (
     "INSERT INTO {s}.ingestion_alerts (dedupe_key, event_id, stage, alert_code, severity, message, details, status) "
@@ -1016,16 +1000,6 @@ async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwa
         )
 
 
-def _replay_event_id(existing: Any, component_sha256: str) -> int:
-    """Verify a replayed event's stored component hash; fail closed on drift."""
-    stored = existing["data"]
-    stored = json.loads(stored) if isinstance(stored, str) else stored
-    stored_sha = hashlib.sha256(canonical_json_bytes(stored["component"])).hexdigest()
-    if stored_sha != component_sha256:
-        raise NoesisKeyCollision(existing_event_id=existing["event_id"])
-    return existing["event_id"]
-
-
 async def _ingest_fact(
     *,
     pool: Any,
@@ -1033,8 +1007,6 @@ async def _ingest_fact(
     item: NoesisInputItem,
     component_index: int,
     component: Any,
-    component_sha256: str,
-    ingestion_key: str,
     data: dict,
     resolution: TimeResolution,
     identity_client: Any,
@@ -1044,21 +1016,15 @@ async def _ingest_fact(
 
     Returns ``(event_id, vector_alert)`` where ``vector_alert`` is the
     post-commit aggregate identity-vector alert payload (or None). Requirement
-    03 §8.1 order: committed-replay fast path → health/profile gates → atom
-    precheck → sequential bge (all outside the transaction) → the requirement
-    02 short transaction with the vector-carrying upsert.
+    03 §8.1 order: health/profile gates → atom precheck → sequential bge (all
+    outside the transaction) → the requirement 02 short transaction with the
+    vector-carrying upsert. 04A: the event is sequence-numbered via
+    ``INSERT ... RETURNING event_id``; the returned id is shared with
+    ``event_atoms`` inside the same transaction.
     """
     event_time = resolution.event_time
 
-    # 1. Committed-replay fast path (§8.5): zero bge, zero atom precheck,
-    #    zero atom writes. The in-transaction ON CONFLICT path below remains
-    #    the final arbiter for first-time concurrent duplicates.
-    async with pool.acquire() as conn:
-        existing = await conn.fetchrow(_sql(schema, _EVENT_REPLAY_SELECT), ingestion_key, event_time)
-    if existing is not None:
-        return _replay_event_id(existing, component_sha256), None
-
-    # 2. Ordered unique E/P literals of this component (G never gets a vector).
+    # 1. Ordered unique E/P literals of this component (G never gets a vector).
     literals: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for atom in component.atoms:
@@ -1067,12 +1033,12 @@ async def _ingest_fact(
             seen.add(literal)
             literals.append(literal)
 
-    # 3-5. Health gate, profile gate, atom-state precheck, sequential bge.
+    # 2-4. Health gate, profile gate, atom-state precheck, sequential bge.
     prep = await _prepare_identity_vectors(
         pool=pool, schema=schema, client=identity_client, spec=identity_spec, literals=literals
     )
 
-    # 6. The requirement 02 short transaction (unchanged boundaries).
+    # 5. The requirement 02 short transaction (unchanged boundaries).
     async with pool.acquire() as conn:
         async with conn.transaction():
             # Fence the transaction against a rebuild that starts after the
@@ -1122,21 +1088,10 @@ async def _ingest_fact(
             row = await conn.fetchrow(
                 _sql(schema, _EVENT_INSERT),
                 event_time,
-                ingestion_key,
                 json.dumps(data, ensure_ascii=False),
-                item.source,
-                "fact",
+                "L",
+                "R",
             )
-            if row is None:
-                # Concurrent first-time replay: verify and return without
-                # touching atoms or vectors (§8.5).
-                existing = await conn.fetchrow(
-                    _sql(schema, _EVENT_REPLAY_SELECT), ingestion_key, event_time
-                )
-                if existing is None:
-                    raise RuntimeError("event insert conflicted without a replayable row")
-                return _replay_event_id(existing, component_sha256), None
-
             event_id = row["event_id"]
             for warning in resolution.warnings:
                 await _write_alert(
@@ -1160,7 +1115,7 @@ async def _ingest_fact(
             for atom in component.atoms:
                 literal = (atom.text, atom.type)
                 if literal in atom_ids:
-                    continue  # one support increment per typed literal per event
+                    continue  # one upsert per typed literal per event
                 vector = transaction_vectors.get(literal)
                 atom_row = await conn.fetchrow(
                     _sql(schema, _ATOM_UPSERT),
@@ -1175,7 +1130,7 @@ async def _ingest_fact(
                     event_id,
                     atom.pos,
                     atom_ids[(atom.text, atom.type)],
-                    atom.role,
+                    _ROLE_TYPE[atom.role],
                     atom.target_occ,
                 )
             return event_id, transaction_alert
@@ -1198,8 +1153,6 @@ async def _route_component(
     identity_spec: IdentitySpec,
 ) -> None:
     component_json = component.model_dump(mode="json")
-    component_sha256 = hashlib.sha256(canonical_json_bytes(component_json)).hexdigest()
-    ingestion_key = compute_ingestion_key(item=item, component_index=component_index, component_json=component_json)
     data = _build_event_data(
         item=item, component_index=component_index, component_json=component_json, time_metadata=resolution.metadata
     )
@@ -1210,29 +1163,10 @@ async def _route_component(
             item=item,
             component_index=component_index,
             component=component,
-            component_sha256=component_sha256,
-            ingestion_key=ingestion_key,
             data=data,
             resolution=resolution,
             identity_client=identity_client,
             identity_spec=identity_spec,
-        )
-    except NoesisKeyCollision as collision:
-        await _write_alert_safe(
-            pool,
-            schema,
-            item,
-            stage="event_ingest",
-            alert_code="ingestion_key_collision",
-            severity="error",
-            message="same ingestion_key replayed with a different component payload",
-            component_index=component_index,
-            event_id=collision.existing_event_id or None,
-            details={
-                **build_source_envelope(item=item, attempts=attempts),
-                "ingestion_key": ingestion_key,
-                "expected_component_sha256": component_sha256,
-            },
         )
     except Exception as error:
         await _write_alert_safe(
@@ -1245,7 +1179,7 @@ async def _route_component(
             message=f"noesis fact transaction failed: {type(error).__name__}",
             component_index=component_index,
             event_id=None,
-            details={**build_source_envelope(item=item, attempts=attempts), "ingestion_key": ingestion_key},
+            details=build_source_envelope(item=item, attempts=attempts),
         )
     else:
         # 7. Post-commit aggregate identity-vector alert (§8.1). The fact is
@@ -1308,8 +1242,12 @@ async def _ingest_item(
         for component_index, component in enumerate(outcome.components):
             if component.utterance_type == "hypothesis":
                 await _write_alert_safe(
-                    pool, schema, item, stage="hypothesis_routing", alert_code="hypothesis_deferred",
-                    severity="info", message="valid hypothesis deferred until rule-ingestion stage",
+                    pool, schema, item, stage="hypothesis_routing", alert_code="hypothesis_classification_pending",
+                    severity="info",
+                    message=(
+                        "hypothesis recorded as observability signal; classification interface "
+                        "not yet available; component is not persisted as a rule or event"
+                    ),
                     component_index=component_index, event_id=None,
                     details={**envelope, "component": component.model_dump(mode="json")},
                 )

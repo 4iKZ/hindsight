@@ -2,10 +2,10 @@
 
 No network, no real PostgreSQL: every store interaction goes through a small
 in-memory emulation of the ``noesis_core`` statements the ingest module is
-allowed to run (event insert/replay select, atom state precheck, atom upsert,
-event_atoms insert, alert insert, embedding profile gate). Transaction
-rollback is emulated with snapshots so the failure-injection tests can prove
-zero-half-state. Requirement 03 adds the identity-vector seams:
+allowed to run (sequence-numbered event insert with RETURNING, atom state
+precheck, atom upsert, event_atoms insert, alert insert, embedding profile
+gate). Transaction rollback is emulated with snapshots so the failure-injection
+tests can prove zero-half-state. Requirement 03 adds the identity-vector seams:
 ``FakeIdentityClient`` (bge stand-in) and the embedding/profile emulation.
 """
 
@@ -172,7 +172,9 @@ class FakeStore:
     """In-memory emulation of the noesis_core statements the ingest runs."""
 
     def __init__(self) -> None:
-        self.events: dict[tuple[str, datetime], dict[str, Any]] = {}
+        # Requirement 04A: events have no ingestion_key and no unique replay
+        # constraint — every insert gets a fresh sequence-numbered event_id.
+        self.events: dict[int, dict[str, Any]] = {}
         self.atoms: dict[tuple[str, str], dict[str, Any]] = {}
         self.event_atoms: list[tuple] = []
         self.alerts: list[dict[str, Any]] = []
@@ -185,9 +187,9 @@ class FakeStore:
         self.rollbacks = 0
         # marker -> number of matching SQL calls allowed before InjectedFailure.
         # Failure injection fires on in-transaction statements and on writes;
-        # pre-transaction read-only probes (replay select, atom state precheck)
-        # never carry business half-state, so failing them is outside the
-        # zero-half-state contract these markers exist to prove.
+        # pre-transaction read-only probes (atom state precheck) never carry
+        # business half-state, so failing them is outside the zero-half-state
+        # contract these markers exist to prove.
         self.fail_after: dict[str, int] = {}
         self.fail_on_commit = False
         self.interleave: Any = None  # async hook run before each in-tx SQL dispatch
@@ -203,8 +205,8 @@ class FakeStore:
 
     def _maybe_fail(self, sql: str) -> None:
         # Gated to transactional statements and to writes: pre-transaction
-        # read-only probes (replay select, atom state precheck) never carry
-        # business half-state, so failing them is outside the zero-half-state
+        # read-only probes (atom state precheck) never carry business
+        # half-state, so failing them is outside the zero-half-state
         # contract these markers exist to prove. Post-commit alert INSERTs
         # run outside a transaction yet stay fail-able (they are writes).
         if self._tx_depth == 0 and not sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")):
@@ -226,8 +228,6 @@ class FakeStore:
             return self._profile_dispatch(upper, args)
         if ".events" in sql and upper.startswith("INSERT"):
             return self._insert_event(args)
-        if ".events" in sql and upper.startswith("SELECT"):
-            return self._select_event(args)
         if ".atoms" in sql:
             return self._upsert_atom(args)
         if ".ingestion_alerts" in sql:
@@ -335,23 +335,18 @@ class FakeStore:
     # -- table emulation ----------------------------------------------------
 
     def _insert_event(self, args: tuple) -> dict[str, Any] | None:
-        event_time, ingestion_key, data_json = args[0], args[1], args[2]
-        key = (ingestion_key, event_time)
-        if key in self.events:
-            return None
+        # (event_time, data_json, source, category) — the sequence-numbered
+        # INSERT ... RETURNING always yields a fresh event_id (no ON CONFLICT).
+        event_time, data_json, source, category = args[0], args[1], args[2], args[3]
         self._ids["event"] += 1
-        self.events[key] = {
+        self.events[self._ids["event"]] = {
             "event_id": self._ids["event"],
             "event_time": event_time,
             "data": json.loads(data_json),
+            "source": source,
+            "category": category,
         }
         return {"event_id": self._ids["event"]}
-
-    def _select_event(self, args: tuple) -> dict[str, Any] | None:
-        row = self.events.get((args[0], args[1]))
-        if row is None:
-            return None
-        return {"event_id": row["event_id"], "data": json.dumps(row["data"])}
 
     def _atom_state_row(self, text: str, atom_type: str) -> dict[str, Any]:
         atom = self.atoms.get((text, atom_type))
@@ -372,11 +367,9 @@ class FakeStore:
             self._ids["atom"] += 1
             self.atoms[(text, atom_type)] = {
                 "atom_id": self._ids["atom"],
-                "support_count": 1,
                 "embedding": vector,
             }
         else:
-            current["support_count"] += 1
             # CASE branch of the frozen upsert: backfill only, never overwrite.
             if current["embedding"] is None and vector is not None:
                 current["embedding"] = vector
@@ -423,9 +416,6 @@ class FakeStore:
 
     def alerts_by_code(self, code: str) -> list[dict[str, Any]]:
         return [alert for alert in self.alerts if alert["alert_code"] == code]
-
-    def support_count(self, text: str, atom_type: str) -> int:
-        return self.atoms.get((text, atom_type), {}).get("support_count", 0)
 
     def embedding_of(self, text: str, atom_type: str) -> tuple | None:
         return self.atoms.get((text, atom_type), {}).get("embedding")

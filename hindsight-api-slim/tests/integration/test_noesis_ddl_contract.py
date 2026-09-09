@@ -1,18 +1,19 @@
-"""Remote DDL contract tests for Noesis requirement 02 (R02-02 + R02-03).
+"""Remote DDL contract tests for the Noesis 04A latest-contract schema.
 
 Runs entirely on a throwaway TEMP schema so the real ``noesis_core`` tables
 are never touched. Gated: skipped unless ``NOESIS_REMOTE_DDL_TEST=1`` plus the
 SSH env vars are present; the normal regression run never reaches the remote DB.
 
-Covers:
-  * R02-02 fresh-install: the baseline DDL creates ingestion_alerts.dedupe_key
-    NOT NULL + unique constraint, and an _ALERT_INSERT-equivalent INSERT runs
-    twice with the second ON CONFLICT deduped.
-  * R02-03 migration 002 re-runnability:
-      - empty pre-migration schema  -> first run succeeds;
-      - after inserting representative rows -> re-run succeeds as a no-op;
-      - missing column + non-backfillable data -> fail-closed;
-      - failure leaves no half-migrated state.
+Covers (04A requirement §6 / §11.2):
+  * fresh-install baseline: atoms carry no support_count; anchors carry no
+    merged_into_anchor_id; events carry no ingestion_key (sequence-numbered,
+    no unique constraint, plain idx_events_event_id); event_atoms carries
+    target_occ and no head column; class_membership primary key is
+    (atom_id, anchor_id); role_type / source / category / status use "char"
+    CHECK enums (A/P/R/M, L/A/P/S/M, R/W/C/G, A/D).
+  * ingestion_alerts.dedupe_key NOT NULL + unique constraint, and an
+    _ALERT_INSERT-equivalent INSERT dedupes on the second attempt.
+  * migration 003 is idempotent and only creates the identity profile gate.
 
 Credentials live only in the environment; nothing is written to source, logs,
 or fixtures. The remote host key is pinned.
@@ -37,7 +38,6 @@ pytest.importorskip("paramiko")
 _EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
 _REPO_ROOT = Path(__file__).resolve().parents[4]  # wxs-noesis/
 _BASE_SQL_PATH = _REPO_ROOT / "docs" / "db" / "noesis-stage1-schema.sql"
-_MIGRATION_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "002-noesis-ingest-idempotency.sql"
 _MIGRATION_003_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
 
 
@@ -112,9 +112,13 @@ class _Remote:
 
 
 @requires_remote
-def test_fresh_install_baseline_matches_application_sql():
-    """R02-02: baseline DDL creates dedupe_key NOT NULL + UNIQUE, and the app's
-    _ALERT_INSERT-equivalent INSERT dedupes on the second attempt."""
+def test_fresh_install_latest_contract_catalog():
+    """04A §6: the baseline DDL creates exactly the latest-contract structure.
+
+    Catalog proof for: atoms (no support_count, "char" enums), anchors (no
+    merged_into, E/P shared), events (no ingestion_key, no unique constraint,
+    plain idx_events_event_id), event_atoms (target_occ, no head column,
+    A/P/R/M), class_membership ((atom_id, anchor_id) primary key)."""
     schema = f"nzf_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
     remote = _Remote()
     try:
@@ -122,14 +126,79 @@ def test_fresh_install_baseline_matches_application_sql():
         try:
             remote.run_file(_BASE_SQL_PATH, remap=schema)
 
-            # dedupe_key NOT NULL
+            def columns(table: str) -> list[str]:
+                return remote.query(
+                    f"SELECT column_name FROM information_schema.columns "
+                    f"WHERE table_schema='{schema}' AND table_name='{table}' ORDER BY ordinal_position"
+                )
+
+            # atoms: no support_count; text/atom_type/embedding/status present.
+            atom_columns = columns("atoms")
+            assert "support_count" not in atom_columns, f"atoms leaked support_count: {atom_columns}"
+            for required in ("text", "atom_type", "embedding", "status"):
+                assert required in atom_columns, f"atoms.{required} missing: {atom_columns}"
+
+            # anchors: no merged_into_anchor_id.
+            anchor_columns = columns("anchors")
+            assert "merged_into_anchor_id" not in anchor_columns, f"anchors leaked merged_into: {anchor_columns}"
+
+            # events: no ingestion_key, no unique constraint, plain event_id index.
+            event_columns = columns("events")
+            assert "ingestion_key" not in event_columns, f"events leaked ingestion_key: {event_columns}"
+            for required in ("event_id", "event_time", "data", "source", "category"):
+                assert required in event_columns, f"events.{required} missing: {event_columns}"
+            event_uniques = remote.query(
+                f"SELECT conname FROM pg_constraint WHERE conrelid='{schema}.events'::regclass "
+                f"AND contype='u'"
+            )
+            assert event_uniques == [], f"events must carry no unique constraint: {event_uniques}"
+            event_indexes = remote.query(
+                f"SELECT indexname FROM pg_indexes WHERE schemaname='{schema}' AND tablename='events'"
+            )
+            assert "idx_events_event_id" in event_indexes, f"idx_events_event_id missing: {event_indexes}"
+
+            # event_atoms: target_occ present, head column absent.
+            event_atom_columns = columns("event_atoms")
+            assert "target_occ" in event_atom_columns, f"event_atoms.target_occ missing: {event_atom_columns}"
+            assert "head_occurrence_id" not in event_atom_columns, (
+                f"event_atoms leaked head_occurrence_id: {event_atom_columns}"
+            )
+
+            # class_membership: composite primary key (atom_id, anchor_id).
+            membership_pk = remote.query(
+                f"SELECT a.attname FROM pg_index i "
+                f"JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                f"WHERE i.indrelid='{schema}.class_membership'::regclass AND i.indisprimary "
+                f"ORDER BY a.attnum"
+            )
+            assert membership_pk == ["atom_id", "anchor_id"], f"class_membership pk wrong: {membership_pk}"
+
+            # "char" CHECK enums: role_type A/P/R/M, source, category, status.
+            def check_defs(column: str, table: str) -> str:
+                defs = remote.query(
+                    f"SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                    f"WHERE conrelid='{schema}.{table}'::regclass AND contype='c' "
+                    f"AND pg_get_constraintdef(oid) ILIKE '%{column}%'"
+                )
+                assert defs, f"no CHECK definition for {table}.{column}"
+                return defs[0]
+
+            assert "role_type" in check_defs("role_type", "event_atoms")
+            for value in ("'A'", "'P'", "'R'", "'M'"):
+                assert value in check_defs("role_type", "event_atoms"), f"role_type missing {value}"
+            for value in ("'L'", "'A'", "'P'", "'S'", "'M'"):
+                assert value in check_defs("source", "events"), f"source missing {value}"
+            for value in ("'R'", "'W'", "'C'", "'G'"):
+                assert value in check_defs("category", "events"), f"category missing {value}"
+            for value in ("'A'", "'D'"):
+                assert value in check_defs("status", "atoms"), f"atoms.status missing {value}"
+
+            # ingestion_alerts: dedupe_key NOT NULL + unique (contract unchanged).
             nullable = remote.query(
                 f"SELECT is_nullable FROM information_schema.columns "
                 f"WHERE table_schema='{schema}' AND table_name='ingestion_alerts' AND column_name='dedupe_key'"
             )
             assert nullable == ["NO"], f"dedupe_key nullable={nullable}"
-
-            # unique constraint present
             con = remote.query(
                 f"SELECT conname FROM pg_constraint WHERE conrelid='{schema}.ingestion_alerts'::regclass "
                 f"AND conname='ingestion_alerts_dedupe_key_unique'"
@@ -146,110 +215,6 @@ def test_fresh_install_baseline_matches_application_sql():
             remote.query(ins)
             cnt = remote.query(f"SELECT count(*) FROM {schema}.ingestion_alerts WHERE dedupe_key='dedupe-key-1'")
             assert cnt == ["1"], f"alert dedupe failed: {cnt}"
-        finally:
-            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-    finally:
-        remote.close()
-
-
-@requires_remote
-def test_migration_002_rerunnable_and_fail_closed():
-    """R02-03: migration 002 is a safe no-op on an already-complete structure
-    (even with data), and fail-closes when a missing column cannot be backfilled."""
-    schema = f"nzm_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
-    remote = _Remote()
-    try:
-        remote.query(f"CREATE SCHEMA {schema}")
-        try:
-            # --- Scenario 1&2: empty pre-migration schema -> first run succeeds
-            remote.run_file(_BASE_SQL_PATH, remap=schema)  # baseline already has the target structure
-            remote.run_file(_MIGRATION_PATH, remap=schema)  # re-run on complete structure = no-op
-
-            # Insert representative rows (structure complete) then re-run again -> no-op
-            remote.query(
-                f"INSERT INTO {schema}.events (event_time, ingestion_key, data, source, category) "
-                f"VALUES (now(), 'ik-1', '{{}}'::jsonb, 'hindsight_retain', 'fact')"
-            )
-            remote.query(
-                f"INSERT INTO {schema}.ingestion_alerts (dedupe_key, event_id, stage, alert_code, severity, message, details) "
-                f"VALUES ('dk-1', NULL, 'event_ingest', 'event_ingest_failed', 'error', 'm', '{{}}'::jsonb)"
-            )
-            # re-run with data present: must succeed as a no-op
-            remote.run_file(_MIGRATION_PATH, remap=schema)
-            # verify data still present, no half-state
-            assert remote.query(f"SELECT count(*) FROM {schema}.events") == ["1"]
-            assert remote.query(f"SELECT count(*) FROM {schema}.ingestion_alerts") == ["1"]
-        finally:
-            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-    finally:
-        remote.close()
-
-
-@requires_remote
-def test_migration_002_fail_closed_on_non_backfillable_data():
-    """R02-03: when the target column is missing and rows cannot be backfilled,
-    the migration fails (no guesses), and no half-migration state remains."""
-    schema = f"nzf2_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
-    remote = _Remote()
-    try:
-        remote.query(f"CREATE SCHEMA {schema}")
-        try:
-            # Build the FULL baseline, then strip dedupe_key so the alerts table
-            # is "old" while atoms/events still exist (so migration reaches the
-            # alerts step instead of failing earlier on a missing relation).
-            remote.run_file(_BASE_SQL_PATH, remap=schema)
-            remote.query(f"ALTER TABLE {schema}.ingestion_alerts DROP COLUMN dedupe_key CASCADE")
-            remote.query(
-                f"INSERT INTO {schema}.ingestion_alerts (stage, alert_code, severity, message) "
-                f"VALUES ('event_ingest', 'event_ingest_failed', 'error', 'm')"
-            )
-            # Running the (remapped) migration MUST fail because dedupe_key is
-            # missing AND data exists.
-            try:
-                remote.run_file(_MIGRATION_PATH, remap=schema)
-                raise AssertionError("migration should have fail-closed on non-backfillable data")
-            except RuntimeError as exc:
-                assert "cannot backfill" in str(exc) and "dedupe_key" in str(exc), f"unexpected error: {exc}"
-            # No half-migration: dedupe_key column must NOT have been added.
-            cols = remote.query(
-                f"SELECT column_name FROM information_schema.columns "
-                f"WHERE table_schema='{schema}' AND table_name='ingestion_alerts' AND column_name='dedupe_key'"
-            )
-            assert cols == [], f"half-migration leaked dedupe_key column: {cols}"
-        finally:
-            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-    finally:
-        remote.close()
-
-
-@requires_remote
-def test_migration_002_repairs_existing_nullable_identity_columns():
-    """An old schema may already have the columns but leave them nullable.
-    Clean columns are tightened; NULL-bearing columns fail closed."""
-    schema = f"nzn_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
-    remote = _Remote()
-    try:
-        remote.query(f"CREATE SCHEMA {schema}")
-        try:
-            remote.run_file(_BASE_SQL_PATH, remap=schema)
-            remote.query(f"ALTER TABLE {schema}.events ALTER COLUMN ingestion_key DROP NOT NULL")
-            remote.query(f"ALTER TABLE {schema}.ingestion_alerts ALTER COLUMN dedupe_key DROP NOT NULL")
-            remote.run_file(_MIGRATION_PATH, remap=schema)
-            nullable = remote.query(
-                f"SELECT table_name || ':' || is_nullable FROM information_schema.columns "
-                f"WHERE table_schema='{schema}' AND "
-                f"((table_name='events' AND column_name='ingestion_key') OR "
-                f"(table_name='ingestion_alerts' AND column_name='dedupe_key')) ORDER BY table_name"
-            )
-            assert nullable == ["events:NO", "ingestion_alerts:NO"]
-
-            remote.query(f"ALTER TABLE {schema}.events ALTER COLUMN ingestion_key DROP NOT NULL")
-            remote.query(
-                f"INSERT INTO {schema}.events (event_time, ingestion_key, data, source, category) "
-                f"VALUES (now(), NULL, '{{}}'::jsonb, 'hindsight_retain', 'fact')"
-            )
-            with pytest.raises(RuntimeError, match="ingestion_key.*NULL"):
-                remote.run_file(_MIGRATION_PATH, remap=schema)
         finally:
             remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     finally:

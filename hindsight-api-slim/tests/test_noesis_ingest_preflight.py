@@ -38,6 +38,9 @@ class _CatalogConn:
             return "events_hypertable" not in self.missing
         if "timescaledb_information.jobs" in sql:
             return "events_retention_90_days" not in self.missing
+        if "pg_indexes" in sql:
+            # 04A: the plain event_id index replaces the old unique constraint.
+            return "idx_events_event_id" not in self.missing
         if "information_schema.schemata" in sql:
             return args[0] not in self.missing
         if "information_schema.tables" in sql:
@@ -50,8 +53,6 @@ class _CatalogConn:
             # existence probe: args = (schema, table, column)
             return args[2] not in self.missing
         if "pg_constraint" in sql and "to_regclass" in sql:
-            if "events_ingestion_key_time_unique" in sql:
-                return "events_ingestion_key_time_unique" not in self.missing
             if "ingestion_alerts_dedupe_key_unique" in sql:
                 return "ingestion_alerts_dedupe_key_unique" not in self.missing
             if "atoms_text_type_unique" in sql:
@@ -131,9 +132,26 @@ async def test_missing_dedupe_key_column_fails():
         await _run(["dedupe_key"])
 
 
-async def test_missing_events_unique_constraint_fails():
-    with pytest.raises(SchemaPreflightError, match="events_ingestion_key_time_unique"):
-        await _run(["events_ingestion_key_time_unique"])
+async def test_missing_events_event_id_index_fails():
+    """04A: events carries no unique constraint; the plain event_id index is
+    the required object the preflight checks instead."""
+    with pytest.raises(SchemaPreflightError, match="idx_events_event_id"):
+        await _run(["idx_events_event_id"])
+
+
+async def test_ingestion_key_column_not_required():
+    """04A: the dropped events.ingestion_key column must not be probed."""
+    await _run(["ingestion_key"])  # no exception
+
+
+async def test_head_occurrence_id_column_not_required():
+    """04A: event_atoms uses target_occ; the old head column is not probed."""
+    await _run(["head_occurrence_id"])  # no exception
+
+
+async def test_missing_event_atoms_target_occ_fails():
+    with pytest.raises(SchemaPreflightError, match="column 'noesis_core.event_atoms.target_occ' does not exist"):
+        await _run(["target_occ"])
 
 
 async def test_missing_atom_unique_constraint_fails():

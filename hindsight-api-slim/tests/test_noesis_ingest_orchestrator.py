@@ -219,9 +219,9 @@ async def test_hermes_empty_and_hypothesis_semantics(monkeypatch):
     assert store.alerts == []
 
 
-async def test_hermes_hypothesis_only_deferred(monkeypatch):
+async def test_hermes_hypothesis_only_classification_pending(monkeypatch):
     """R02-07: hypothesis routed via the real boundary only writes
-    hypothesis_deferred, never a fact row."""
+    hypothesis_classification_pending, never a fact row."""
     from hyperextract.noesis import ExtractionOutcome
 
     import hindsight_api.engine.retain.noesis_ingest as noesis_ingest
@@ -244,9 +244,9 @@ async def test_hermes_hypothesis_only_deferred(monkeypatch):
     )
     assert store.events == {}
     assert store.atoms == {}
-    deferred = store.alerts_by_code("hypothesis_deferred")
-    assert len(deferred) == 1
-    assert deferred[0]["stage"] == "hypothesis_routing"
+    pending = store.alerts_by_code("hypothesis_classification_pending")
+    assert len(pending) == 1
+    assert pending[0]["stage"] == "hypothesis_routing"
 
 
 def _fake_pool_factory(store):

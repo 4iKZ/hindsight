@@ -1,24 +1,22 @@
-"""Noesis store tests: mapping, envelope, idempotency, failure injection.
+"""Noesis store tests: mapping, envelope, sequence issue, failure injection.
 
-Requirement 02 §10 / §11 / §17.4–§17.6. The database is the in-memory
+Requirement 02 §10 / §17.4–§17.6 realigned to the 04A latest contract: events
+are sequence-numbered (no ingestion_key, no replay, no collision — duplicate
+input is a new event by contract), atoms carry no support_count, event_atoms
+use role_type A/P/R/M plus target_occ. The database is the in-memory
 FakeStore; the extraction layer is bypassed (components injected as golden
 ExtractionOutcomes through the module-level extract seam).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime, timedelta
 
 from hyperextract.noesis import ExtractionAlert, FactComponent
 
 import hindsight_api.engine.retain.noesis_ingest as noesis_ingest
-from hindsight_api.engine.retain.noesis_ingest import (
-    NoesisInputItem,
-    compute_ingestion_key,
-    ingest_noesis_batch,
-)
+from hindsight_api.engine.retain.noesis_ingest import ingest_noesis_batch
 from tests.noesis_fakes import (
     CONTENT,
     GOLDEN_FACT_RECURSIVE_JSON,
@@ -76,6 +74,14 @@ def event_atom_args(store):
     return [args for kind, sql, args in store.calls if kind == "execute" and ".event_atoms" in sql]
 
 
+def event_insert_calls(store):
+    return [
+        (sql, args)
+        for kind, sql, args in store.calls
+        if kind == "fetchrow" and ".events" in sql and sql.lstrip().upper().startswith("INSERT")
+    ]
+
+
 def first_event_data(store) -> dict:
     return next(iter(store.events.values()))["data"]
 
@@ -95,22 +101,40 @@ async def test_event_atoms_mechanical_mapping(monkeypatch):
     rows = event_atom_args(store)
     assert len(rows) == 5
     by_occurrence = {row[1]: row for row in rows}
-    # (event_id, occurrence_id, atom_id, role_type, head_occurrence_id)
-    assert by_occurrence[1][3] == "agent"
+    # (event_id, occurrence_id, atom_id, role_type, target_occ)
+    assert by_occurrence[1][3] == "A"  # agent
     assert by_occurrence[1][4] == 4
-    assert by_occurrence[2][3] == "predicate"
+    assert by_occurrence[2][3] == "R"  # predicate
     assert by_occurrence[2][4] == 4
-    assert by_occurrence[3][3] == "patient"
+    assert by_occurrence[3][3] == "P"  # patient
     assert by_occurrence[3][4] == 2
-    assert by_occurrence[4][3] == "predicate"
-    assert by_occurrence[4][4] is None  # root predicate head is NULL
-    assert by_occurrence[5][3] == "patient"
+    assert by_occurrence[4][3] == "R"
+    assert by_occurrence[4][4] is None  # root predicate target is NULL
+    assert by_occurrence[5][3] == "P"
     assert by_occurrence[5][4] == 4
     # anchor_id is never written (stays NULL): the insert carries five values only
     assert all(len(row) == 5 for row in rows)
 
 
-async def test_repeated_text_two_occurrences_one_support(monkeypatch):
+async def test_role_four_values_map_one_to_one(monkeypatch):
+    """agent→A, patient→P, predicate→R, modifier→M — every value exercised."""
+    store = FakeStore()
+    await run(
+        store,
+        [{"content": "昨天妈妈在超市买了苹果。", "event_date": OBSERVED_AT}],
+        [golden_fact_time()],
+    )
+
+    rows = event_atom_args(store)
+    by_occurrence = {row[1]: row for row in rows}
+    assert by_occurrence[1][3] == "M"  # 昨天 modifier
+    assert by_occurrence[2][3] == "A"  # 妈妈 agent
+    assert by_occurrence[3][3] == "M"  # 在超市 modifier
+    assert by_occurrence[4][3] == "R"  # 买 predicate
+    assert by_occurrence[5][3] == "P"  # 苹果 patient
+
+
+async def test_repeated_text_two_occurrences_one_upsert(monkeypatch):
     store = FakeStore()
     await run(store, one_fact_contents(), [golden_fact_recursive()])
 
@@ -118,8 +142,7 @@ async def test_repeated_text_two_occurrences_one_support(monkeypatch):
     upserts = atom_upsert_args(store)
     # distinct typed literals: (小明,E), (没写,P), (作业,E), (揍,P) → 4 upserts
     assert set(upserts) == {("小明", "E"), ("作业", "E"), ("没写", "P"), ("揍", "P")}
-    assert store.support_count("小明", "E") == 1
-    assert store.support_count("没写", "P") == 1
+    assert len(store.atoms) == 4  # one atom row per typed literal
 
 
 async def test_same_text_different_types_are_distinct_atoms(monkeypatch):
@@ -203,71 +226,75 @@ async def test_time_range_metadata_saved_in_data(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# §11.1 ingestion_key
+# 04A latest contract: sequence-numbered event insert
 # ---------------------------------------------------------------------------
 
-def _item(**overrides):
-    fields = dict(
-        bank_id="bank-1",
-        content=CONTENT,
-        observed_at=OBSERVED_AT,
-        operation_id=None,
-        document_id=None,
-        item_index=0,
-    )
-    fields.update(overrides)
-    return NoesisInputItem(**fields)
+async def test_event_insert_sequence_returning_no_conflict(monkeypatch):
+    store = FakeStore()
+    await run(store, one_fact_contents(), [golden_fact_recursive()])
+
+    calls = event_insert_calls(store)
+    assert len(calls) == 1
+    sql, args = calls[0]
+    assert "ingestion_key" not in sql
+    assert "ON CONFLICT" not in sql
+    assert "RETURNING event_id" in sql
+    # (event_time, data_json, source, category) — source 'L' (LLM extraction),
+    # category 'R' (raw) are the frozen "char" enum values of the new DDL.
+    assert args[2] == "L"
+    assert args[3] == "R"
 
 
-def test_ingestion_key_stable_for_same_input():
-    dump = golden_fact_recursive().model_dump(mode="json")
-    assert compute_ingestion_key(item=_item(), component_index=0, component_json=dump) == compute_ingestion_key(
-        item=_item(), component_index=0, component_json=dump
-    )
+async def test_event_id_shared_with_event_atoms_same_transaction(monkeypatch):
+    store = FakeStore()
+    await run(store, one_fact_contents(), [golden_fact_recursive()])
+
+    event_id = next(iter(store.events.values()))["event_id"]
+    rows = event_atom_args(store)
+    assert rows
+    assert all(row[0] == event_id for row in rows)
 
 
-def test_ingestion_key_varies_with_component_index():
-    dump = golden_fact_recursive().model_dump(mode="json")
-    assert compute_ingestion_key(item=_item(), component_index=0, component_json=dump) != compute_ingestion_key(
-        item=_item(), component_index=1, component_json=dump
-    )
+async def test_atom_upsert_carries_no_support_count(monkeypatch):
+    store = FakeStore()
+    await run(store, one_fact_contents(), [golden_fact_recursive()])
 
-
-def test_ingestion_key_varies_with_observed_at():
-    dump = golden_fact_recursive().model_dump(mode="json")
-    assert compute_ingestion_key(item=_item(), component_index=0, component_json=dump) != compute_ingestion_key(
-        item=_item(observed_at=OBSERVED_AT + timedelta(minutes=1)), component_index=0, component_json=dump
-    )
-
-
-def test_ingestion_key_varies_with_content():
-    dump = golden_fact_recursive().model_dump(mode="json")
-    assert compute_ingestion_key(item=_item(), component_index=0, component_json=dump) != compute_ingestion_key(
-        item=_item(content="另一句话。"), component_index=0, component_json=dump
-    )
+    upserts = [
+        (sql, args)
+        for kind, sql, args in store.calls
+        if kind == "fetchrow" and ".atoms" in sql and sql.lstrip().upper().startswith("INSERT")
+    ]
+    assert upserts
+    for sql, args in upserts:
+        assert "support_count" not in sql
+        assert len(args) == 3  # (text, atom_type, vector) only
 
 
 # ---------------------------------------------------------------------------
-# §11.2/§11.4 idempotency & concurrency
+# §11.2 duplicate input is a new event (04A contract behavior)
 # ---------------------------------------------------------------------------
 
-async def test_serial_replay_single_event_no_double_support(monkeypatch):
+async def test_serial_duplicate_input_two_events(monkeypatch):
+    """Events have no unique key: the same input twice lands two events."""
     store = FakeStore()
     await run(store, one_fact_contents(), [golden_fact_recursive()])
     await run(store, one_fact_contents(), [golden_fact_recursive()])
 
-    assert len(store.events) == 1
-    assert store.support_count("小明", "E") == 1
-    assert len(store.event_atoms) == 5
+    assert len(store.events) == 2
+    assert len(store.event_atoms) == 10  # 5 per event
+    assert len(store.atoms) == 4  # upserts are still per-typed-literal unique
     assert store.rollbacks == 0
 
 
-async def test_replay_returns_existing_event_id(monkeypatch):
+async def test_duplicate_input_event_ids_differ(monkeypatch):
     store = FakeStore()
     await run(store, one_fact_contents(), [golden_fact_recursive()])
-    first_event_id = next(iter(store.events.values()))["event_id"]
     await run(store, one_fact_contents(), [golden_fact_recursive()])
-    assert next(iter(store.events.values()))["event_id"] == first_event_id
+
+    assert sorted(store.events) == sorted(set(store.events))  # distinct ids
+    first_ids = {row[0] for row in event_atom_args(store)[:5]}
+    second_ids = {row[0] for row in event_atom_args(store)[5:]}
+    assert first_ids != second_ids  # each event's rows share only their own id
 
 
 async def test_same_content_different_observed_at_two_events(monkeypatch):
@@ -276,10 +303,12 @@ async def test_same_content_different_observed_at_two_events(monkeypatch):
     await run(store, one_fact_contents(OBSERVED_AT + timedelta(days=1)), [golden_fact_recursive()])
 
     assert len(store.events) == 2
-    assert store.support_count("小明", "E") == 2
+    assert len(store.atoms) == 4
 
 
-async def test_concurrent_same_event_single_row(monkeypatch):
+async def test_concurrent_duplicate_input_two_events(monkeypatch):
+    import asyncio
+
     async def yield_once():  # fresh coroutine per call: two tasks may interleave safely
         await asyncio.sleep(0)
 
@@ -290,19 +319,20 @@ async def test_concurrent_same_event_single_row(monkeypatch):
         run(store, one_fact_contents(), [golden_fact_recursive()]),
     )
 
-    assert len(store.events) == 1
-    assert store.support_count("小明", "E") == 1
-    assert len(store.event_atoms) == 5
+    assert len(store.events) == 2
+    assert len(store.event_atoms) == 10
+    assert len(store.atoms) == 4  # one atom row per typed literal
 
 
-async def test_two_events_concurrent_same_atom_support_two(monkeypatch):
+async def test_two_events_concurrent_same_atom_single_row(monkeypatch):
+    import asyncio
+
     store = FakeStore()
     await asyncio.gather(
         run(store, one_fact_contents(), [golden_fact_recursive()]),
         run(store, one_fact_contents(OBSERVED_AT + timedelta(days=1)), [golden_fact_recursive()]),
     )
     assert len(store.events) == 2
-    assert store.support_count("小明", "E") == 2
     assert len(store.atoms) == 4  # one atom row per typed literal
 
 
@@ -338,40 +368,13 @@ async def test_extraction_error_retry_single_alert(monkeypatch):
     assert store.events == {}
 
 
-async def test_key_collision_fails_closed(monkeypatch):
-    """Same ingestion key, different stored component → collision alert, old data intact."""
-    store = FakeStore()
-    await run(store, one_fact_contents(), [golden_fact_recursive()])
-    original_event_id = next(iter(store.events.values()))["event_id"]
-
-    original_select = FakeStore._select_event
-
-    def tampered_select(self, args):
-        row = original_select(self, args)
-        if row is not None:
-            data = json.loads(row["data"])
-            data["component"]["tree"]["predicate"] = "被篡改"
-            row["data"] = json.dumps(data, ensure_ascii=False)
-        return row
-
-    monkeypatch.setattr(FakeStore, "_select_event", tampered_select)
-    await run(store, one_fact_contents(), [golden_fact_recursive()])
-
-    collisions = store.alerts_by_code("ingestion_key_collision")
-    assert len(collisions) == 1
-    assert collisions[0]["severity"] == "error"
-    assert collisions[0]["stage"] == "event_ingest"
-    assert collisions[0]["event_id"] == original_event_id  # existing event recorded
-    assert first_event_data(store)["component"]["tree"]["predicate"] == "揍"  # old data untouched
-
-
 # ---------------------------------------------------------------------------
 # §11.3 / §17.6 failure injection — zero half state
 # ---------------------------------------------------------------------------
 
 def _assert_no_fact_state(store):
     assert store.events == {}, "event must roll back"
-    assert store.atoms == {}, "atom support must roll back"
+    assert store.atoms == {}, "atom rows must roll back"
     assert store.event_atoms == [], "event_atoms must roll back"
 
 

@@ -58,20 +58,20 @@ async def _run(store, contents, monkeypatch, *, components=None, **kwargs):
 # ---------------------------------------------------------------------------
 
 async def test_missing_time_reused_across_retries(monkeypatch):
-    """Same input retried twice (same op/doc/content, no time) must produce one
-    stable observed_at -> one event, stable ingestion_key."""
+    """Same input retried twice must reuse the queue-persisted observed_at.
+    04A: events have no replay key, so the retry lands a second event by
+    contract — the stability being asserted is the timestamp, not the count."""
     store = FakeStore()
     queued_item = _contents()
     queued_item["_noesis_observed_at"] = "2026-09-05T02:00:00Z"
     await _run(store, [queued_item], monkeypatch, components=[golden_fact_recursive()], operation_id="op-1")
     first_observed = next(iter(store.events.values()))["data"]["observed_at"]
-    first_key = next(iter(store.events.keys()))[0]
 
     # retry the same input
     await _run(store, [dict(queued_item)], monkeypatch, components=[golden_fact_recursive()], operation_id="op-1")
-    assert len(store.events) == 1, "retry must not create a second event"
-    assert next(iter(store.events.values()))["data"]["observed_at"] == first_observed
-    assert next(iter(store.events.keys()))[0] == first_key
+    assert len(store.events) == 2  # duplicate input is a new event (04A contract)
+    observed = {event["data"]["observed_at"] for event in store.events.values()}
+    assert observed == {first_observed}
 
 
 def test_no_unbounded_observed_at_process_cache_exists():
@@ -86,8 +86,8 @@ async def test_different_operations_same_content_distinct(monkeypatch):
     assert len(store.events) == 2
     observed = {e["data"]["observed_at"] for e in store.events.values()}
     assert len(observed) == 2, "different operations must use different captured times"
-    # both are real events (support for the shared typed literal increments)
-    assert store.support_count("小明", "E") == 2
+    # both are real events; the shared typed literals stay one atom row each
+    assert len(store.atoms) == 4
 
 
 async def test_explicit_time_not_overridden_by_cache(monkeypatch):

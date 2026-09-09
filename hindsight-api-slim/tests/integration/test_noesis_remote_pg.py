@@ -263,7 +263,9 @@ async def test_remote_noesis_smoke():
         }
         assert set(extensions) == {"vector", "roaringbitmap", "timescaledb", "pg_ripple"}, extensions
 
-        # 2. Migration constraints present
+        # 2. 04A constraints: atoms pair-unique + alert dedupe unique present;
+        #    events has NO unique constraint (sequence-numbered) and carries
+        #    the plain idx_events_event_id index.
         constraints = {
             row["conname"]
             for row in await conn.fetch(
@@ -271,11 +273,12 @@ async def test_remote_noesis_smoke():
                 ["atoms_text_type_unique", "events_ingestion_key_time_unique", "ingestion_alerts_dedupe_key_unique"],
             )
         }
-        assert constraints == {
-            "atoms_text_type_unique",
-            "events_ingestion_key_time_unique",
-            "ingestion_alerts_dedupe_key_unique",
-        }
+        assert constraints == {"atoms_text_type_unique", "ingestion_alerts_dedupe_key_unique"}, constraints
+        event_index = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes "
+            "WHERE schemaname='noesis_core' AND tablename='events' AND indexname='idx_events_event_id')"
+        )
+        assert event_index is True
 
         # 3. Outer transaction: everything below rolls back at the end.
         # (asyncpg forbids manual BEGIN via execute(); its transaction object
@@ -290,7 +293,7 @@ async def test_remote_noesis_smoke():
 
         # 5. Verify events / atoms / event_atoms / data
         events = await conn.fetch(
-            "SELECT event_id, event_time, ingestion_key, data FROM noesis_core.events ORDER BY event_id"
+            "SELECT event_id, event_time, source, category, data FROM noesis_core.events ORDER BY event_id"
         )
         assert len(events) == 2
         by_predicate = {json.loads(e["data"])["component"]["tree"]["predicate"]: e for e in events}
@@ -298,6 +301,8 @@ async def test_remote_noesis_smoke():
 
         buy_event = by_predicate["买"]
         beat_event = by_predicate["揍"]
+        # asyncpg decodes the internal one-byte "char" type as bytes.
+        assert all(e["source"] == b"L" and e["category"] == b"R" for e in events)  # 04A "char" enums
         # 昨天 resolved to the Shanghai day start → 2026-09-03T16:00:00Z
         assert buy_event["event_time"] == datetime(2026, 9, 3, 16, 0, 0, tzinfo=UTC)
         beat_data = json.loads(beat_event["data"])
@@ -309,13 +314,12 @@ async def test_remote_noesis_smoke():
         assert beat_data["source_text"] == "昨天妈妈在超市买了苹果。小明没写作业后揍了自己。"
 
         atoms = {
-            row["text"] + row["atom_type"]: row
-            for row in await conn.fetch("SELECT atom_id, text, atom_type, support_count, embedding FROM noesis_core.atoms")
+            row["text"] + row["atom_type"].decode(): row
+            for row in await conn.fetch("SELECT atom_id, text, atom_type, embedding FROM noesis_core.atoms")
         }
         # 买-fact: 昨天 E, 妈妈 E, 在超市 E, 买 P, 苹果 E
         # 揍-fact: 小明 E, 没写 P, 作业 E, 揍 P
         assert set(atoms) == {"昨天E", "妈妈E", "在超市E", "买P", "苹果E", "小明E", "没写P", "作业E", "揍P"}
-        assert all(row["support_count"] == 1 for row in atoms.values())  # repeated 小明 → one support
         # Requirement 03: every new E/P atom now embeds BGE(pure literal) on
         # creation (the fake identity client yields a deterministic 1024-dim
         # vector), so embedding is non-NULL for E/P. Real-bge coverage is in
@@ -323,7 +327,7 @@ async def test_remote_noesis_smoke():
         assert all(row["embedding"] is not None for row in atoms.values()), "E/P atoms must carry a vector"
 
         beat_atoms = await conn.fetch(
-            "SELECT occurrence_id, atom_id, anchor_id, role_type, head_occurrence_id "
+            "SELECT occurrence_id, atom_id, anchor_id, role_type, target_occ "
             "FROM noesis_core.event_atoms WHERE event_id = $1 ORDER BY occurrence_id",
             beat_event["event_id"],
         )
@@ -331,23 +335,23 @@ async def test_remote_noesis_smoke():
         xiaoming_atom = atoms["小明E"]["atom_id"]
         assert beat_atoms[0]["atom_id"] == xiaoming_atom and beat_atoms[4]["atom_id"] == xiaoming_atom
         assert all(row["anchor_id"] is None for row in beat_atoms)
-        heads = {row["occurrence_id"]: row["head_occurrence_id"] for row in beat_atoms}
-        assert heads == {1: 4, 2: 4, 3: 2, 4: None, 5: 4}  # mechanical target_occ mapping
+        roles = {row["occurrence_id"]: row["role_type"].decode() for row in beat_atoms}
+        assert roles == {1: "A", 2: "R", 3: "P", 4: "R", 5: "P"}  # agent/predicate/patient/predicate/patient
+        targets = {row["occurrence_id"]: row["target_occ"] for row in beat_atoms}
+        assert targets == {1: 4, 2: 4, 3: 2, 4: None, 5: 4}  # mechanical target_occ mapping
 
-        # 6. Replay: same input twice → still one event per fact, support +0
+        # 6. 04A: duplicate input has no replay — the same input twice lands
+        #    NEW events (sequence numbers), one atom row per typed literal.
         await _ingest_two_golden_facts(pool, _YesterdayAnalyzer())
         replay_events = await conn.fetch("SELECT count(*) c FROM noesis_core.events")
-        assert replay_events[0]["c"] == 2
-        replay_support = await conn.fetchval(
-            "SELECT support_count FROM noesis_core.atoms WHERE text='小明' AND atom_type='E'"
-        )
-        assert replay_support == 1
-        replay_atoms = await conn.fetch("SELECT count(*) c FROM noesis_core.event_atoms")
-        assert replay_atoms[0]["c"] == 10  # 5 per fact, unchanged
+        assert replay_events[0]["c"] == 4  # 2 original + 2 new events
+        replay_atoms = await conn.fetch("SELECT count(*) c FROM noesis_core.atoms")
+        assert replay_atoms[0]["c"] == 9  # upserts stay one row per typed literal
+        replay_event_atoms = await conn.fetch("SELECT count(*) c FROM noesis_core.event_atoms")
+        assert replay_event_atoms[0]["c"] == 20  # 5 per event
 
         # 7. Failure injection: break the event_atoms insert for a FRESH fact
-        #    (a replay would skip the write path entirely) → full rollback,
-        #    event_ingest_failed alert written, batch continues.
+        #    → full rollback, event_ingest_failed alert written, batch continues.
         original_sql = noesis_ingest._EVENT_ATOM_INSERT
         original_extract = noesis_ingest.extract_noesis_components
         noesis_ingest._EVENT_ATOM_INSERT = "INSERT INTO {s}.event_atoms (event_id, occurrence_id, nonexistent_column) VALUES ($1, $2, $3)"
@@ -377,7 +381,7 @@ async def test_remote_noesis_smoke():
         )
         assert len(failed_alerts) == 1  # the fresh fact failed and rolled back
         after_failure_events = await conn.fetch("SELECT count(*) c FROM noesis_core.events")
-        assert after_failure_events[0]["c"] == 2  # no new events, old intact
+        assert after_failure_events[0]["c"] == 4  # no new events, old intact
 
         # 8. Rollback the outer transaction: zero business rows remain.
         await outer_tx.rollback()
