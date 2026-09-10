@@ -2877,7 +2877,7 @@ class HindsightConfig:
     noesis_pool_max_size: int = DEFAULT_NOESIS_POOL_MAX_SIZE
     noesis_command_timeout: int = DEFAULT_NOESIS_COMMAND_TIMEOUT
     # Noesis identity embedding service (requirement 03 §10.1). Drives the
-    # bge identity-vector client in engine/retain/noesis_identity_vector.py.
+    # bge embedding client in engine/retain/noesis_embedding.py.
     noesis_embedding_base_url: str = DEFAULT_NOESIS_EMBEDDING_BASE_URL
     noesis_embedding_model: str = DEFAULT_NOESIS_EMBEDDING_MODEL
     noesis_embedding_revision: str = DEFAULT_NOESIS_EMBEDDING_REVISION

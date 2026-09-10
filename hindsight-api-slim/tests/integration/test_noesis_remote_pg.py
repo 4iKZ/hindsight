@@ -32,11 +32,11 @@ pytest.importorskip("asyncpg")
 
 from hindsight_api.engine.retain import noesis_ingest  # noqa: E402
 from tests.noesis_fakes import (  # noqa: E402
+    FakeEmbeddingClient,
     FakeExtractOnceFactory,
-    FakeIdentityClient,
+    embedding_factory_for,
     golden_fact_recursive,
     golden_fact_time,
-    identity_factory_for,
     llm_config,
     noesis_config,
 )
@@ -56,6 +56,11 @@ def _remote_enabled() -> bool:
 
 
 requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_REMOTE_TEST/SSH env not set")
+
+# Serialize with every other remote noesis_core test under pytest-xdist: this
+# file asserts absolute zero residue after ROLLBACK, which a parallel sibling's
+# committed noesis05-test- window would break.
+remote_group = pytest.mark.xdist_group("noesis_remote")
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +186,7 @@ async def _ingest_two_golden_facts(pool, analyzer):
     original = noesis_ingest.extract_noesis_components
     noesis_ingest.extract_noesis_components = fake_extract
     # A fake identity client keeps this requirement-02 smoke deterministic and
-    # offline: real bge + PG coverage lives in test_noesis_identity_remote.py.
+    # offline: real bge + PG coverage lives in test_noesis_embedding_remote.py.
     # Req-03 embeds every new E/P atom, so atoms.embedding is now non-NULL.
     try:
         await noesis_ingest.ingest_noesis_batch(
@@ -198,7 +203,7 @@ async def _ingest_two_golden_facts(pool, analyzer):
             analyzer=analyzer,
             extract_once_factory=FakeExtractOnceFactory(),
             pool_factory=_async_return(pool),
-            identity_client_factory=identity_factory_for(FakeIdentityClient()),
+            embedding_client_factory=embedding_factory_for(FakeEmbeddingClient()),
         )
     finally:
         noesis_ingest.extract_noesis_components = original
@@ -230,6 +235,7 @@ class _YesterdayAnalyzer:
 # ---------------------------------------------------------------------------
 
 @requires_remote
+@remote_group
 async def test_remote_noesis_smoke():
     import asyncpg
 
@@ -323,7 +329,7 @@ async def test_remote_noesis_smoke():
         # Requirement 03: every new E/P atom now embeds BGE(pure literal) on
         # creation (the fake identity client yields a deterministic 1024-dim
         # vector), so embedding is non-NULL for E/P. Real-bge coverage is in
-        # test_noesis_identity_remote.py; G atoms stay NULL by contract.
+        # test_noesis_embedding_remote.py; G atoms stay NULL by contract.
         assert all(row["embedding"] is not None for row in atoms.values()), "E/P atoms must carry a vector"
 
         beat_atoms = await conn.fetch(
@@ -334,7 +340,11 @@ async def test_remote_noesis_smoke():
         assert len(beat_atoms) == 5  # 小明 twice → two occurrences
         xiaoming_atom = atoms["小明E"]["atom_id"]
         assert beat_atoms[0]["atom_id"] == xiaoming_atom and beat_atoms[4]["atom_id"] == xiaoming_atom
-        assert all(row["anchor_id"] is None for row in beat_atoms)
+        # Requirement 05: every successful occurrence carries the anchor routed
+        # in the same transaction; the two 小明 occurrences share one route
+        # ((atom, frame) is sampled once per component, §5.6).
+        assert all(row["anchor_id"] is not None for row in beat_atoms)
+        assert beat_atoms[0]["anchor_id"] == beat_atoms[4]["anchor_id"]
         roles = {row["occurrence_id"]: row["role_type"].decode() for row in beat_atoms}
         assert roles == {1: "A", 2: "R", 3: "P", 4: "R", 5: "P"}  # agent/predicate/patient/predicate/patient
         targets = {row["occurrence_id"]: row["target_occ"] for row in beat_atoms}
@@ -370,7 +380,7 @@ async def test_remote_noesis_smoke():
                 analyzer=_YesterdayAnalyzer(),
                 extract_once_factory=FakeExtractOnceFactory(),
                 pool_factory=_async_return(pool),
-                identity_client_factory=identity_factory_for(FakeIdentityClient()),
+                embedding_client_factory=embedding_factory_for(FakeEmbeddingClient()),
             )
         finally:
             noesis_ingest._EVENT_ATOM_INSERT = original_sql
@@ -385,7 +395,7 @@ async def test_remote_noesis_smoke():
 
         # 8. Rollback the outer transaction: zero business rows remain.
         await outer_tx.rollback()
-        for table in ("events", "event_atoms", "ingestion_alerts"):
+        for table in ("events", "event_atoms", "ingestion_alerts", "anchors"):
             remaining = await conn.fetchval(f"SELECT count(*) FROM noesis_core.{table}")
             assert remaining == 0, f"{table} rows leaked: {remaining}"
         remaining_atoms = await conn.fetchval("SELECT count(*) FROM noesis_core.atoms")

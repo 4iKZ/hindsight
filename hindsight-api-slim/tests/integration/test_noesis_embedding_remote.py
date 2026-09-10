@@ -1,6 +1,6 @@
 """Remote bge-m3 + PostgreSQL smoke test (requirement 03 §15.6).
 
-Runs the REAL write path (real ``NoesisIdentityClient`` against
+Runs the REAL write path (real ``NoesisEmbeddingClient`` against
 ``http://10.0.0.8:8010``, real asyncpg, real ``noesis_core``) inside one outer
 transaction so the final ``ROLLBACK`` leaves zero business rows. Gated: skipped
 unless ``NOESIS_REMOTE_TEST=1`` and the SSH env vars are present.
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 import os
 import socket
@@ -41,13 +42,13 @@ pytest.importorskip("asyncpg")
 pytest.importorskip("httpx")
 
 from hindsight_api.engine.retain import noesis_ingest  # noqa: E402
-from hindsight_api.engine.retain.noesis_identity_rebuild import (  # noqa: E402
-    BuildSpec,
-    run_identity_rebuild,
-)
-from hindsight_api.engine.retain.noesis_identity_vector import (  # noqa: E402
-    NoesisIdentityClient,
+from hindsight_api.engine.retain.noesis_embedding import (  # noqa: E402
+    NoesisEmbeddingClient,
     normalize_model_basename,
+)
+from hindsight_api.engine.retain.noesis_embedding_rebuild import (  # noqa: E402
+    BuildSpec,
+    run_embedding_rebuild,
 )
 from tests.noesis_fakes import (  # noqa: E402
     FakeExtractOnceFactory,
@@ -70,6 +71,10 @@ def _remote_enabled() -> bool:
 
 
 requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_REMOTE_TEST/SSH env not set")
+
+# Serialize with every other remote noesis_core test under pytest-xdist (see
+# test_noesis_remote_pg.remote_group for the why).
+remote_group = pytest.mark.xdist_group("noesis_remote")
 
 
 class _SshTunnel:
@@ -197,8 +202,8 @@ async def _apply_migration_003(pool):
     await pool.execute(content)
 
 
-async def _real_bge_client() -> NoesisIdentityClient:
-    return NoesisIdentityClient(
+async def _real_bge_client() -> NoesisEmbeddingClient:
+    return NoesisEmbeddingClient(
         base_url=_REAL_BGE_URL,
         model="bge-m3",
         revision="bge-m3-1024-v1",
@@ -209,6 +214,7 @@ async def _real_bge_client() -> NoesisIdentityClient:
 
 
 @requires_remote
+@remote_group
 async def test_remote_identity_health_and_cosine_smoke():
     # 1. Real /health: dim=1024 and exact normalized basename.
     client = await _real_bge_client()
@@ -220,10 +226,10 @@ async def test_remote_identity_health_and_cosine_smoke():
         assert normalize_model_basename(payload["model"]) == "bge-m3"
 
         # 2. Real encoding of golden literals: 1024-dim floats each.
-        v_apple = await client.embed("苹果", "E")
-        v_iphone = await client.embed("苹果手机", "E")
-        v_carrier = await client.embed("航空母舰", "E")
-        v_buy = await client.embed("买", "P")
+        v_apple = await client.embed_identity("苹果", "E")
+        v_iphone = await client.embed_identity("苹果手机", "E")
+        v_carrier = await client.embed_identity("航空母舰", "E")
+        v_buy = await client.embed_identity("买", "P")
         assert len(v_apple) == 1024
         assert len(v_iphone) == 1024
         assert len(v_carrier) == 1024
@@ -236,6 +242,7 @@ async def test_remote_identity_health_and_cosine_smoke():
 
 
 @requires_remote
+@remote_group
 async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
     import asyncpg
 
@@ -284,7 +291,7 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
                 llm_config=llm_config(),
                 extract_once_factory=FakeExtractOnceFactory(),
                 pool_factory=_async_return(pool),
-                identity_client_factory=_async_return(client),
+                embedding_client_factory=_async_return(client),
             )
 
             # 7. Atoms landed with non-NULL real vectors, vector_dims=1024.
@@ -292,7 +299,8 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
                 "SELECT atom_id, text, atom_type, embedding, vector_dims(embedding) AS dims FROM noesis_core.atoms"
             )
             assert len(atoms) >= 4
-            ep = [row for row in atoms if row["atom_type"] in ("E", "P")]
+            # asyncpg decodes the 04A one-byte "char" enum as bytes.
+            ep = [row for row in atoms if row["atom_type"] in (b"E", b"P")]
             assert ep, "no E/P atoms written"
             for row in ep:
                 assert row["embedding"] is not None, f"{row['text']} has NULL embedding"
@@ -313,7 +321,7 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
 
         # 9. Rollback the outer transaction: zero business rows remain.
         await outer_tx.rollback()
-        for table in ("events", "event_atoms", "ingestion_alerts"):
+        for table in ("events", "event_atoms", "ingestion_alerts", "anchors"):
             remaining = await conn.fetchval(f"SELECT count(*) FROM noesis_core.{table}")
             assert remaining == 0, f"{table} rows leaked: {remaining}"
         remaining_atoms = await conn.fetchval("SELECT count(*) FROM noesis_core.atoms WHERE embedding IS NOT NULL")
@@ -325,7 +333,8 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
 
 
 @requires_remote
-async def test_remote_identity_rebuild_stages_and_atomically_cuts_over():
+@remote_group
+async def test_remote_embedding_rebuild_stages_and_atomically_cuts_over():
     """Exercise the production rebuild SQL against real pgvector/PostgreSQL."""
     import asyncpg
 
@@ -336,13 +345,27 @@ async def test_remote_identity_rebuild_stages_and_atomically_cuts_over():
         conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
         outer_tx = conn.transaction()
         await outer_tx.start()
-        schema = f"noesis_identity_test_{uuid.uuid4().hex[:12]}"
+        schema = f"noesis_embedding_test_{uuid.uuid4().hex[:12]}"
         await conn.execute(f'CREATE SCHEMA "{schema}"')
         await conn.execute(
             f'CREATE TABLE "{schema}".atoms ('
             "atom_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
             "text TEXT NOT NULL, atom_type CHAR(1) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'active', "
             "embedding vector(1024))"
+        )
+        await conn.execute(
+            f'CREATE TABLE "{schema}".anchors ('
+            "anchor_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+            f'atom_id BIGINT NOT NULL REFERENCES "{schema}".atoms(atom_id), '
+            "centroid_vector vector(1024) NOT NULL, total_count BIGINT NOT NULL DEFAULT 0, "
+            "status CHAR(1) NOT NULL DEFAULT 'A', updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        await conn.execute(f'CREATE TABLE "{schema}".events (event_id BIGINT PRIMARY KEY, data JSONB NOT NULL)')
+        await conn.execute(
+            f'CREATE TABLE "{schema}".event_atoms ('
+            "event_id BIGINT NOT NULL, occurrence_id INT NOT NULL, atom_id BIGINT NOT NULL, "
+            "anchor_id BIGINT NOT NULL, role_type CHAR(1) NOT NULL, target_occ INT, "
+            "PRIMARY KEY (event_id, occurrence_id))"
         )
         await conn.execute(
             f'CREATE TABLE "{schema}".embedding_profiles ('
@@ -354,28 +377,95 @@ async def test_remote_identity_rebuild_stages_and_atomically_cuts_over():
             "(embedding_kind, model_name, model_revision, dimension, status) "
             "VALUES ('identity', 'bge-m3', 'old-generation', 1024, 'ready')"
         )
-        await conn.executemany(
-            f'INSERT INTO "{schema}".atoms (text, atom_type) VALUES ($1, $2)',
-            [("苹果", "E"), ("购买", "P"), ("内部构元", "G")],
+        atom_ids: dict[str, int] = {}
+        for text, atom_type in (("张三", "E"), ("修复", "P"), ("服务器", "E"), ("内部构元", "G")):
+            row = await conn.fetchrow(
+                f'INSERT INTO "{schema}".atoms (text, atom_type) VALUES ($1, $2) RETURNING atom_id',
+                text,
+                atom_type,
+            )
+            atom_ids[text] = row["atom_id"]
+        zeros = "[" + ",".join(["0"] * 1024) + "]"
+        anchor_ids: dict[str, int] = {}
+        for text in ("张三", "修复", "服务器"):
+            row = await conn.fetchrow(
+                f'INSERT INTO "{schema}".anchors (atom_id, centroid_vector, total_count, status) '
+                "VALUES ($1, $2::vector, 7, 'A') RETURNING anchor_id",
+                atom_ids[text],
+                zeros,
+            )
+            anchor_ids[text] = row["anchor_id"]
+        component = {
+            "utterance_type": "fact",
+            "atoms": [
+                {"pos": 1, "text": "张三", "type": "E", "role": "agent", "target_occ": 2, "resolved": None},
+                {"pos": 2, "text": "修复", "type": "P", "role": "predicate", "target_occ": None, "resolved": None},
+                {"pos": 3, "text": "服务器", "type": "E", "role": "patient", "target_occ": 2, "resolved": None},
+            ],
+            "tree": {
+                "predicate": "修复",
+                "agent": [{"text": "张三", "modifier": [], "implied": False}],
+                "patient": [{"text": "服务器", "modifier": [], "implied": False}],
+                "modifier": [],
+                "nested": [],
+                "conditional": [],
+            },
+        }
+        await conn.execute(
+            f'INSERT INTO "{schema}".events (event_id, data) VALUES (1, $1::jsonb)',
+            json.dumps({"component": component}, ensure_ascii=False),
         )
+        for occurrence_id, text, role, target, anchor_text in (
+            (1, "张三", "A", 2, "张三"),
+            (2, "修复", "R", None, "修复"),
+            (3, "服务器", "P", 2, "服务器"),
+        ):
+            await conn.execute(
+                f'INSERT INTO "{schema}".event_atoms '
+                "(event_id, occurrence_id, atom_id, anchor_id, role_type, target_occ) "
+                "VALUES (1, $1, $2, $3, $4, $5)",
+                occurrence_id,
+                atom_ids[text],
+                anchor_ids[anchor_text],
+                role,
+                target,
+            )
 
         client = await _real_bge_client()
-        result = await run_identity_rebuild(
+        result = await run_embedding_rebuild(
             pool=_SingleConnPool(conn),
             schema=schema,
             client=client,
             spec=BuildSpec(model="bge-m3", revision="bge-m3-1024-v2", dimension=1024),
         )
         assert result == 0
+
+        # Every active E/P atom was rebuilt to the target generation; G is untouched.
         rows = await conn.fetch(
-            f'SELECT atom_type, embedding IS NOT NULL AS populated, vector_dims(embedding) AS dims '
+            f'SELECT text, embedding IS NOT NULL AS populated, vector_dims(embedding) AS dims '
             f'FROM "{schema}".atoms ORDER BY atom_id'
         )
-        assert [(row["atom_type"], row["populated"], row["dims"]) for row in rows] == [
-            ("E", True, 1024),
-            ("P", True, 1024),
-            ("G", False, None),
-        ]
+        by_text = {row["text"]: row for row in rows}
+        for text in ("张三", "修复", "服务器"):
+            assert by_text[text]["populated"] is True, f"{text} has NULL embedding"
+            assert by_text[text]["dims"] == 1024, f"{text} dims={by_text[text]['dims']}"
+        assert by_text["内部构元"]["populated"] is False, "G must never get a vector"
+
+        # E and P anchors were rebuilt from history: one sample each -> count 1, 1024 dims.
+        anchor_rows = await conn.fetch(
+            f'SELECT anchor_id, total_count, vector_dims(centroid_vector) AS dims '
+            f'FROM "{schema}".anchors ORDER BY anchor_id'
+        )
+        assert len(anchor_rows) == 3
+        assert all(row["total_count"] == 1 for row in anchor_rows)
+        assert all(row["dims"] == 1024 for row in anchor_rows)
+
+        # event_atoms.anchor_id and events.data were preserved verbatim.
+        preserved = await conn.fetch(
+            f'SELECT occurrence_id, anchor_id FROM "{schema}".event_atoms ORDER BY occurrence_id'
+        )
+        assert [row["anchor_id"] for row in preserved] == [anchor_ids["张三"], anchor_ids["修复"], anchor_ids["服务器"]]
+
         profile = await conn.fetchrow(
             f'SELECT model_name, model_revision, dimension, status FROM "{schema}".embedding_profiles '
             "WHERE embedding_kind = 'identity'"
@@ -390,6 +480,61 @@ async def test_remote_identity_rebuild_stages_and_atomically_cuts_over():
     finally:
         if client is not None:
             await client.aclose()
+        if conn is not None:
+            await conn.close()
+        tunnel.close()
+
+
+@requires_remote
+@remote_group
+async def test_remote_gate_refuses_mismatched_and_rebuilding_generations():
+    """The shared gate refuses a mismatched/rebuilding generation before any bge call."""
+    import asyncpg
+
+    from hindsight_api.engine.retain.noesis_ingest import IdentitySpec, _embedding_space_profile_gate
+
+    tunnel = _SshTunnel()
+    conn = None
+    try:
+        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
+        outer_tx = conn.transaction()
+        await outer_tx.start()
+        schema = f"noesis_gate_test_{uuid.uuid4().hex[:12]}"
+        await conn.execute(f'CREATE SCHEMA "{schema}"')
+        await conn.execute(
+            f'CREATE TABLE "{schema}".atoms ('
+            "atom_id BIGINT PRIMARY KEY, text TEXT NOT NULL, atom_type CHAR(1) NOT NULL, embedding vector(1024))"
+        )
+        await conn.execute(
+            f'CREATE TABLE "{schema}".anchors ('
+            "anchor_id BIGINT PRIMARY KEY, atom_id BIGINT NOT NULL, centroid_vector vector(1024) NOT NULL, "
+            "total_count BIGINT NOT NULL DEFAULT 0, status CHAR(1) NOT NULL DEFAULT 'A')"
+        )
+        await conn.execute(
+            f'CREATE TABLE "{schema}".embedding_profiles ('
+            "embedding_kind TEXT PRIMARY KEY, model_name TEXT NOT NULL, model_revision TEXT NOT NULL, "
+            "dimension INTEGER NOT NULL, status TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        await conn.execute(
+            f'INSERT INTO "{schema}".embedding_profiles '
+            "(embedding_kind, model_name, model_revision, dimension, status) "
+            "VALUES ('identity', 'bge-m3', 'bge-m3-1024-v1', 1024, 'ready')"
+        )
+        spec = IdentitySpec(
+            base_url="http://10.0.0.8:8010", model="bge-m3", revision="bge-m3-1024-v2", dimension=1024
+        )
+
+        gate = await _embedding_space_profile_gate(_SingleConnPool(conn), schema, spec)
+        assert gate.allowed is False
+        assert gate.reason == "generation_mismatch"
+
+        await conn.execute(f'UPDATE "{schema}".embedding_profiles SET status = \'rebuilding\'')
+        gate = await _embedding_space_profile_gate(_SingleConnPool(conn), schema, spec)
+        assert gate.allowed is False
+        assert gate.reason == "rebuilding"
+
+        await outer_tx.rollback()
+    finally:
         if conn is not None:
             await conn.close()
         tunnel.close()

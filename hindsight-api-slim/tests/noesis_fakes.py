@@ -5,8 +5,11 @@ in-memory emulation of the ``noesis_core`` statements the ingest module is
 allowed to run (sequence-numbered event insert with RETURNING, atom state
 precheck, atom upsert, event_atoms insert, alert insert, embedding profile
 gate). Transaction rollback is emulated with snapshots so the failure-injection
-tests can prove zero-half-state. Requirement 03 adds the identity-vector seams:
-``FakeIdentityClient`` (bge stand-in) and the embedding/profile emulation.
+tests can prove zero-half-state. Requirement 03 adds the identity-vector
+embedding/profile emulation; requirement 05 adds the anchors emulation (atom
+row locks, nearest-active cosine query, insert-with-count-1, EMA update,
+transaction snapshots) and the unified ``FakeEmbeddingClient`` bge stand-in
+(``embed_identity`` + ``embed_context``).
 """
 
 from __future__ import annotations
@@ -20,10 +23,10 @@ from typing import Any
 
 from hyperextract.noesis import ExtractionAlert, ExtractionOutcome, FactComponent, HypothesisComponent
 
-from hindsight_api.engine.retain.noesis_identity_vector import (
-    IdentityConfigInvalid,
-    IdentityEmbedError,
-    IdentityServiceUnavailable,
+from hindsight_api.engine.retain.noesis_embedding import (
+    EmbeddingConfigInvalid,
+    EmbeddingError,
+    EmbeddingServiceUnavailable,
 )
 
 
@@ -180,7 +183,15 @@ class FakeStore:
         self.alerts: list[dict[str, Any]] = []
         # Requirement 03: the single-row identity embedding profile gate.
         self.profile: dict[str, Any] | None = None
-        self.identity_rebuild_stage: dict[int, tuple[float, ...]] = {}
+        # Requirement 05A: the four rebuild TEMP staging tables (session-scoped).
+        self.embedding_atom_stage: dict[int, tuple[float, ...]] = {}
+        self.embedding_context_stage: dict[tuple[int, int], tuple[float, ...]] = {}
+        self.embedding_anchor_sample_stage: dict[tuple[int, int, int], bool] = {}
+        self.embedding_anchor_stage: dict[int, tuple[tuple[float, ...], int]] = {}
+        # Requirement 05: anchors keyed by anchor_id; locked_atoms records the
+        # FOR UPDATE atom row locks taken inside the fact transaction.
+        self.anchors: dict[int, dict[str, Any]] = {}
+        self.locked_atoms: list[int] = []
         self.calls: list[tuple[str, str, tuple]] = []
         self.tx_log: list[str] = []  # "begin" / "commit" / "rollback" markers
         self.commits = 0
@@ -198,7 +209,7 @@ class FakeStore:
         self.advisory_lock_available = True
         self.pg_indexes: list[dict[str, Any]] = []
         self._marker_counts: dict[str, int] = {}
-        self._ids = {"event": 1000, "atom": 500, "alert": 9000}
+        self._ids = {"event": 1000, "atom": 500, "alert": 9000, "anchor": 100}
         self._tx_depth = 0
 
     # -- SQL dispatch -------------------------------------------------------
@@ -228,6 +239,15 @@ class FakeStore:
             return self._profile_dispatch(upper, args)
         if ".events" in sql and upper.startswith("INSERT"):
             return self._insert_event(args)
+        # Requirement 05 dispatches. The atom row lock must precede the generic
+        # ".atoms" branch or the single-arg lock SQL would be misrouted into
+        # the three-arg upsert unpack.
+        if "FOR UPDATE" in sql and ".atoms" in sql:
+            return self._lock_atom(args)
+        if ".anchors" in sql and upper.startswith("INSERT"):
+            return self._insert_anchor(args)
+        if ".anchors" in sql and "<=>" in sql:
+            return self._nearest_anchor(args)
         if ".atoms" in sql:
             return self._upsert_atom(args)
         if ".ingestion_alerts" in sql:
@@ -242,26 +262,80 @@ class FakeStore:
             return [self._atom_state_row(text, atom_type) for text, atom_type in zip(texts, atom_types)]
         if "pg_indexes" in sql:
             return list(self.pg_indexes)
-        if "LEFT JOIN pg_temp.noesis_identity_rebuild_stage" in sql:
-            null_only = "a.embedding IS NULL" in sql
-            rows = []
-            for (text, atom_type), atom in sorted(self.atoms.items(), key=lambda kv: kv[1]["atom_id"]):
-                if atom_type not in ("E", "P") or atom["atom_id"] in self.identity_rebuild_stage:
-                    continue
-                if null_only and atom["embedding"] is not None:
-                    continue
-                rows.append({"atom_id": atom["atom_id"], "text": text, "atom_type": atom_type})
-            return rows
-        if ".atoms" in sql and "ORDER BY atom_id" in sql:
+        # Requirement 05A rebuild: keyset-paginated atom/event scans (256 rows).
+        if ".atoms" in sql and "atom_id > $1" in sql:
             null_only = "embedding IS NULL" in sql
             rows = []
             for (text, atom_type), atom in sorted(self.atoms.items(), key=lambda kv: kv[1]["atom_id"]):
-                if atom_type not in ("E", "P"):
+                if atom_type not in ("E", "P") or atom.get("status", "active") != "active":
+                    continue
+                if int(atom["atom_id"]) <= args[0]:
                     continue
                 if null_only and atom["embedding"] is not None:
                     continue
                 rows.append({"atom_id": atom["atom_id"], "text": text, "atom_type": atom_type})
-            return rows
+            return rows[:256]
+        if ".events" in sql and "event_id > $1" in sql:
+            rows = []
+            for event_id, event in sorted(self.events.items()):
+                if int(event_id) <= args[0]:
+                    continue
+                rows.append({"event_id": int(event_id), "data": event["data"]})
+            return rows[:256]
+        if ".event_atoms" in sql and "event_id = $1" in sql:
+            rows = []
+            for row in self.event_atoms:
+                # (event_id, occurrence_id, atom_id, role_type, target_occ, anchor_id)
+                if row[0] != args[0]:
+                    continue
+                rows.append(
+                    {
+                        "occurrence_id": row[1],
+                        "atom_id": row[2],
+                        "anchor_id": row[5] if len(row) > 5 else None,
+                    }
+                )
+            return sorted(rows, key=lambda item: item["occurrence_id"])
+        if ".atoms" in sql and "ANY(" in sql:
+            wanted = set(args[0])
+            return [
+                {"atom_id": atom["atom_id"], "text": text, "atom_type": atom_type}
+                for (text, atom_type), atom in self.atoms.items()
+                if int(atom["atom_id"]) in wanted
+            ]
+        if ".anchors" in sql and "ANY(" in sql:
+            wanted = set(args[0])
+            return [
+                {"anchor_id": anchor_id, "atom_id": anchor["atom_id"]}
+                for anchor_id, anchor in self.anchors.items()
+                if anchor_id in wanted
+            ]
+        if "noesis_embedding_anchor_stage" in sql and "LEFT JOIN" in sql:
+            staged = self.embedding_anchor_stage
+            rows = []
+            for anchor_id, anchor in sorted(self.anchors.items()):
+                if anchor_id in staged:
+                    continue
+                rows.append({"anchor_id": anchor_id, "atom_id": anchor["atom_id"]})
+            return rows[:50]
+        if "noesis_embedding_anchor_sample_stage" in sql and "JOIN" in sql:
+            rows = []
+            last_key = tuple(int(value) for value in args)
+            for (anchor_id, event_id, predicate_pos) in sorted(self.embedding_anchor_sample_stage):
+                if (anchor_id, event_id, predicate_pos) <= last_key:
+                    continue
+                context = self.embedding_context_stage.get((event_id, predicate_pos))
+                if context is None:
+                    continue
+                rows.append(
+                    {
+                        "anchor_id": anchor_id,
+                        "event_id": event_id,
+                        "predicate_pos": predicate_pos,
+                        "context_text": _format_vector_literal(context),
+                    }
+                )
+            return rows[:256]
         raise AssertionError(f"unexpected fetch SQL: {sql}")
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
@@ -271,12 +345,27 @@ class FakeStore:
             return f"vector({self.embedding_dimension})"
         if "pg_try_advisory_lock" in sql:
             return self.advisory_lock_available
+        # Requirement 05A rebuild: staging and active-atom coverage counts.
+        if "noesis_embedding_atom_stage" in sql and "count(*)" in sql:
+            return len(self.embedding_atom_stage)
+        if "noesis_embedding_anchor_stage" in sql and "count(*)" in sql:
+            return len(self.embedding_anchor_stage)
+        if "status = 'active'" in sql and "count(*)" in sql:
+            return sum(
+                1
+                for (text, atom_type), atom in self.atoms.items()
+                if atom_type in ("E", "P") and atom.get("status", "active") == "active"
+            )
         if "embedding IS NOT NULL" in sql and "count(*)" in sql:
             return sum(
                 1
                 for (text, atom_type), atom in self.atoms.items()
                 if atom_type in ("E", "P") and atom["embedding"] is not None
             )
+        if ".anchors" in sql and "count(*)" in sql:
+            # Requirement 05A §5.2: the empty-store claim must also prove zero
+            # anchors before it may guess a generation.
+            return len(self.anchors)
         # The ingestion preflight is read-only; the in-memory store models the
         # fully migrated schema and therefore answers every catalog probe true.
         return True
@@ -284,6 +373,8 @@ class FakeStore:
     async def execute(self, sql: str, *args: Any) -> str:
         self._maybe_fail(sql)
         self.calls.append(("execute", sql, args))
+        if ".anchors" in sql and "total_count = total_count + 1" in sql:
+            return self._ema_update_anchor(args)
         if ".event_atoms" in sql:
             self.event_atoms.append(args)
             return "INSERT 0 1"
@@ -291,15 +382,44 @@ class FakeStore:
             return "SELECT 1"
         if sql.startswith("CREATE TEMP TABLE"):
             return "CREATE TABLE"
-        if sql.startswith("TRUNCATE TABLE pg_temp.noesis_identity_rebuild_stage"):
-            self.identity_rebuild_stage.clear()
+        if sql.startswith("TRUNCATE TABLE pg_temp.noesis_embedding_atom_stage"):
+            self.embedding_atom_stage.clear()
             return "TRUNCATE TABLE"
-        if sql.startswith("DROP TABLE IF EXISTS pg_temp.noesis_identity_rebuild_stage"):
-            self.identity_rebuild_stage.clear()
+        if sql.startswith("TRUNCATE TABLE pg_temp.noesis_embedding_context_stage"):
+            self.embedding_context_stage.clear()
+            return "TRUNCATE TABLE"
+        if sql.startswith("TRUNCATE TABLE pg_temp.noesis_embedding_anchor_sample_stage"):
+            self.embedding_anchor_sample_stage.clear()
+            return "TRUNCATE TABLE"
+        if sql.startswith("TRUNCATE TABLE pg_temp.noesis_embedding_anchor_stage"):
+            self.embedding_anchor_stage.clear()
+            return "TRUNCATE TABLE"
+        if sql.startswith("DROP TABLE IF EXISTS pg_temp.noesis_embedding_atom_stage"):
+            self.embedding_atom_stage.clear()
             return "DROP TABLE"
-        if sql.startswith("INSERT INTO pg_temp.noesis_identity_rebuild_stage"):
-            self.identity_rebuild_stage[args[0]] = _parse_vector_literal(args[1])
+        if sql.startswith("DROP TABLE IF EXISTS pg_temp.noesis_embedding_context_stage"):
+            self.embedding_context_stage.clear()
+            return "DROP TABLE"
+        if sql.startswith("DROP TABLE IF EXISTS pg_temp.noesis_embedding_anchor_sample_stage"):
+            self.embedding_anchor_sample_stage.clear()
+            return "DROP TABLE"
+        if sql.startswith("DROP TABLE IF EXISTS pg_temp.noesis_embedding_anchor_stage"):
+            self.embedding_anchor_stage.clear()
+            return "DROP TABLE"
+        if sql.startswith("INSERT INTO pg_temp.noesis_embedding_atom_stage"):
+            self.embedding_atom_stage[args[0]] = _parse_vector_literal(args[1])
             return "INSERT 0 1"
+        if sql.startswith("INSERT INTO pg_temp.noesis_embedding_context_stage"):
+            self.embedding_context_stage[(args[0], args[1])] = _parse_vector_literal(args[2])
+            return "INSERT 0 1"
+        if sql.startswith("INSERT INTO pg_temp.noesis_embedding_anchor_sample_stage"):
+            self.embedding_anchor_sample_stage[(args[0], args[1], args[2])] = True
+            return "INSERT 0 1"
+        if sql.startswith("INSERT INTO pg_temp.noesis_embedding_anchor_stage"):
+            self.embedding_anchor_stage[args[0]] = (_parse_vector_literal(args[1]), int(args[2]))
+            return "INSERT 0 1"
+        if sql.startswith("REINDEX INDEX"):
+            return "REINDEX"
         if sql.startswith("LOCK TABLE"):
             return "LOCK TABLE"
         if ".embedding_profiles" in sql and "SET status = 'rebuilding'" in sql:
@@ -312,24 +432,26 @@ class FakeStore:
                     {"model_name": args[0], "model_revision": args[1], "dimension": args[2], "status": "ready"}
                 )
             return "UPDATE 1"
-        if ".atoms" in sql and "FROM pg_temp.noesis_identity_rebuild_stage" in sql:
+        if ".atoms" in sql and "FROM pg_temp.noesis_embedding_atom_stage" in sql:
             null_guard = "a.embedding IS NULL" in sql
             updated = 0
             for atom in self.atoms.values():
-                vector = self.identity_rebuild_stage.get(atom["atom_id"])
+                vector = self.embedding_atom_stage.get(atom["atom_id"])
                 if vector is None or (null_guard and atom["embedding"] is not None):
                     continue
                 atom["embedding"] = vector
                 updated += 1
             return f"UPDATE {updated}"
-        if ".atoms" in sql and "SET embedding" in sql:
-            null_guard = "AND embedding IS NULL" in sql
-            for atom in self.atoms.values():
-                if atom["atom_id"] == args[0]:
-                    if not (null_guard and atom["embedding"] is not None):
-                        atom["embedding"] = _parse_vector_literal(args[1])
-                    return "UPDATE 1"
-            return "UPDATE 0"
+        if ".anchors" in sql and "FROM pg_temp.noesis_embedding_anchor_stage" in sql:
+            updated = 0
+            for anchor_id, (centroid, total_count) in self.embedding_anchor_stage.items():
+                anchor = self.anchors.get(anchor_id)
+                if anchor is None:
+                    continue
+                anchor["centroid"] = tuple(centroid)
+                anchor["total_count"] = int(total_count)
+                updated += 1
+            return f"UPDATE {updated}"
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
     # -- table emulation ----------------------------------------------------
@@ -409,6 +531,67 @@ class FakeStore:
         self.alerts.append(alert)
         return {"alert_id": alert["alert_id"]}
 
+    def _lock_atom(self, args: tuple) -> dict[str, Any] | None:
+        # SELECT ... FROM {s}.atoms WHERE atom_id = $1 FOR UPDATE — a missing
+        # atom row returns None exactly like PostgreSQL would.
+        atom_id = args[0]
+        if any(atom["atom_id"] == atom_id for atom in self.atoms.values()):
+            self.locked_atoms.append(atom_id)
+            return {"atom_id": atom_id}
+        return None
+
+    def _insert_anchor(self, args: tuple) -> dict[str, Any]:
+        # INSERT ... VALUES ($1, $2::vector, 1, 'A') RETURNING anchor_id — the
+        # frozen SQL carries the explicit total_count=1 and status 'A'.
+        atom_id, vector_literal = args[0], args[1]
+        centroid = _parse_vector_literal(vector_literal)
+        if centroid is None or len(centroid) != self.embedding_dimension:
+            raise InjectedFailure("pgvector dimension reject")
+        self._ids["anchor"] += 1
+        anchor_id = self._ids["anchor"]
+        self.anchors[anchor_id] = {
+            "anchor_id": anchor_id,
+            "atom_id": atom_id,
+            "centroid": tuple(centroid),
+            "total_count": 1,
+            "status": "A",
+        }
+        return {"anchor_id": anchor_id}
+
+    def _nearest_anchor(self, args: tuple) -> dict[str, Any] | None:
+        # Nearest active anchor of the atom by pgvector cosine distance, with
+        # the frozen (distance, anchor_id) ascending tie-break.
+        atom_id, vector_literal = args[0], args[1]
+        query = _parse_vector_literal(vector_literal)
+        if query is None:
+            raise InjectedFailure("pgvector dimension reject")
+        best: tuple[int, float, tuple[float, ...]] | None = None
+        for anchor_id, anchor in self.anchors.items():
+            if anchor["atom_id"] != atom_id or anchor["status"] != "A":
+                continue
+            candidate = (anchor_id, _cosine_distance(query, anchor["centroid"]), anchor["centroid"])
+            if best is None or (candidate[1], candidate[0]) < (best[1], best[0]):
+                best = candidate
+        if best is None:
+            return None
+        anchor_id, distance, centroid = best
+        return {
+            "anchor_id": anchor_id,
+            "centroid_text": _format_vector_literal(centroid),
+            "distance": distance,
+        }
+
+    def _ema_update_anchor(self, args: tuple) -> str:
+        # UPDATE ... SET centroid_vector = $2::vector, total_count = total_count + 1
+        anchor_id, vector_literal = args[0], args[1]
+        centroid = _parse_vector_literal(vector_literal)
+        if centroid is None or len(centroid) != self.embedding_dimension:
+            raise InjectedFailure("pgvector dimension reject")
+        anchor = self.anchors[anchor_id]
+        anchor["centroid"] = tuple(centroid)
+        anchor["total_count"] += 1
+        return "UPDATE 1"
+
     # -- helpers ------------------------------------------------------------
 
     def event_rows(self) -> list[dict[str, Any]]:
@@ -419,6 +602,24 @@ class FakeStore:
 
     def embedding_of(self, text: str, atom_type: str) -> tuple | None:
         return self.atoms.get((text, atom_type), {}).get("embedding")
+
+    def anchors_rows(self) -> list[dict[str, Any]]:
+        return list(self.anchors.values())
+
+    def seed_anchor(
+        self, atom_id: int, centroid: tuple[float, ...], *, status: str = "A", total_count: int = 0
+    ) -> int:
+        """Insert a pre-existing anchor row and return its anchor_id."""
+        self._ids["anchor"] += 1
+        anchor_id = self._ids["anchor"]
+        self.anchors[anchor_id] = {
+            "anchor_id": anchor_id,
+            "atom_id": atom_id,
+            "centroid": tuple(centroid),
+            "total_count": total_count,
+            "status": status,
+        }
+        return anchor_id
 
     def fetch_calls(self, marker: str) -> list[tuple]:
         return [call for call in self.calls if marker in call[1]]
@@ -431,6 +632,21 @@ def _parse_vector_literal(literal: str | None) -> tuple[float, ...] | None:
     body = literal.strip()
     assert body.startswith("[") and body.endswith("]"), f"not a vector literal: {literal!r}"
     return tuple(float(component) for component in body[1:-1].split(","))
+
+
+def _format_vector_literal(vector: Any) -> str:
+    """Inverse of ``_parse_vector_literal``: repr(float) keeps full precision."""
+    return "[" + ",".join(repr(float(component)) for component in vector) + "]"
+
+
+def _cosine_distance(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    """pgvector ``<=>`` semantics: 1 - dot/(|left|*|right|), zero norm -> 1.0, clamped to [0, 2]."""
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_left = sum(a * a for a in left) ** 0.5
+    norm_right = sum(b * b for b in right) ** 0.5
+    if norm_left == 0.0 or norm_right == 0.0:
+        return 1.0
+    return max(0.0, min(2.0, 1.0 - dot / (norm_left * norm_right)))
 
 
 class _FakeTransaction:
@@ -446,10 +662,14 @@ class _FakeTransaction:
             (
                 self._store.events,
                 self._store.atoms,
+                self._store.anchors,
                 self._store.event_atoms,
                 self._store.alerts,
                 self._store.profile,
-                self._store.identity_rebuild_stage,
+                self._store.embedding_atom_stage,
+                self._store.embedding_context_stage,
+                self._store.embedding_anchor_sample_stage,
+                self._store.embedding_anchor_stage,
                 self._store._ids,
             )
         )
@@ -468,13 +688,29 @@ class _FakeTransaction:
         return False
 
     def _rollback(self) -> None:
-        events, atoms, event_atoms, alerts, profile, rebuild_stage, ids = self._snapshot
+        (
+            events,
+            atoms,
+            anchors,
+            event_atoms,
+            alerts,
+            profile,
+            atom_stage,
+            context_stage,
+            sample_stage,
+            anchor_stage,
+            ids,
+        ) = self._snapshot
         self._store.events = events
         self._store.atoms = atoms
+        self._store.anchors = anchors
         self._store.event_atoms = event_atoms
         self._store.alerts = alerts
         self._store.profile = profile
-        self._store.identity_rebuild_stage = rebuild_stage
+        self._store.embedding_atom_stage = atom_stage
+        self._store.embedding_context_stage = context_stage
+        self._store.embedding_anchor_sample_stage = sample_stage
+        self._store.embedding_anchor_stage = anchor_stage
         self._store._ids = ids
         self._store._marker_counts = self._marker_counts
         self._store.rollbacks += 1
@@ -566,7 +802,7 @@ class FakeExtractOnceFactory:
 
 
 # ---------------------------------------------------------------------------
-# Identity-vector seams (requirement 03)
+# Embedding seams (requirements 03 + 05, unified client)
 # ---------------------------------------------------------------------------
 
 def fake_identity_vector(text: str, atom_type: str, dimension: int = 1024) -> tuple[float, ...]:
@@ -575,47 +811,65 @@ def fake_identity_vector(text: str, atom_type: str, dimension: int = 1024) -> tu
     return tuple(round((digest[index % len(digest)] / 255.0) * 2 - 1, 6) for index in range(dimension))
 
 
-class FakeIdentityClient:
-    """``identity_client_factory`` seam: scriptable bge stand-in.
+def fake_context_vector(context_text: str, dimension: int = 1024) -> tuple[float, ...]:
+    """Deterministic stand-in for BGE(context_text): sha256-seeded floats in [-1, 1)."""
+    digest = hashlib.sha256(f"context::{context_text}".encode("utf-8")).digest()
+    return tuple(round((digest[index % len(digest)] / 255.0) * 2 - 1, 6) for index in range(dimension))
+
+
+class FakeEmbeddingClient:
+    """``embedding_client_factory`` seam: scriptable bge stand-in covering both
+    the identity endpoints and the ``/normalize/sentence`` context endpoint.
 
     ``health`` is "ready" (default), "config_invalid", or "unavailable";
-    ``failures`` maps (text, atom_type) -> error_kind for per-literal failures.
+    ``identity_failures`` maps (text, atom_type) -> error_kind;
+    ``context_failures`` maps context_text -> error_kind.
     """
 
     def __init__(
         self,
         *,
         health: str = "ready",
-        failures: dict[tuple[str, str], str] | None = None,
+        identity_failures: dict[tuple[str, str], str] | None = None,
+        context_failures: dict[str, str] | None = None,
         dimension: int = 1024,
     ) -> None:
         self.health = health
-        self.failures = dict(failures or {})
+        self.identity_failures = dict(identity_failures or {})
+        self.context_failures = dict(context_failures or {})
         self.dimension = dimension
         self.ensure_calls = 0
-        self.embed_calls: list[tuple[str, str]] = []
+        self.identity_calls: list[tuple[str, str]] = []
+        self.context_calls: list[str] = []
         self.closed = False
 
     async def ensure_ready(self) -> None:
         self.ensure_calls += 1
         if self.health == "config_invalid":
-            raise IdentityConfigInvalid("fake /health config mismatch")
+            raise EmbeddingConfigInvalid("fake /health config mismatch")
         if self.health == "unavailable":
-            raise IdentityServiceUnavailable("fake /health transport failure")
+            raise EmbeddingServiceUnavailable("fake /health transport failure")
 
-    async def embed(self, text: str, atom_type: str) -> list[float]:
-        self.embed_calls.append((text, atom_type))
-        error_kind = self.failures.get((text, atom_type))
+    async def embed_identity(self, text: str, atom_type: str) -> list[float]:
+        self.identity_calls.append((text, atom_type))
+        error_kind = self.identity_failures.get((text, atom_type))
         if error_kind is not None:
-            raise IdentityEmbedError(error_kind, f"fake embed failure: {error_kind}")
+            raise EmbeddingError(error_kind, f"fake embed failure: {error_kind}")
         return list(fake_identity_vector(text, atom_type, self.dimension))
+
+    async def embed_context(self, context_text: str) -> list[float]:
+        self.context_calls.append(context_text)
+        error_kind = self.context_failures.get(context_text)
+        if error_kind is not None:
+            raise EmbeddingError(error_kind, f"fake context failure: {error_kind}")
+        return list(fake_context_vector(context_text, self.dimension))
 
     async def aclose(self) -> None:
         self.closed = True
 
 
-def identity_factory_for(client: FakeIdentityClient):
-    """``identity_client_factory`` seam returning ``client`` for any config."""
+def embedding_factory_for(client: FakeEmbeddingClient):
+    """``embedding_client_factory`` seam returning ``client`` for any config."""
 
     async def factory(_config):
         return client

@@ -15,6 +15,13 @@ production retain main chain. For every non-empty content item this module:
 4. isolates every failure from the native Hindsight retain: failures become
    alerts (never exceptions) and the retain pipeline continues untouched.
 
+Requirement 05A freezes the per-component order as plan → /health → shared
+embedding-space profile gate → Context vectors → Identity vectors → BEGIN,
+with the transaction's first business statement being the unconditional
+``FOR SHARE`` generation fence (§5.1/§5.5); a refused generation drops the
+whole component with zero bge HTTP, zero facts, and one fixed sanitized
+``embedding_profile_unavailable`` alert (§5.3).
+
 The Noesis database is a dedicated asyncpg pool against ``noesis`` /
 ``noesis_core``; LLM calls and deterministic validation always run outside any
 database transaction. Application startup never executes DDL.
@@ -35,11 +42,20 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from ...utils import mask_network_location
-from .noesis_identity_vector import (
-    IdentityConfigInvalid,
-    IdentityEmbedError,
-    IdentityServiceUnavailable,
-    NoesisIdentityClient,
+from .noesis_anchor import (
+    AnchorFrameError,
+    AnchorRouteError,
+    plan_anchor_routing,
+    prepare_context_vectors,
+    route_anchors,
+    vector_literal,
+)
+from .noesis_embedding import (
+    EmbeddingConfigInvalid,
+    EmbeddingError,
+    EmbeddingProfileUnavailable,
+    EmbeddingServiceUnavailable,
+    NoesisEmbeddingClient,
     is_transport_kind,
 )
 
@@ -408,10 +424,10 @@ async def _get_pool(config: Any) -> Any:
 async def close_noesis_pool() -> None:
     """Idempotent shutdown, called from MemoryEngine.close().
 
-    Closes the dedicated asyncpg pool AND the shared identity-vector client
+    Closes the dedicated asyncpg pool AND the shared embedding client
     (requirement 03 §5.3: one lazy client per process, retired together).
     """
-    global _pool, _identity_client, _identity_client_key
+    global _pool, _embedding_client, _embedding_client_key
     async with _pool_lock:
         if _pool is not None and not getattr(_pool, "is_closed", lambda: False)():
             try:
@@ -420,14 +436,14 @@ async def close_noesis_pool() -> None:
                 logger.error("noesis pool close failed: %s", type(error).__name__)
         _pool = None
         _preflight_cache.clear()
-    async with _identity_client_lock:
-        if _identity_client is not None:
+    async with _embedding_client_lock:
+        if _embedding_client is not None:
             try:
-                await _identity_client.aclose()
+                await _embedding_client.aclose()
             except Exception as error:
-                logger.error("noesis identity client close failed: %s", type(error).__name__)
-        _identity_client = None
-        _identity_client_key = None
+                logger.error("noesis embedding client close failed: %s", type(error).__name__)
+        _embedding_client = None
+        _embedding_client_key = None
 
 
 async def _acquire_pool(config: Any, pool_factory: Any) -> Any:
@@ -437,7 +453,7 @@ async def _acquire_pool(config: Any, pool_factory: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Identity-vector client lifecycle (requirement 03 §5.3/§10)
+# Shared embedding client lifecycle (requirement 03 §5.3/§10)
 # ---------------------------------------------------------------------------
 
 _IDENTITY_KIND = "identity"
@@ -476,12 +492,12 @@ def _identity_spec_from_config(config: Any) -> IdentitySpec:
     )
 
 
-_identity_client: Any | None = None
-_identity_client_key: tuple | None = None
-_identity_client_lock = asyncio.Lock()
+_embedding_client: Any | None = None
+_embedding_client_key: tuple | None = None
+_embedding_client_lock = asyncio.Lock()
 
 
-def _identity_client_key_from_config(config: Any, spec: IdentitySpec) -> tuple:
+def _embedding_client_key_from_config(config: Any, spec: IdentitySpec) -> tuple:
     return (
         spec.base_url,
         spec.model,
@@ -493,15 +509,15 @@ def _identity_client_key_from_config(config: Any, spec: IdentitySpec) -> tuple:
     )
 
 
-async def _get_identity_client(config: Any, spec: IdentitySpec) -> Any:
+async def _get_embedding_client(config: Any, spec: IdentitySpec) -> Any:
     """One shared lazily-built client per process; a config change builds a
     fresh client (whose /health cache is naturally cold) and retires the old."""
-    global _identity_client, _identity_client_key
-    key = _identity_client_key_from_config(config, spec)
-    async with _identity_client_lock:
-        if _identity_client is None or _identity_client_key != key:
-            stale = _identity_client
-            _identity_client = NoesisIdentityClient(
+    global _embedding_client, _embedding_client_key
+    key = _embedding_client_key_from_config(config, spec)
+    async with _embedding_client_lock:
+        if _embedding_client is None or _embedding_client_key != key:
+            stale = _embedding_client
+            _embedding_client = NoesisEmbeddingClient(
                 base_url=spec.base_url,
                 model=spec.model,
                 revision=spec.revision,
@@ -510,62 +526,82 @@ async def _get_identity_client(config: Any, spec: IdentitySpec) -> Any:
                 max_retries=int(getattr(config, "noesis_embedding_max_retries", 1) or 0),
                 api_key=getattr(config, "noesis_embedding_api_key", "") or "",
             )
-            _identity_client_key = key
+            _embedding_client_key = key
             if stale is not None:
                 try:
                     await stale.aclose()
                 except Exception as error:
-                    logger.error("stale noesis identity client close failed: %s", type(error).__name__)
-        return _identity_client
+                    logger.error("stale noesis embedding client close failed: %s", type(error).__name__)
+        return _embedding_client
 
 
-async def _acquire_identity_client(config: Any, spec: IdentitySpec, factory: Any) -> Any:
+async def _acquire_embedding_client(config: Any, spec: IdentitySpec, factory: Any) -> Any:
     if factory is not None:
         return await factory(config)
-    return await _get_identity_client(config, spec)
+    return await _get_embedding_client(config, spec)
 
 
 # ---------------------------------------------------------------------------
-# Identity profile gate + pre-transaction vector preparation (requirement 03
-# §8.1/§10.3). Everything here is read-only or a tiny independent claim
-# transaction; bge HTTP happens outside any business transaction.
+# Shared embedding-space profile gate + pre-transaction vector preparation
+# (requirement 05A §5.2: one generation governs Identity, Context, and Anchor).
+# Everything here is read-only or a tiny independent claim transaction; bge
+# HTTP happens outside any business transaction.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class _ProfileGate:
     allowed: bool
     db_profile: dict[str, Any] | None
+    reason: str
 
 
-async def _identity_profile_gate(pool: Any, schema: str, spec: IdentitySpec) -> _ProfileGate:
-    """Config, live service, and DB profile must agree before vectors flow.
+def _config_profile(spec: IdentitySpec) -> dict[str, Any]:
+    """Sanitized config-side generation snapshot for the fixed 05A §5.3 alert."""
+    return {"model_name": spec.model, "model_revision": spec.revision, "dimension": spec.dimension}
 
-    Missing profile + zero existing E/P vectors → safe claim (§10.3.1).
-    Missing profile + existing vectors → refuse to guess their source (§10.3.2).
+
+async def _embedding_space_profile_gate(pool: Any, schema: str, spec: IdentitySpec) -> _ProfileGate:
+    """Shared E/P embedding-space generation gate (requirement 05A §4.2/§5.2).
+
+    The single ``embedding_kind='identity'`` profile row protects the whole
+    E/P vector space: ``atoms.embedding``, the throwaway Context Vectors,
+    ``anchors.centroid_vector``, and the ANN index over atoms. Config, live
+    service, and DB profile must agree before any bge call flows.
+
+    Missing profile + zero existing E/P vectors AND zero anchors → safe
+    claim (§2.3.2); any pre-existing vector or anchor → refuse to guess the
+    generation. Fixed reasons: ``ready`` / ``missing_with_existing_data`` /
+    ``generation_mismatch`` / ``rebuilding`` (a matching triple still loses
+    to a rebuilding status).
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(_sql(schema, _PROFILE_SELECT), _IDENTITY_KIND)
         if row is None:
             non_null = await conn.fetchval(_sql(schema, _EP_NON_NULL_COUNT))
-            if non_null:
-                return _ProfileGate(allowed=False, db_profile=None)
+            anchors = await conn.fetchval(_sql(schema, _ANCHOR_COUNT))
+            if non_null or anchors:
+                return _ProfileGate(False, None, "missing_with_existing_data")
             async with conn.transaction():
                 await conn.fetchrow(_sql(schema, _PROFILE_CLAIM), spec.model, spec.revision, spec.dimension)
             row = await conn.fetchrow(_sql(schema, _PROFILE_SELECT), _IDENTITY_KIND)
             if row is None:  # pragma: no cover - claim is atomic with its conflict rule
-                raise RuntimeError("identity profile claim did not produce a row")
+                raise RuntimeError("embedding profile claim did not produce a row")
         profile = {
             "model_name": row["model_name"],
             "model_revision": row["model_revision"],
             "dimension": int(row["dimension"]),
             "status": row["status"],
         }
+    if profile["status"] == "rebuilding":
+        return _ProfileGate(False, profile, "rebuilding")
     matches = (profile["model_name"], profile["model_revision"], profile["dimension"]) == (
         spec.model,
         spec.revision,
         spec.dimension,
     )
-    return _ProfileGate(allowed=matches and profile["status"] == "ready", db_profile=profile)
+    if not matches:
+        return _ProfileGate(False, profile, "generation_mismatch")
+    return _ProfileGate(True, profile, "ready")
 
 
 def _identity_alert(
@@ -578,7 +614,6 @@ def _identity_alert(
     attempted: int = 0,
     succeeded: int = 0,
     failed_atoms: list[dict[str, Any]] | None = None,
-    db_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Aggregate alert payload; never carries credentials, bodies, or stacks."""
     details: dict[str, Any] = {
@@ -589,9 +624,6 @@ def _identity_alert(
         "revision": spec.revision,
         "base_url": mask_network_location(spec.base_url),
     }
-    if db_profile is not None:
-        details["db_profile"] = db_profile
-        details["config_profile"] = {"model_name": spec.model, "model_revision": spec.revision, "dimension": spec.dimension}
     return {"stage": stage, "alert_code": alert_code, "severity": severity, "message": message, "details": details}
 
 
@@ -609,9 +641,16 @@ async def _prepare_identity_vectors(
     spec: IdentitySpec,
     literals: list[tuple[str, str]],
 ) -> _VectorPrep:
-    """Health gate → profile gate → atom-state precheck → sequential bge calls.
+    """Pure encoding step (requirement 05A §5.1 step 5): atom-state precheck →
+    sequential bge calls.
 
-    All HTTP and probes happen before (and outside) the fact transaction.
+    The /health probe and the shared profile gate have already run in
+    ``_ingest_fact`` before any bge HTTP (05A §5.1 steps 2-3); this function
+    only encodes. All HTTP and probes happen before (and outside) the fact
+    transaction. A whole-batch transport failure or a per-literal failure
+    keeps the frozen requirement 03 §5.4 identity degradation: the literal
+    registers with a NULL vector plus an aggregate warning alert — it never
+    bypasses the in-transaction fence.
     """
     if client is None:
         return _VectorPrep(
@@ -622,44 +661,6 @@ async def _prepare_identity_vectors(
                 severity="warning",
                 message="identity vector client could not be constructed; literals register with NULL vectors",
                 spec=spec,
-            ),
-        )
-    try:
-        await client.ensure_ready()
-    except IdentityConfigInvalid:
-        return _VectorPrep(
-            {},
-            _identity_alert(
-                stage="noesis_config",
-                alert_code="identity_vector_config_invalid",
-                severity="error",
-                message="identity service /health contradicts the configured generation; vectors disabled for this process",
-                spec=spec,
-            ),
-        )
-    except IdentityServiceUnavailable:
-        return _VectorPrep(
-            {},
-            _identity_alert(
-                stage="identity_vector",
-                alert_code="identity_vector_unavailable",
-                severity="warning",
-                message="identity service /health unreachable; literals register with NULL vectors",
-                spec=spec,
-            ),
-        )
-
-    gate = await _identity_profile_gate(pool, schema, spec)
-    if not gate.allowed:
-        return _VectorPrep(
-            {},
-            _identity_alert(
-                stage="identity_vector",
-                alert_code="identity_vector_profile_mismatch",
-                severity="error",
-                message="database identity profile does not match the running config or is rebuilding; vector writes suspended",
-                spec=spec,
-                db_profile=gate.db_profile,
             ),
         )
 
@@ -679,8 +680,8 @@ async def _prepare_identity_vectors(
                 failed.append({"text": text, "atom_type": atom_type, "error_kind": "empty_literal"})
                 continue
             try:
-                vectors[(text, atom_type)] = await client.embed(text, atom_type)
-            except IdentityEmbedError as error:
+                vectors[(text, atom_type)] = await client.embed_identity(text, atom_type)
+            except EmbeddingError as error:
                 failed.append({"text": text, "atom_type": atom_type, "error_kind": error.error_kind})
     if not failed:
         return _VectorPrep(vectors, None)
@@ -715,12 +716,6 @@ async def _prepare_identity_vectors(
     )
 
 
-def _vector_literal(vector: Any) -> str:
-    """asyncpg speaks to pgvector through an explicit ``$3::vector`` cast of a
-    text literal; ``repr(float(...))`` keeps full precision and valid syntax."""
-    return "[" + ",".join(repr(float(component)) for component in vector) + "]"
-
-
 # ---------------------------------------------------------------------------
 # Read-only schema preflight (requirement 02 §12 / R02-06)
 # ---------------------------------------------------------------------------
@@ -728,14 +723,16 @@ def _vector_literal(vector: Any) -> str:
 _preflight_lock = asyncio.Lock()
 _preflight_cache: dict[tuple[int, str], bool] = {}
 
-# The object identity the application depends on for the four ingest tables
-# plus the requirement 03 identity profile gate.
-_PREFLIGHT_TABLES = ("atoms", "events", "event_atoms", "ingestion_alerts", "embedding_profiles")
+# The object identity the application depends on for the four ingest tables,
+# the requirement 03 identity profile gate, and the requirement 05 anchor
+# routing objects (anchors table, event_atoms.anchor_id, events.context_embedding).
+_PREFLIGHT_TABLES = ("atoms", "anchors", "events", "event_atoms", "ingestion_alerts", "embedding_profiles")
 _PREFLIGHT_EXTENSIONS = ("vector", "roaringbitmap", "timescaledb", "pg_ripple")
 _PREFLIGHT_COLUMNS = {
     "atoms": ("text", "atom_type", "embedding"),
-    "events": ("event_time", "data"),
-    "event_atoms": ("event_id", "occurrence_id", "atom_id", "role_type", "target_occ"),
+    "anchors": ("atom_id", "centroid_vector", "total_count", "status"),
+    "events": ("event_time", "data", "context_embedding"),
+    "event_atoms": ("event_id", "occurrence_id", "atom_id", "anchor_id", "role_type", "target_occ"),
     "ingestion_alerts": ("dedupe_key", "stage", "alert_code", "severity", "message", "details"),
     "embedding_profiles": ("embedding_kind", "model_name", "model_revision", "dimension", "status", "updated_at"),
 }
@@ -749,8 +746,9 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
     Read-only (SELECT on information_schema / pg_catalog). Raises
     SchemaPreflightError naming the first missing object; never ALTERs, never
     prints a DSN or password. ``expected_dimension`` pins the declared width
-    of atoms.embedding (requirement 03 §11), verified against the live
-    catalog as ``vector(N)`` (format confirmed against the remote database).
+    of atoms.embedding (requirement 03 §11) and anchors.centroid_vector
+    (requirement 05 §10.3), verified against the live catalog as ``vector(N)``
+    (format confirmed against the remote database).
     """
     async with pool.acquire() as conn:
         for extension in _PREFLIGHT_EXTENSIONS:
@@ -850,6 +848,79 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
                 f"'{schema}.atoms.embedding' declares {declared!r}, expected 'vector({expected_dimension})'"
             )
 
+        # Requirement 05 §10.3: anchors is the E/P shared routing table and
+        # event_atoms.anchor_id must already be the NOT NULL FK the writer
+        # depends on — the preflight never repairs, it only names objects.
+        centroid_declared = await conn.fetchval(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+            "WHERE a.attrelid = to_regclass($1) AND a.attname = 'centroid_vector'",
+            f"{schema}.anchors",
+        )
+        if centroid_declared != f"vector({expected_dimension})":
+            raise SchemaPreflightError(
+                f"'{schema}.anchors.centroid_vector' declares {centroid_declared!r}, "
+                f"expected 'vector({expected_dimension})'"
+            )
+
+        centroid_not_null = await conn.fetchval(
+            "SELECT (is_nullable = 'NO') FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = 'anchors' AND column_name = 'centroid_vector'",
+            schema,
+        )
+        if centroid_not_null is not True:
+            raise SchemaPreflightError(f"'{schema}.anchors.centroid_vector' is nullable, expected NOT NULL")
+
+        total_count_not_null = await conn.fetchval(
+            "SELECT (is_nullable = 'NO') FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = 'anchors' AND column_name = 'total_count'",
+            schema,
+        )
+        if total_count_not_null is not True:
+            raise SchemaPreflightError(f"'{schema}.anchors.total_count' is nullable, expected NOT NULL")
+
+        anchors_atom_fk = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE contype = 'f' AND conrelid = to_regclass($1) AND confrelid = to_regclass($2))",
+            f"{schema}.anchors",
+            f"{schema}.atoms",
+        )
+        if not anchors_atom_fk:
+            raise SchemaPreflightError(f"foreign key from '{schema}.anchors' to '{schema}.atoms' is missing")
+
+        anchor_id_not_null = await conn.fetchval(
+            "SELECT (is_nullable = 'NO') FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = 'event_atoms' AND column_name = 'anchor_id'",
+            schema,
+        )
+        if anchor_id_not_null is not True:
+            raise SchemaPreflightError(f"'{schema}.event_atoms.anchor_id' is nullable, expected NOT NULL")
+
+        event_atoms_anchor_fk = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE contype = 'f' AND conrelid = to_regclass($1) AND confrelid = to_regclass($2))",
+            f"{schema}.event_atoms",
+            f"{schema}.anchors",
+        )
+        if not event_atoms_anchor_fk:
+            raise SchemaPreflightError(
+                f"foreign key from '{schema}.event_atoms' to '{schema}.anchors' is missing"
+            )
+
+        # idx_anchors_atom or any equivalent btree index leading with atom_id:
+        # the router's WHERE atom_id = ... probe depends on it.
+        anchors_atom_index = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes "
+            "WHERE schemaname = $1 AND tablename = 'anchors' "
+            "AND (indexname = 'idx_anchors_atom' "
+            "OR indexdef LIKE '%USING btree (atom_id)%' "
+            "OR indexdef LIKE '%USING btree (atom_id,%'))",
+            schema,
+        )
+        if not anchors_atom_index:
+            raise SchemaPreflightError(
+                f"index 'idx_anchors_atom' (or an equivalent atom_id-leading index) missing on '{schema}.anchors'"
+            )
+
 
 async def _ensure_schema_ready(pool: Any, schema: str, expected_dimension: int = 1024) -> bool:
     """Probe once per pool/schema. Unknown failures skip Noesis for this call
@@ -914,7 +985,8 @@ _PROFILE_SELECT = (
     "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles "
     "WHERE embedding_kind = $1"
 )
-_PROFILE_WRITE_GUARD = (
+# Requirement 05A §5.5: the unconditional in-transaction generation fence.
+_PROFILE_FENCE = (
     "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles "
     "WHERE embedding_kind = $1 FOR SHARE"
 )
@@ -924,11 +996,16 @@ _PROFILE_CLAIM = (
     "ON CONFLICT (embedding_kind) DO NOTHING RETURNING embedding_kind"
 )
 _EP_NON_NULL_COUNT = "SELECT count(*) FROM {s}.atoms WHERE embedding IS NOT NULL AND atom_type IN ('E', 'P')"
+# 05A §5.2: the empty-store claim must also prove no Anchor exists — any
+# pre-existing anchor pins a generation the missing profile cannot guess.
+_ANCHOR_COUNT = "SELECT count(*) FROM {s}.anchors"
 # 04A: target_occ is the atoms[].target_occ value verbatim; role_type carries
-# the mapped "char" value (see _ROLE_TYPE) bound via the text cast.
+# the mapped "char" value (see _ROLE_TYPE) bound via the text cast. Requirement
+# 05 §8.2: every row carries the anchor_id routed in this same transaction —
+# a NULL anchor on the success path is impossible by construction.
 _EVENT_ATOM_INSERT = (
-    "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, target_occ) "
-    "VALUES ($1, $2, $3, $4::text::\"char\", $5)"
+    "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, target_occ, anchor_id) "
+    "VALUES ($1, $2, $3, $4::text::\"char\", $5, $6)"
 )
 _ALERT_INSERT = (
     "INSERT INTO {s}.ingestion_alerts (dedupe_key, event_id, stage, alert_code, severity, message, details, status) "
@@ -1009,22 +1086,52 @@ async def _ingest_fact(
     component: Any,
     data: dict,
     resolution: TimeResolution,
-    identity_client: Any,
+    embedding_client: Any,
     identity_spec: IdentitySpec,
 ) -> tuple[int, dict[str, Any] | None]:
     """One fact, one short transaction.
 
     Returns ``(event_id, vector_alert)`` where ``vector_alert`` is the
-    post-commit aggregate identity-vector alert payload (or None). Requirement
-    03 §8.1 order: health/profile gates → atom precheck → sequential bge (all
-    outside the transaction) → the requirement 02 short transaction with the
-    vector-carrying upsert. 04A: the event is sequence-numbered via
+    post-commit aggregate identity-vector alert payload (or None). The frozen
+    05A §5.1 order is: plan → /health → shared profile gate → Context vectors
+    → Identity vectors → BEGIN, where the transaction's first business
+    statement is the unconditional ``FOR SHARE`` generation fence. The gate
+    runs before ANY bge call, so a mismatch/rebuilding profile drops the whole
+    component with zero HTTP and zero facts; the requirement 05 Context
+    hard-precondition and requirement 03 §5.4 identity degradation semantics
+    are unchanged. 04A: the event is sequence-numbered via
     ``INSERT ... RETURNING event_id``; the returned id is shared with
     ``event_atoms`` inside the same transaction.
     """
     event_time = resolution.event_time
 
-    # 1. Ordered unique E/P literals of this component (G never gets a vector).
+    # 1. Requirement 05 §8.1 steps 3-6: build the predicate frames and validate
+    # that every E/P occurrence belongs to a frame — pure CPU, before any
+    # network or database work.
+    plan = plan_anchor_routing(component.atoms)
+    if embedding_client is None:
+        raise EmbeddingServiceUnavailable(
+            "noesis embedding client unavailable; context vectors cannot be prepared"
+        )
+    # 2. Requirement 05A §5.1 step 2: the /health probe precedes the gate.
+    await embedding_client.ensure_ready()
+    # 3. Requirement 05A §5.1 step 3: the shared embedding-space profile gate
+    # runs before ANY Context or Identity bge HTTP. A refused component is
+    # dropped whole (§5.3): the fixed sanitized alert is written by the
+    # _route_component handler of the dedicated exception below.
+    gate = await _embedding_space_profile_gate(pool, schema, identity_spec)
+    if not gate.allowed:
+        raise EmbeddingProfileUnavailable(
+            gate.reason,
+            db_profile=gate.db_profile,
+            config_profile=_config_profile(identity_spec),
+        )
+    # 4. Requirement 05A §5.1 step 4: Context Vector preparation comes only
+    # after the gate allowed this component's generation (05 §8.1 hard
+    # precondition unchanged).
+    context_vectors = await prepare_context_vectors(embedding_client, plan)
+
+    # 5. Ordered unique E/P literals of this component (G never gets a vector).
     literals: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for atom in component.atoms:
@@ -1033,58 +1140,53 @@ async def _ingest_fact(
             seen.add(literal)
             literals.append(literal)
 
-    # 2-4. Health gate, profile gate, atom-state precheck, sequential bge.
+    # 6. Requirement 05A §5.1 step 5: identity encoding (pure step; the gates
+    # already ran above).
     prep = await _prepare_identity_vectors(
-        pool=pool, schema=schema, client=identity_client, spec=identity_spec, literals=literals
+        pool=pool, schema=schema, client=embedding_client, spec=identity_spec, literals=literals
     )
 
-    # 5. The requirement 02 short transaction (unchanged boundaries).
+    # 7. The requirement 02 short transaction (unchanged boundaries).
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Fence the transaction against a rebuild that starts after the
-            # transaction-external profile check and BGE calls. FOR SHARE is
-            # held until commit, so a rebuild status UPDATE must wait. If the
-            # rebuild/new generation already won, discard the prepared vectors
-            # while preserving the fact-only degradation path.
-            transaction_vectors = prep.vectors
-            transaction_alert = prep.alert
-            if transaction_vectors:
-                profile_row = await conn.fetchrow(
-                    _sql(schema, _PROFILE_WRITE_GUARD), _IDENTITY_KIND
+            # Requirement 05A §5.5: the FOR SHARE generation fence is the
+            # FIRST business statement of the fact transaction, executed
+            # unconditionally — even when every atom already carries a vector
+            # and this round prepares zero new Identity vectors. FOR SHARE is
+            # held until commit, so a rebuild status UPDATE must wait; the
+            # in-transaction re-check refuses a generation that changed (or a
+            # rebuild that started) after the transaction-external gate, and
+            # the dedicated exception rolls back the WHOLE component (§5.6:
+            # no Anchor EMA/create may interleave with a rebuild cutover).
+            profile_row = await conn.fetchrow(_sql(schema, _PROFILE_FENCE), _IDENTITY_KIND)
+            db_profile = None
+            if profile_row is not None:
+                db_profile = {
+                    "model_name": profile_row["model_name"],
+                    "model_revision": profile_row["model_revision"],
+                    "dimension": int(profile_row["dimension"]),
+                    "status": profile_row["status"],
+                }
+            if db_profile is None:
+                reason = "missing_with_existing_data"
+            elif db_profile["status"] == "rebuilding":
+                reason = "rebuilding"
+            elif (
+                db_profile["model_name"],
+                db_profile["model_revision"],
+                db_profile["dimension"],
+            ) != (identity_spec.model, identity_spec.revision, identity_spec.dimension) or db_profile[
+                "status"
+            ] != "ready":
+                reason = "generation_mismatch"
+            else:
+                reason = None
+            if reason is not None:
+                raise EmbeddingProfileUnavailable(
+                    reason,
+                    db_profile=db_profile,
+                    config_profile=_config_profile(identity_spec),
                 )
-                db_profile = None
-                if profile_row is not None:
-                    db_profile = {
-                        "model_name": profile_row["model_name"],
-                        "model_revision": profile_row["model_revision"],
-                        "dimension": int(profile_row["dimension"]),
-                        "status": profile_row["status"],
-                    }
-                expected = (
-                    identity_spec.model,
-                    identity_spec.revision,
-                    identity_spec.dimension,
-                    "ready",
-                )
-                actual = None if db_profile is None else (
-                    db_profile["model_name"],
-                    db_profile["model_revision"],
-                    db_profile["dimension"],
-                    db_profile["status"],
-                )
-                if actual != expected:
-                    transaction_vectors = {}
-                    transaction_alert = _identity_alert(
-                        stage="identity_vector",
-                        alert_code="identity_vector_profile_mismatch",
-                        severity="error",
-                        message=(
-                            "database identity profile changed before commit; "
-                            "prepared vectors were discarded"
-                        ),
-                        spec=identity_spec,
-                        db_profile=db_profile,
-                    )
             row = await conn.fetchrow(
                 _sql(schema, _EVENT_INSERT),
                 event_time,
@@ -1112,18 +1214,28 @@ async def _ingest_fact(
                 )
 
             atom_ids: dict[tuple[str, str], int] = {}
-            for atom in component.atoms:
-                literal = (atom.text, atom.type)
-                if literal in atom_ids:
-                    continue  # one upsert per typed literal per event
-                vector = transaction_vectors.get(literal)
+            # ON CONFLICT DO UPDATE can acquire an atom-row lock before the
+            # explicit anchor locks below. Use one global literal order so two
+            # overlapping components cannot take those upsert locks in reverse
+            # input order and deadlock before route_anchors gets control.
+            for literal in sorted(literals):
+                text, atom_type = literal
+                vector = prep.vectors.get(literal)
                 atom_row = await conn.fetchrow(
                     _sql(schema, _ATOM_UPSERT),
-                    atom.text,
-                    atom.type,
-                    _vector_literal(vector) if vector is not None else None,
+                    text,
+                    atom_type,
+                    vector_literal(vector) if vector is not None else None,
                 )
                 atom_ids[literal] = atom_row["atom_id"]
+            # 5. Requirement 05 §8.2 steps 4-5: anchor routing — atom row
+            # locks, nearest-active reuse/EMA or immediate create — inside
+            # this same short transaction, before the event_atoms rows below
+            # carry the routed anchor_id (one route per (atom_id, frame), §5.6).
+            anchor_routes = await route_anchors(
+                conn, schema, atom_ids=atom_ids, plan=plan, context_vectors=context_vectors
+            )
+            occurrence_frame = {occ.pos: occ.frame_pos for occ in plan.occurrences}
             for atom in component.atoms:
                 await conn.execute(
                     _sql(schema, _EVENT_ATOM_INSERT),
@@ -1132,13 +1244,51 @@ async def _ingest_fact(
                     atom_ids[(atom.text, atom.type)],
                     _ROLE_TYPE[atom.role],
                     atom.target_occ,
+                    anchor_routes[(atom_ids[(atom.text, atom.type)], occurrence_frame[atom.pos])],
                 )
-            return event_id, transaction_alert
+            return event_id, prep.alert
 
 
 # ---------------------------------------------------------------------------
 # Routing (requirement 02 §8)
 # ---------------------------------------------------------------------------
+
+async def _anchor_component_alert(
+    pool: Any,
+    schema: str,
+    item: NoesisInputItem,
+    *,
+    component_index: int,
+    stage: str,
+    alert_code: str,
+    message: str,
+    error: Exception,
+    **extra_details: Any,
+) -> None:
+    """anchor_context / anchor_route failure alert (requirement 05 §9.2/§9.3).
+
+    Fixed sanitized wording plus a details whitelist — component_index,
+    predicate_pos (frame errors), error_kind (embedding errors), and
+    exception_type — never the source text, a context vector, or a credential.
+    """
+    details: dict[str, Any] = {
+        "component_index": component_index,
+        "exception_type": type(error).__name__,
+        **extra_details,
+    }
+    await _write_alert_safe(
+        pool,
+        schema,
+        item,
+        stage=stage,
+        alert_code=alert_code,
+        severity="error",
+        message=message,
+        component_index=component_index,
+        event_id=None,
+        details=details,
+    )
+
 
 async def _route_component(
     *,
@@ -1149,7 +1299,7 @@ async def _route_component(
     component: Any,
     resolution: TimeResolution,
     attempts: int,
-    identity_client: Any,
+    embedding_client: Any,
     identity_spec: IdentitySpec,
 ) -> None:
     component_json = component.model_dump(mode="json")
@@ -1165,8 +1315,96 @@ async def _route_component(
             component=component,
             data=data,
             resolution=resolution,
-            identity_client=identity_client,
+            embedding_client=embedding_client,
             identity_spec=identity_spec,
+        )
+    except EmbeddingProfileUnavailable as error:
+        # Requirement 05A §5.3: the fixed sanitized component-drop alert. The
+        # details whitelist carries component_index, the fixed gate reason,
+        # the sanitized db/config generation snapshots, and the content
+        # digest — never source text, atom/context text, vectors, credentials,
+        # or a full exception dump. A missing profile (refused over existing
+        # data) has no db_profile, so the key is omitted entirely.
+        details: dict[str, Any] = {
+            "component_index": component_index,
+            "reason": error.reason,
+            "config_profile": error.config_profile or _config_profile(identity_spec),
+            "content_sha256": _content_sha256(item.content),
+        }
+        if error.db_profile is not None:
+            details["db_profile"] = error.db_profile
+        await _write_alert_safe(
+            pool,
+            schema,
+            item,
+            stage="embedding_profile",
+            alert_code="embedding_profile_unavailable",
+            severity="error",
+            message="noesis embedding generation is unavailable; component dropped",
+            component_index=component_index,
+            event_id=None,
+            details=details,
+        )
+    except AnchorFrameError as error:
+        await _anchor_component_alert(
+            pool,
+            schema,
+            item,
+            component_index=component_index,
+            stage="anchor_context",
+            alert_code="anchor_frame_invalid",
+            message="noesis occurrence could not be assigned to a predicate frame; component dropped",
+            error=error,
+            predicate_pos=error.predicate_pos,
+        )
+    except EmbeddingConfigInvalid as error:
+        await _anchor_component_alert(
+            pool,
+            schema,
+            item,
+            component_index=component_index,
+            stage="anchor_context",
+            alert_code="anchor_context_config_invalid",
+            message="noesis context embedding /health contradicts the configured generation; component dropped",
+            error=error,
+        )
+    except EmbeddingServiceUnavailable as error:
+        await _anchor_component_alert(
+            pool,
+            schema,
+            item,
+            component_index=component_index,
+            stage="anchor_context",
+            alert_code="anchor_context_service_unavailable",
+            message="noesis context embedding service unavailable; component dropped",
+            error=error,
+        )
+    except EmbeddingError as error:
+        await _anchor_component_alert(
+            pool,
+            schema,
+            item,
+            component_index=component_index,
+            stage="anchor_context",
+            alert_code=(
+                "anchor_context_service_unavailable"
+                if is_transport_kind(error.error_kind)
+                else "anchor_context_vector_failed"
+            ),
+            message="noesis context vector could not be embedded; component dropped",
+            error=error,
+            error_kind=error.error_kind,
+        )
+    except AnchorRouteError as error:
+        await _anchor_component_alert(
+            pool,
+            schema,
+            item,
+            component_index=component_index,
+            stage="anchor_route",
+            alert_code="anchor_route_failed",
+            message="noesis anchor routing failed; component rolled back",
+            error=error,
         )
     except Exception as error:
         await _write_alert_safe(
@@ -1208,7 +1446,7 @@ async def _ingest_item(
     analyzer: Any,
     pool_factory: Any,
     config: Any,
-    identity_client: Any,
+    embedding_client: Any,
     identity_spec: IdentitySpec,
 ) -> None:
     """Process one item; never raises to the batch loop. Only business/dependency
@@ -1261,7 +1499,7 @@ async def _ingest_item(
             await _route_component(
                 pool=pool, schema=schema, item=item, component_index=component_index,
                 component=component, resolution=resolution, attempts=outcome.attempts,
-                identity_client=identity_client, identity_spec=identity_spec,
+                embedding_client=embedding_client, identity_spec=identity_spec,
             )
     except asyncio.CancelledError:
         raise  # never swallow cancellation semantics
@@ -1305,7 +1543,7 @@ async def ingest_noesis_batch(
     extract_once_factory: Callable[[Any], Callable[[str], object]] | None = None,
     pool_factory: Callable[[Any], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
-    identity_client_factory: Callable[[Any], Any] | None = None,
+    embedding_client_factory: Callable[[Any], Any] | None = None,
 ) -> None:
     """Production entry point: never raises, never blocks the native retain."""
     if not getattr(config, "noesis_enabled", False):
@@ -1388,15 +1626,15 @@ async def ingest_noesis_batch(
             logger.error("noesis analyzer alert could not be written: %s", type(pool_error).__name__)
         return
 
-    # One shared identity-vector client for the whole batch (lazy singleton in
+    # One shared embedding client for the whole batch (lazy singleton in
     # production; factory seam in tests). Construction is trivial and must
     # never block retain — a failure here degrades to NULL vectors plus the
     # per-fact aggregate alert (requirement 03 §5.4/§9).
     try:
-        identity_client = await _acquire_identity_client(config, identity_spec, identity_client_factory)
+        embedding_client = await _acquire_embedding_client(config, identity_spec, embedding_client_factory)
     except Exception as error:  # pragma: no cover - construction never fails in practice
-        logger.error("noesis identity client unavailable: %s", type(error).__name__)
-        identity_client = None
+        logger.error("noesis embedding client unavailable: %s", type(error).__name__)
+        embedding_client = None
 
     timezone_name = getattr(config, "noesis_timezone", DEFAULT_NOESIS_TIMEZONE) or DEFAULT_NOESIS_TIMEZONE
     for item in items:
@@ -1408,6 +1646,6 @@ async def ingest_noesis_batch(
             analyzer=analyzer,
             pool_factory=pool_factory,
             config=config,
-            identity_client=identity_client,
+            embedding_client=embedding_client,
             identity_spec=identity_spec,
         )

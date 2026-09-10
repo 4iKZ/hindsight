@@ -17,14 +17,14 @@ from hindsight_api.engine.retain.noesis_ingest import ingest_noesis_batch
 from tests.noesis_fakes import (
     CONTENT,
     OBSERVED_AT,
+    FakeEmbeddingClient,
     FakeExtractOnceFactory,
-    FakeIdentityClient,
     FakeStore,
+    embedding_factory_for,
     golden_fact_recursive,
     golden_fact_time,
     golden_hypothesis,
     he_alert,
-    identity_factory_for,
     llm_config,
     noesis_config,
     outcome,
@@ -71,8 +71,8 @@ async def run_ingest(store, contents, monkeypatch, *, config=None, llm_config_va
         extract_once_factory=kwargs.pop("extract_once_factory", FakeExtractOnceFactory()),
         pool_factory=kwargs.pop("pool_factory", pool_factory_for(store)),
         # Offline + alert-quiet default; requirement-03 vector behavior is
-        # covered by test_noesis_identity_vector.py.
-        identity_client_factory=kwargs.pop("identity_client_factory", identity_factory_for(FakeIdentityClient())),
+        # covered by test_noesis_embedding.py.
+        embedding_client_factory=kwargs.pop("embedding_client_factory", embedding_factory_for(FakeEmbeddingClient())),
         **kwargs,
     )
 
@@ -400,7 +400,7 @@ async def test_item_document_id_beats_batch_document_id(monkeypatch):
         llm_config=llm_config(), document_id="batch-doc",
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=pool_factory_for(store),
-        identity_client_factory=identity_factory_for(FakeIdentityClient()),
+        embedding_client_factory=embedding_factory_for(FakeEmbeddingClient()),
     )
     assert [item.document_id for item in ingested] == ["item-doc", "batch-doc"]
 

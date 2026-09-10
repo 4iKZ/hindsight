@@ -15,6 +15,15 @@ Covers (04A requirement §6 / §11.2):
     _ALERT_INSERT-equivalent INSERT dedupes on the second attempt.
   * migration 003 is idempotent and only creates the identity profile gate.
 
+Covers (requirement 05 §10.2/§13.6, offline text + gated remote behavior):
+  * the canonical DDL text pins event_atoms.anchor_id as BIGINT NOT NULL
+    REFERENCES noesis_core.anchors(anchor_id) and stays free of
+    support_count / merged_into_anchor_id / redirect constructs;
+  * migration 005 aborts on existing NULL anchor rows with the exact count
+    and leaves the data untouched, then applies the idempotent SET NOT NULL
+    once the rows are resolved; re-running is safe; its text carries no
+    DELETE/TRUNCATE/INSERT/UPDATE business DML.
+
 Credentials live only in the environment; nothing is written to source, logs,
 or fixtures. The remote host key is pinned.
 """
@@ -25,6 +34,7 @@ import base64
 import hashlib
 import os
 import random
+import re
 import string
 import uuid
 from pathlib import Path
@@ -39,6 +49,10 @@ _EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
 _REPO_ROOT = Path(__file__).resolve().parents[4]  # wxs-noesis/
 _BASE_SQL_PATH = _REPO_ROOT / "docs" / "db" / "noesis-stage1-schema.sql"
 _MIGRATION_003_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
+_MIGRATION_005_PATH = _REPO_ROOT / "docs" / "db" / "migrations" / "005-noesis-anchor-routing.sql"
+_MIGRATION_006_PATH = (
+    _REPO_ROOT / "docs" / "db" / "migrations" / "006-noesis-shared-embedding-generation.sql"
+)
 
 
 def _enabled() -> bool:
@@ -49,6 +63,10 @@ def _enabled() -> bool:
 
 
 requires_remote = pytest.mark.skipif(not _enabled(), reason="NOESIS_REMOTE_DDL_TEST/SSH env not set")
+
+# Serialize with every other remote noesis test under pytest-xdist (see
+# test_noesis_remote_pg.remote_group for the why).
+remote_group = pytest.mark.xdist_group("noesis_remote")
 
 
 class _Remote:
@@ -112,6 +130,7 @@ class _Remote:
 
 
 @requires_remote
+@remote_group
 def test_fresh_install_latest_contract_catalog():
     """04A §6: the baseline DDL creates exactly the latest-contract structure.
 
@@ -222,6 +241,7 @@ def test_fresh_install_latest_contract_catalog():
 
 
 @requires_remote
+@remote_group
 def test_migration_003_idempotent_creates_identity_profile_gate():
     """Req-03 §11: migration 003 is idempotent and only creates the single-row
     model-generation gate — never an index on atoms.embedding (IVFFlat deferred
@@ -262,6 +282,159 @@ def test_migration_003_idempotent_creates_identity_profile_gate():
                 f"AND indexdef ILIKE '%embedding%'"
             )
             assert indexes == [], f"req-04 index leaked by migration 003: {indexes}"
+        finally:
+            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    finally:
+        remote.close()
+
+
+@requires_remote
+@remote_group
+def test_migration_005_rejects_null_anchors_then_applies_idempotently():
+    """Requirement 05 §10.2: migration 005 aborts with the exact NULL count
+    while legacy NULL anchor rows exist (data untouched, column still
+    nullable), then applies the idempotent SET NOT NULL once the rows are
+    resolved; a re-run is a safe no-op."""
+    schema = f"nz5_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
+    remote = _Remote()
+    try:
+        remote.query(f"CREATE SCHEMA {schema}")
+        try:
+            # Fresh baseline, then simulate a pre-005 deployment: anchor_id
+            # still nullable with one legacy NULL row.
+            remote.run_file(_BASE_SQL_PATH, remap=schema)
+            remote.query(f"ALTER TABLE {schema}.event_atoms ALTER COLUMN anchor_id DROP NOT NULL")
+            event_id = remote.query(
+                f"INSERT INTO {schema}.events (event_time, data) VALUES (now(), '{{}}'::jsonb) RETURNING event_id"
+            )[0]
+            atom_id = remote.query(
+                f"INSERT INTO {schema}.atoms (text, atom_type) VALUES ('apple', 'E') RETURNING atom_id"
+            )[0]
+            remote.query(
+                f"INSERT INTO {schema}.event_atoms (event_id, occurrence_id, atom_id, anchor_id, role_type, "
+                f"target_occ) VALUES ({event_id}, 1, {atom_id}, NULL, 'A', NULL)"
+            )
+
+            def anchor_id_nullable() -> list[str]:
+                return remote.query(
+                    f"SELECT is_nullable FROM information_schema.columns "
+                    f"WHERE table_schema='{schema}' AND table_name='event_atoms' AND column_name='anchor_id'"
+                )
+
+            # 005 must abort on the NULL row and leave it exactly as-is.
+            with pytest.raises(RuntimeError, match="anchor_id IS NULL"):
+                remote.run_file(_MIGRATION_005_PATH, remap=schema)
+            null_rows = remote.query(
+                f"SELECT count(*) FROM {schema}.event_atoms WHERE anchor_id IS NULL"
+            )
+            assert null_rows == ["1"], f"NULL row was modified by the aborted migration: {null_rows}"
+            assert anchor_id_nullable() == ["YES"], "aborted migration still flipped NOT NULL"
+
+            # Leader resolves the row; 005 applies and is safe to re-run.
+            remote.query(f"DELETE FROM {schema}.event_atoms WHERE anchor_id IS NULL")
+            remote.run_file(_MIGRATION_005_PATH, remap=schema)
+            remote.run_file(_MIGRATION_005_PATH, remap=schema)
+            assert anchor_id_nullable() == ["NO"], "SET NOT NULL not applied after NULL rows were resolved"
+        finally:
+            remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    finally:
+        remote.close()
+
+
+# ---------------------------------------------------------------------------
+# Offline text-contract assertions (no remote access required)
+# ---------------------------------------------------------------------------
+
+def _strip_sql_comments(text: str) -> str:
+    """Drop full-line SQL comments so text assertions see executable code."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("--"))
+
+
+def _table_block(text: str, table: str) -> str:
+    start = text.index(f"CREATE TABLE noesis_core.{table}")
+    return text[start : text.index(");", start)]
+
+
+def test_canonical_ddl_event_atoms_anchor_id_is_not_null_fk():
+    """Requirement 05 §10.1: event_atoms.anchor_id is BIGINT NOT NULL
+    referencing noesis_core.anchors(anchor_id) — no NULL default bucket."""
+    text = _BASE_SQL_PATH.read_text(encoding="utf-8")
+    block = _table_block(text, "event_atoms")
+    assert re.search(
+        r"anchor_id\s+BIGINT\s+NOT\s+NULL\s+REFERENCES\s+noesis_core\.anchors\(anchor_id\)",
+        block,
+    ), "event_atoms.anchor_id must be BIGINT NOT NULL REFERENCES noesis_core.anchors(anchor_id)"
+
+
+def test_canonical_ddl_has_no_support_merge_redirect_constructs():
+    """04A/05: support_count, merged_into_anchor_id, and any redirect
+    replacement stay banned from the executable DDL (comments may explain)."""
+    code = _strip_sql_comments(_BASE_SQL_PATH.read_text(encoding="utf-8"))
+    for banned in ("support_count", "merged_into_anchor_id", "redirect"):
+        assert banned not in code, f"canonical DDL leaked banned construct {banned!r}"
+
+
+def test_migration_005_text_contract():
+    """Requirement 05 §10.2: migration 005 aborts on existing NULL anchor
+    rows (RAISE with the exact count for the Leader), applies SET NOT NULL
+    only behind the nullable guard, and carries no business DML."""
+    code = _strip_sql_comments(_MIGRATION_005_PATH.read_text(encoding="utf-8"))
+    # Stock check: refuse to run while NULL anchor rows exist.
+    assert "WHERE anchor_id IS NULL" in code, "migration 005 lost the NULL stock check"
+    assert "RAISE EXCEPTION" in code, "migration 005 must RAISE on NULL anchor rows"
+    # Idempotent SET NOT NULL guarded by the nullable probe.
+    assert "is_nullable = 'YES'" in code, "migration 005 lost the idempotent nullable guard"
+    assert "SET NOT NULL" in code, "migration 005 lost the SET NOT NULL step"
+    # Never any business DML: no backfill, no destructive cleanup.
+    for banned in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+        assert banned not in code, f"migration 005 leaked business DML: {banned}"
+
+
+def test_migration_006_text_contract():
+    """Requirement 05A §8.2: migration 006 is catalog guard + COMMENT only —
+    it never writes the profile row, never touches business data, and never
+    creates or drops an ANN index."""
+    code = _strip_sql_comments(_MIGRATION_006_PATH.read_text(encoding="utf-8"))
+    # Fail-closed identity + pre-state guards.
+    assert "current_database()" in code, "migration 006 lost the database guard"
+    assert "RAISE EXCEPTION" in code, "migration 006 must raise on a mismatched pre-state"
+    assert "vector(1024)" in code, "migration 006 lost the 1024-dimension guard"
+    # Comment alignment for the shared E/P embedding space.
+    assert "COMMENT ON TABLE" in code, "migration 006 lost the table comment"
+    assert "shared" in code.lower(), "migration 006 comment must describe the shared embedding space"
+    # Never any business DML, and never an ANN index change.
+    for banned in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+        assert banned not in code, f"migration 006 leaked business DML: {banned}"
+    for banned in ("CREATE INDEX", "DROP INDEX", "REINDEX", "CONCURRENTLY"):
+        assert banned not in code, f"migration 006 must not touch an ANN index: {banned}"
+
+
+@requires_remote
+@remote_group
+def test_migration_006_catalog_guard_and_comment_idempotent():
+    """Requirement 05A §8.2: migration 006 checks the shared-generation
+    pre-state, aligns the embedding_profiles comment, and is safe to re-run
+    without writing a single profile row."""
+    schema = f"nz6_rmt_{random.choice(string.ascii_lowercase)}{uuid.uuid4().hex[:10]}"
+    remote = _Remote()
+    try:
+        remote.query(f"CREATE SCHEMA {schema}")
+        try:
+            remote.run_file(_BASE_SQL_PATH, remap=schema)
+
+            # 006 applies twice (idempotent) and leaves zero profile rows.
+            remote.run_file(_MIGRATION_006_PATH, remap=schema)
+            remote.run_file(_MIGRATION_006_PATH, remap=schema)
+            assert remote.query(f"SELECT count(*) FROM {schema}.embedding_profiles") == ["0"]
+
+            comment = remote.query(
+                f"SELECT obj_description('{schema}.embedding_profiles'::regclass, 'pg_class')"
+            )
+            assert comment, "006 did not set the embedding_profiles comment"
+            lowered = comment[0].lower()
+            assert "shared embedding space" in lowered, f"006 comment lost the shared-space wording: {comment}"
+            assert "no second context row" in lowered, f"006 comment must reject a second context row: {comment}"
+            assert "not an identity-only scope" in lowered, f"006 comment must disclaim the identity-only scope: {comment}"
         finally:
             remote.query(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
     finally:
