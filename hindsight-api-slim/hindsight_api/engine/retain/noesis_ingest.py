@@ -50,6 +50,7 @@ from .noesis_anchor import (
     route_anchors,
     vector_literal,
 )
+from .noesis_bitmap import apply_bitmap_writes, plan_bitmap_writes
 from .noesis_embedding import (
     EmbeddingConfigInvalid,
     EmbeddingError,
@@ -724,9 +725,19 @@ _preflight_lock = asyncio.Lock()
 _preflight_cache: dict[tuple[int, str], bool] = {}
 
 # The object identity the application depends on for the four ingest tables,
-# the requirement 03 identity profile gate, and the requirement 05 anchor
-# routing objects (anchors table, event_atoms.anchor_id, events.context_embedding).
-_PREFLIGHT_TABLES = ("atoms", "anchors", "events", "event_atoms", "ingestion_alerts", "embedding_profiles")
+# the requirement 03 identity profile gate, the requirement 05 anchor routing
+# objects (anchors table, event_atoms.anchor_id, events.context_embedding), and
+# the requirement 06 metric-layer bitmap tables.
+_PREFLIGHT_TABLES = (
+    "atoms",
+    "anchors",
+    "events",
+    "event_atoms",
+    "ingestion_alerts",
+    "embedding_profiles",
+    "cooccurrence_bitmaps",
+    "neighbor_bitmaps",
+)
 _PREFLIGHT_EXTENSIONS = ("vector", "roaringbitmap", "timescaledb", "pg_ripple")
 _PREFLIGHT_COLUMNS = {
     "atoms": ("text", "atom_type", "embedding"),
@@ -735,6 +746,8 @@ _PREFLIGHT_COLUMNS = {
     "event_atoms": ("event_id", "occurrence_id", "atom_id", "anchor_id", "role_type", "target_occ"),
     "ingestion_alerts": ("dedupe_key", "stage", "alert_code", "severity", "message", "details"),
     "embedding_profiles": ("embedding_kind", "model_name", "model_revision", "dimension", "status", "updated_at"),
+    "cooccurrence_bitmaps": ("atom_id", "anchor_id", "event_bitmap"),
+    "neighbor_bitmaps": ("atom_id", "anchor_id", "role_type", "neighbor_bitmap"),
 }
 # 04A: JSON role -> event_atoms.role_type "char" enum (requirement 04A §6.4).
 _ROLE_TYPE = {"agent": "A", "patient": "P", "predicate": "R", "modifier": "M"}
@@ -920,6 +933,105 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
             raise SchemaPreflightError(
                 f"index 'idx_anchors_atom' (or an equivalent atom_id-leading index) missing on '{schema}.anchors'"
             )
+
+        # Requirement 06 §8.3: the two metric-layer bitmap tables must be the
+        # realtime write-maintenance shape — roaringbitmap64 payloads, a real
+        # non-zero Anchor key, and the role-typed neighbor primary key — before
+        # any bitmap write may run.
+        for table, bitmap_column in (
+            ("cooccurrence_bitmaps", "event_bitmap"),
+            ("neighbor_bitmaps", "neighbor_bitmap"),
+        ):
+            declared = await conn.fetchval(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                "WHERE a.attrelid = to_regclass($1) AND a.attname = $2",
+                f"{schema}.{table}",
+                bitmap_column,
+            )
+            if declared != "roaringbitmap64":
+                raise SchemaPreflightError(
+                    f"'{schema}.{table}.{bitmap_column}' declares {declared!r}, expected 'roaringbitmap64'"
+                )
+
+        role_declared = await conn.fetchval(
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+            "WHERE a.attrelid = to_regclass($1) AND a.attname = 'role_type'",
+            f"{schema}.neighbor_bitmaps",
+        )
+        if role_declared != '"char"':
+            raise SchemaPreflightError(
+                f"'{schema}.neighbor_bitmaps.role_type' declares {role_declared!r}, expected '\"char\"'"
+            )
+
+        for table, expected_pk in (
+            ("cooccurrence_bitmaps", "atom_id,anchor_id"),
+            ("neighbor_bitmaps", "atom_id,anchor_id,role_type"),
+        ):
+            pk_columns = await conn.fetchval(
+                "SELECT string_agg(a.attname, ',' ORDER BY array_position(i.indkey::int2[], a.attnum)) "
+                "FROM pg_index i JOIN pg_attribute a "
+                "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                "WHERE i.indrelid = to_regclass($1) AND i.indisprimary",
+                f"{schema}.{table}",
+            )
+            if pk_columns != expected_pk:
+                raise SchemaPreflightError(
+                    f"'{schema}.{table}' primary key is {pk_columns!r}, expected '{expected_pk}'"
+                )
+
+        role_check = await conn.fetchval(
+            "SELECT string_agg(pg_get_constraintdef(oid), ' ') FROM pg_constraint "
+            "WHERE conrelid = to_regclass($1) AND contype = 'c' "
+            "AND pg_get_constraintdef(oid) ILIKE '%role_type%'",
+            f"{schema}.neighbor_bitmaps",
+        )
+        role_values = re.findall(r"'([A-Z])'::\"char\"", role_check or "")
+        if sorted(role_values) != ["N", "O", "S"]:
+            raise SchemaPreflightError(
+                f"'{schema}.neighbor_bitmaps.role_type' CHECK (S/O/N) is missing or incomplete"
+            )
+
+        for table in ("cooccurrence_bitmaps", "neighbor_bitmaps"):
+            anchor_default = await conn.fetchval(
+                "SELECT column_default FROM information_schema.columns "
+                "WHERE table_schema = $1 AND table_name = $2 AND column_name = 'anchor_id'",
+                schema,
+                table,
+            )
+            if anchor_default is not None:
+                raise SchemaPreflightError(
+                    f"'{schema}.{table}.anchor_id' still declares a DEFAULT ({anchor_default!r})"
+                )
+            anchor_check = await conn.fetchval(
+                "SELECT string_agg(pg_get_constraintdef(oid), ' ') FROM pg_constraint "
+                "WHERE conrelid = to_regclass($1) AND contype = 'c' "
+                "AND pg_get_constraintdef(oid) ILIKE '%anchor_id%'",
+                f"{schema}.{table}",
+            )
+            if not anchor_check or "anchor_id > 0" not in anchor_check:
+                raise SchemaPreflightError(f"'{schema}.{table}.anchor_id' CHECK (anchor_id > 0) is missing")
+
+        # Requirement 06 §8.3: the installed roaringbitmap build must provide
+        # rb64_build/rb64_or; the catalog probe names a missing function, the
+        # live call probe proves the installed signature is callable.
+        functions_present = await conn.fetchval(
+            "SELECT count(DISTINCT proname) = 2 FROM pg_proc "
+            "WHERE proname IN ('rb64_build', 'rb64_or')"
+        )
+        if functions_present is not True:
+            raise SchemaPreflightError(
+                "required roaringbitmap functions rb64_build/rb64_or are not installed"
+            )
+        try:
+            rb64_callable = await conn.fetchval(
+                "SELECT rb64_or(rb64_build(ARRAY[1::bigint]), rb64_build(ARRAY[2::bigint])) IS NOT NULL"
+            )
+        except Exception as error:
+            raise SchemaPreflightError(
+                f"roaringbitmap functions rb64_build/rb64_or are not callable: {type(error).__name__}"
+            ) from error
+        if rb64_callable is not True:
+            raise SchemaPreflightError("roaringbitmap functions rb64_build/rb64_or are not callable")
 
 
 async def _ensure_schema_ready(pool: Any, schema: str, expected_dimension: int = 1024) -> bool:
@@ -1246,6 +1358,19 @@ async def _ingest_fact(
                     atom.target_occ,
                     anchor_routes[(atom_ids[(atom.text, atom.type)], occurrence_frame[atom.pos])],
                 )
+            # 6. Requirement 06 §3.1/§9.1: maintain the Cooccurrence and
+            # Neighbor bitmaps inside this same short transaction. The plan is
+            # pure CPU over the already-routed (atom_id, frame_pos) anchors; the
+            # writer issues only database-side rb64_build/rb64_or upserts on
+            # this connection — no new pool, no nested transaction, no commit.
+            bitmap_plan = plan_bitmap_writes(
+                event_id=event_id,
+                atoms=component.atoms,
+                anchor_plan=plan,
+                atom_ids=atom_ids,
+                anchor_routes=anchor_routes,
+            )
+            await apply_bitmap_writes(conn, schema, bitmap_plan)
             return event_id, prep.alert
 
 
