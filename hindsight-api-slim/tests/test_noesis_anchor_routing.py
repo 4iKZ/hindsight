@@ -90,10 +90,12 @@ def seed_atom(store, text, atom_type):
     return atom_id
 
 
-def make_plan(frames, occurrences):
+def make_plan(frames, occurrences, semantic_members=()):
     """Hand-built AnchorPlan: ``frames`` is {predicate_pos: context_text},
     ``occurrences`` is [(pos, text, atom_type, frame_pos)]. plan_anchor_routing
-    is still a skeleton, so the §13.3 tests construct plans directly."""
+    is still a skeleton, so the §13.3 tests construct plans directly. Route-only
+    tests may leave the semantic members empty; bitmap callers must pass the
+    full physical+borrowed member set (requirement 08 §8.2)."""
     ordered = dict(sorted(frames.items()))
     texts: list[str] = []
     for text in ordered.values():
@@ -104,8 +106,16 @@ def make_plan(frames, occurrences):
         occurrences=tuple(
             OccurrenceRoute(pos, (text, atom_type), frame_pos) for pos, text, atom_type, frame_pos in occurrences
         ),
+        semantic_members=tuple(semantic_members),
         context_texts=tuple(texts),
     )
+
+
+def member_tuples(plan):
+    return [
+        (m.occurrence_pos, m.frame_pos, m.semantic_role, m.anchor_route_frame_pos, m.borrowed)
+        for m in plan.semantic_members
+    ]
 
 
 async def route(store, *, atom_ids, plan, context_vectors):
@@ -197,8 +207,19 @@ def test_root_and_nested_clause_two_frames():
     ]
     component = fact(atoms)
     frames = build_predicate_frames(component.atoms)
-    assert frames == {2: PredicateFrame(2, "老师 说 学生"), 4: PredicateFrame(4, "写 作业")}
+    # Requirement 08 §6.2: the parent patient 学生 is borrowed as the nested
+    # clause's semantic agent, so the nested frame carries a real subject.
+    assert frames == {2: PredicateFrame(2, "老师 说 学生"), 4: PredicateFrame(4, "学生 写 作业")}
     assert assign_occurrence_frames(component.atoms, frames) == {1: 2, 2: 2, 3: 2, 4: 4, 5: 4}
+    plan = plan_anchor_routing(component.atoms)
+    assert member_tuples(plan) == [
+        (1, 2, "agent", 2, False),
+        (2, 2, "predicate", 2, False),
+        (3, 2, "patient", 2, False),
+        (3, 4, "agent", 2, True),
+        (4, 4, "predicate", 4, False),
+        (5, 4, "patient", 4, False),
+    ]
 
 
 def test_deeply_nested_clause_frames():
@@ -211,23 +232,74 @@ def test_deeply_nested_clause_frames():
         atom(6, "走", "P", "predicate", 5),  # nested 2 → patient 丙
     ]
     frames = build_predicate_frames(fact(atoms).atoms)
+    # Requirement 08 §6.4: each layer borrows only its direct target — 告诉
+    # borrows 乙 and 走 borrows 丙, never the ancestor patient 乙/甲.
     assert frames == {
         2: PredicateFrame(2, "甲 说 乙"),
-        4: PredicateFrame(4, "告诉 丙"),
-        6: PredicateFrame(6, "走"),
+        4: PredicateFrame(4, "乙 告诉 丙"),
+        6: PredicateFrame(6, "丙 走"),
     }
+    plan = plan_anchor_routing(fact(atoms).atoms)
+    assert member_tuples(plan) == [
+        (1, 2, "agent", 2, False),
+        (2, 2, "predicate", 2, False),
+        (3, 2, "patient", 2, False),
+        (3, 4, "agent", 2, True),
+        (4, 4, "predicate", 4, False),
+        (5, 4, "patient", 4, False),
+        (5, 6, "agent", 4, True),
+        (6, 6, "predicate", 6, False),
+    ]
 
 
-def test_nested_clause_without_explicit_agent_no_implied_injection():
-    # golden_fact_recursive: the nested clause predicate 没写(2) has no explicit
-    # agent — 小明(1) is the ROOT agent (target=4) and 小明(5) the root patient
-    # (resolved=True, still an ordinary atoms entry). The implied agent recorded
-    # in tree.nested[0] must NOT be injected into the clause frame.
+def test_nested_clause_targeting_parent_predicate_does_not_borrow():
+    # golden_fact_recursive: the nested clause predicate 没写(2) targets the
+    # parent predicate 揍(4) directly — the legal fallback — so no semantic
+    # agent is borrowed even though tree.nested[0] records implied 小明.
     frames = build_predicate_frames(golden_fact_recursive().atoms)
     assert frames == {
         2: PredicateFrame(2, "没写 作业"),
         4: PredicateFrame(4, "小明 揍 小明"),
     }
+    plan = plan_anchor_routing(golden_fact_recursive().atoms)
+    assert all(not member.borrowed for member in plan.semantic_members)
+
+
+def test_plan_reads_atoms_only_and_ignores_the_tree_track():
+    """§12.4: identical atoms with different tree tracks produce the same plan."""
+    atoms = [
+        atom(1, "妈妈", "E", "agent", 2),
+        atom(2, "让", "P", "predicate", None),
+        atom(3, "小明", "E", "patient", 2),
+        atom(4, "打", "P", "predicate", 3),
+        atom(5, "酱油", "E", "patient", 4),
+    ]
+    plain = fact(atoms)  # helper tree: root frame only, nested=[]
+    with_nested_track = FactComponent.model_validate(
+        {
+            "utterance_type": "fact",
+            "atoms": atoms,
+            "tree": {
+                "predicate": "让",
+                "agent": [{"text": "妈妈", "modifier": [], "implied": False}],
+                "patient": [{"text": "小明", "modifier": [], "implied": False}],
+                "modifier": [],
+                "nested": [
+                    {
+                        "predicate": "打",
+                        "agent": [{"text": "小明", "modifier": [], "implied": True}],
+                        "patient": [{"text": "酱油", "modifier": [], "implied": False}],
+                        "modifier": [],
+                        "nested": [],
+                        "conditional": [],
+                    }
+                ],
+                "conditional": [],
+            },
+        }
+    )
+
+    assert plan_anchor_routing(plain.atoms) == plan_anchor_routing(with_nested_track.atoms)
 
 
 def test_duplicate_context_text_once_in_plan():
@@ -297,18 +369,18 @@ def test_shuffled_json_array_pos_order_stable():
 
 
 def test_frozen_example_mother_lets_child_buy_soy_sauce():
-    # Requirement 05 §5.5: 妈妈让小明打酱油 — exactly two frames; 打/酱油 never
-    # inherit the root frame "妈妈 让 小明" and never the whole sentence.
+    # Requirement 08 §4.4/§7.1: 打 targets 小明, so the child frame borrows the
+    # single 小明 occurrence as its semantic agent: "小明 打 酱油".
     atoms = [
         atom(1, "妈妈", "E", "agent", 2),
         atom(2, "让", "P", "predicate", None),
         atom(3, "小明", "E", "patient", 2),
-        atom(4, "打", "P", "predicate", 2),
+        atom(4, "打", "P", "predicate", 3),
         atom(5, "酱油", "E", "patient", 4),
     ]
     component = fact(atoms)
     frames = build_predicate_frames(component.atoms)
-    assert frames == {2: PredicateFrame(2, "妈妈 让 小明"), 4: PredicateFrame(4, "打 酱油")}
+    assert frames == {2: PredicateFrame(2, "妈妈 让 小明"), 4: PredicateFrame(4, "小明 打 酱油")}
     assignment = assign_occurrence_frames(component.atoms, frames)
     assert assignment == {1: 2, 2: 2, 3: 2, 4: 4, 5: 4}  # 妈妈/让/小明→2, 打/酱油→4
     plan = plan_anchor_routing(component.atoms)
@@ -319,7 +391,106 @@ def test_frozen_example_mother_lets_child_buy_soy_sauce():
         OccurrenceRoute(4, ("打", "P"), 4),
         OccurrenceRoute(5, ("酱油", "E"), 4),
     )
-    assert plan.context_texts == ("妈妈 让 小明", "打 酱油")
+    assert plan.context_texts == ("妈妈 让 小明", "小明 打 酱油")
+    assert member_tuples(plan) == [
+        (1, 2, "agent", 2, False),
+        (2, 2, "predicate", 2, False),
+        (3, 2, "patient", 2, False),
+        (3, 4, "agent", 2, True),
+        (4, 4, "predicate", 4, False),
+        (5, 4, "patient", 4, False),
+    ]
+
+
+async def test_shared_pivot_routes_once_with_parent_anchor():
+    store = FakeStore()
+    plan = plan_anchor_routing(
+        fact(
+            [
+                atom(1, "妈妈", "E", "agent", 2),
+                atom(2, "让", "P", "predicate", None),
+                atom(3, "小明", "E", "patient", 2),
+                atom(4, "打", "P", "predicate", 3),
+                atom(5, "酱油", "E", "patient", 4),
+            ]
+        ).atoms
+    )
+    atom_ids = {}
+    for occurrence in plan.occurrences:
+        if occurrence.literal not in atom_ids:
+            atom_ids[occurrence.literal] = seed_atom(store, occurrence.literal[0], occurrence.literal[1])
+
+    routes = await route(
+        store,
+        atom_ids=atom_ids,
+        plan=plan,
+        context_vectors={"妈妈 让 小明": list(basis(0)), "小明 打 酱油": list(basis(1))},
+    )
+
+    ming = atom_ids[("小明", "E")]
+    assert set(routes) == {
+        (atom_ids[("妈妈", "E")], 2),
+        (atom_ids[("让", "P")], 2),
+        (ming, 2),
+        (atom_ids[("打", "P")], 4),
+        (atom_ids[("酱油", "E")], 4),
+    }
+    assert all(atom_id != ming or frame_pos != 4 for atom_id, frame_pos in routes)
+    ming_anchors = [row for row in store.anchors_rows() if row["atom_id"] == ming]
+    assert len(ming_anchors) == 1  # requirement 08 §7.2: one occurrence, one anchor
+    assert ming_anchors[0]["total_count"] == 1
+    assert ming_anchors[0]["centroid"] == basis(0)  # sampled with the parent frame context
+
+
+def test_complex_shared_pivot_frames_and_members():
+    """需求 08 §0.1: the authoritative complex sentence."""
+    atoms = [
+        atom(1, "昨天晚上", "E", "modifier", 4),
+        atom(2, "妈妈", "E", "agent", 4),
+        atom(3, "在厨房", "E", "modifier", 4),
+        atom(4, "让", "P", "predicate", None),
+        atom(5, "小明", "E", "patient", 4),
+        atom(6, "桌上", "E", "modifier", 9),
+        atom(7, "两个", "E", "modifier", 9),
+        atom(8, "红", "E", "modifier", 9),
+        atom(9, "苹果", "E", "patient", 10),
+        atom(10, "洗", "P", "predicate", 5),
+        atom(11, "干净", "E", "modifier", 10),
+    ]
+    plan = plan_anchor_routing(fact(atoms).atoms)
+
+    assert build_predicate_frames(fact(atoms).atoms) == {
+        4: PredicateFrame(4, "妈妈 让 小明"),
+        10: PredicateFrame(10, "小明 洗 苹果"),
+    }
+    assert plan.context_texts == ("妈妈 让 小明", "小明 洗 苹果")
+    assert plan.occurrences == (
+        OccurrenceRoute(1, ("昨天晚上", "E"), 4),
+        OccurrenceRoute(2, ("妈妈", "E"), 4),
+        OccurrenceRoute(3, ("在厨房", "E"), 4),
+        OccurrenceRoute(4, ("让", "P"), 4),
+        OccurrenceRoute(5, ("小明", "E"), 4),
+        OccurrenceRoute(6, ("桌上", "E"), 10),
+        OccurrenceRoute(7, ("两个", "E"), 10),
+        OccurrenceRoute(8, ("红", "E"), 10),
+        OccurrenceRoute(9, ("苹果", "E"), 10),
+        OccurrenceRoute(10, ("洗", "P"), 10),
+        OccurrenceRoute(11, ("干净", "E"), 10),
+    )
+    assert member_tuples(plan) == [
+        (1, 4, "modifier", 4, False),
+        (2, 4, "agent", 4, False),
+        (3, 4, "modifier", 4, False),
+        (4, 4, "predicate", 4, False),
+        (5, 4, "patient", 4, False),
+        (5, 10, "agent", 4, True),
+        (6, 10, "modifier", 10, False),
+        (7, 10, "modifier", 10, False),
+        (8, 10, "modifier", 10, False),
+        (9, 10, "patient", 10, False),
+        (10, 10, "predicate", 10, False),
+        (11, 10, "modifier", 10, False),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +747,7 @@ async def test_route_never_writes_null_anchor():
 async def test_prepare_context_vectors_embeds_each_unique_text_once():
     client = FakeEmbeddingClient()
     plan = AnchorPlan(
-        frames={2: PredicateFrame(2, "妈妈 让 小明"), 4: PredicateFrame(4, "打 酱油")},
+        frames={2: PredicateFrame(2, "妈妈 让 小明"), 4: PredicateFrame(4, "小明 打 酱油")},
         occurrences=(
             OccurrenceRoute(1, ("妈妈", "E"), 2),
             OccurrenceRoute(2, ("让", "P"), 2),
@@ -584,16 +755,17 @@ async def test_prepare_context_vectors_embeds_each_unique_text_once():
             OccurrenceRoute(4, ("打", "P"), 4),
             OccurrenceRoute(5, ("酱油", "E"), 4),
         ),
-        context_texts=("妈妈 让 小明", "打 酱油"),
+        semantic_members=(),
+        context_texts=("妈妈 让 小明", "小明 打 酱油"),
     )
 
     vectors = await prepare_context_vectors(client, plan)
 
     assert client.ensure_calls == 1
-    assert client.context_calls == ["妈妈 让 小明", "打 酱油"]  # plan order, no duplicates
+    assert client.context_calls == ["妈妈 让 小明", "小明 打 酱油"]  # plan order, no duplicates
     assert vectors == {
         "妈妈 让 小明": list(fake_context_vector("妈妈 让 小明")),
-        "打 酱油": list(fake_context_vector("打 酱油")),
+        "小明 打 酱油": list(fake_context_vector("小明 打 酱油")),
     }
 
 
@@ -602,6 +774,7 @@ async def test_prepare_context_vectors_failure_propagates():
     plan = AnchorPlan(
         frames={4: PredicateFrame(4, "打 酱油")},
         occurrences=(OccurrenceRoute(4, ("打", "P"), 4),),
+        semantic_members=(),
         context_texts=("打 酱油",),
     )
 

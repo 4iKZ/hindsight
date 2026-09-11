@@ -19,6 +19,7 @@ from hindsight_api.engine.retain.noesis_anchor import (
     AnchorPlan,
     OccurrenceRoute,
     PredicateFrame,
+    SemanticFrameMember,
     plan_anchor_routing,
 )
 from hindsight_api.engine.retain.noesis_bitmap import (
@@ -280,7 +281,7 @@ def test_same_atom_in_two_frames_gets_two_cooccurrence_buckets():
             atom(1, "妈妈", "E", "agent", 2),
             atom(2, "让", "P", "predicate", None),
             atom(3, "小明", "E", "patient", 2),
-            atom(4, "打", "P", "predicate", 2),
+            atom(4, "打", "P", "predicate", 3),
             atom(5, "酱油", "E", "patient", 4),
             atom(6, "小明", "E", "patient", 4),
         ]
@@ -308,7 +309,7 @@ def test_plan_is_independent_of_atom_input_order():
         atom(1, "妈妈", "E", "agent", 2),
         atom(2, "让", "P", "predicate", None),
         atom(3, "小明", "E", "patient", 2),
-        atom(4, "打", "P", "predicate", 2),
+        atom(4, "打", "P", "predicate", 3),
         atom(5, "酱油", "E", "patient", 4),
     ]
     forward, forward_ids, _ = planned(fact(atoms))
@@ -334,6 +335,11 @@ def _stub_plan():
             OccurrenceRoute(1, ("妈妈", "E"), 2),
             OccurrenceRoute(2, ("买", "P"), 2),
             OccurrenceRoute(3, ("苹果", "E"), 2),
+        ),
+        semantic_members=(
+            SemanticFrameMember(1, 2, "agent", 2, False),
+            SemanticFrameMember(2, 2, "predicate", 2, False),
+            SemanticFrameMember(3, 2, "patient", 2, False),
         ),
         context_texts=("妈妈 买 苹果",),
     )
@@ -398,6 +404,7 @@ def test_missing_planned_occurrence_fails_closed():
     incomplete = AnchorPlan(
         frames=plan.frames,
         occurrences=plan.occurrences[:-1],
+        semantic_members=plan.semantic_members[:-1],
         context_texts=plan.context_texts,
     )
     with pytest.raises(BitmapPlanError, match="missing atom occurrence"):
@@ -415,6 +422,7 @@ def test_mismatched_planned_literal_fails_closed():
     mismatched = AnchorPlan(
         frames=plan.frames,
         occurrences=(OccurrenceRoute(1, ("别人", "E"), 2), *plan.occurrences[1:]),
+        semantic_members=plan.semantic_members,
         context_texts=plan.context_texts,
     )
     with pytest.raises(BitmapPlanError, match="does not match atom"):
@@ -424,6 +432,42 @@ def test_mismatched_planned_literal_fails_closed():
             anchor_plan=mismatched,
             atom_ids={**_STUB_ATOM_IDS, ("别人", "E"): 104},
             anchor_routes={**_STUB_ROUTES, (104, 2): 9004},
+        )
+
+
+def test_missing_semantic_members_fail_closed():
+    plan = _stub_plan()
+    empty = AnchorPlan(
+        frames=plan.frames,
+        occurrences=plan.occurrences,
+        semantic_members=(),
+        context_texts=plan.context_texts,
+    )
+    with pytest.raises(BitmapPlanError, match="semantic member"):
+        plan_bitmap_writes(
+            event_id=1,
+            atoms=_stub_atoms(),
+            anchor_plan=empty,
+            atom_ids=_STUB_ATOM_IDS,
+            anchor_routes=_STUB_ROUTES,
+        )
+
+
+def test_semantic_member_coverage_mismatch_fails_closed():
+    plan = _stub_plan()
+    missing = AnchorPlan(
+        frames=plan.frames,
+        occurrences=plan.occurrences,
+        semantic_members=plan.semantic_members[:-1],
+        context_texts=plan.context_texts,
+    )
+    with pytest.raises(BitmapPlanError, match="semantic member"):
+        plan_bitmap_writes(
+            event_id=1,
+            atoms=_stub_atoms(),
+            anchor_plan=missing,
+            atom_ids=_STUB_ATOM_IDS,
+            anchor_routes=_STUB_ROUTES,
         )
 
 
@@ -462,8 +506,8 @@ def test_nested_clause_frames_never_cross_pair():
     )
     assert rows[(homework, "N")] == (xie,)
     assert rows[(xie, "O")] == (homework,)
-    assert (xie, "S") not in rows, "no agent in the nested clause and no implied occurrence added"
-    assert rows[(ming, "N")] == (zou,), "root-frame 小明 must not inherit the nested frame"
+    assert (xie, "S") not in rows, "没写 targets the parent predicate: no semantic agent is borrowed"
+    assert rows[(ming, "N")] == (zou,), "without a borrow the same-name E rows stay in their own frame"
     assert homework not in rows[(ming, "N")]
     assert ming not in rows[(homework, "N")]
 
@@ -474,7 +518,7 @@ def test_frozen_mother_lets_child_buy_soy_sauce_isolation():
             atom(1, "妈妈", "E", "agent", 2),
             atom(2, "让", "P", "predicate", None),
             atom(3, "小明", "E", "patient", 2),
-            atom(4, "打", "P", "predicate", 2),
+            atom(4, "打", "P", "predicate", 3),
             atom(5, "酱油", "E", "patient", 4),
         ]
     )
@@ -484,16 +528,62 @@ def test_frozen_mother_lets_child_buy_soy_sauce_isolation():
     mother, rang, ming, beat, sauce = (ids[lit] for lit in (("妈妈", "E"), ("让", "P"), ("小明", "E"), ("打", "P"), ("酱油", "E")))
     assert rows[(rang, "S")] == (mother,)
     assert rows[(rang, "O")] == (ming,)
+    assert rows[(beat, "S")] == (ming,), "requirement 08 §8.2: the child frame's S row carries the borrowed pivot"
     assert rows[(beat, "O")] == (sauce,)
-    assert (beat, "S") not in rows, "no agent in the nested frame"
-    assert rows[(sauce, "N")] == (beat,)
-    assert set(rows[(mother, "N")]) == {rang, ming}
-    assert set(rows[(ming, "N")]) == {mother, rang}
+    assert rows[(sauce, "N")] == (ming, beat)
+    assert rows[(mother, "N")] == (rang, ming)
+    # The shared pivot is the one legal overlap node: its own N row unions both
+    # frames, while no other node crosses frames.
+    assert rows[(ming, "N")] == (mother, rang, beat, sauce)
+    assert mother not in rows[(sauce, "N")]
+    assert sauce not in rows[(mother, "N")]
+    assert set(rows[(rang, "S")]) | set(rows[(rang, "O")]) <= {mother, ming}
+    assert set(rows[(beat, "S")]) | set(rows[(beat, "O")]) <= {ming, sauce}
+
+
+def test_complex_shared_pivot_neighbor_frames():
+    component = fact(
+        [
+            atom(1, "昨天晚上", "E", "modifier", 4),
+            atom(2, "妈妈", "E", "agent", 4),
+            atom(3, "在厨房", "E", "modifier", 4),
+            atom(4, "让", "P", "predicate", None),
+            atom(5, "小明", "E", "patient", 4),
+            atom(6, "桌上", "E", "modifier", 9),
+            atom(7, "两个", "E", "modifier", 9),
+            atom(8, "红", "E", "modifier", 9),
+            atom(9, "苹果", "E", "patient", 10),
+            atom(10, "洗", "P", "predicate", 5),
+            atom(11, "干净", "E", "modifier", 10),
+        ]
+    )
+    plan, ids, _ = planned(component)
+    rows = neighbor_rows(plan)
+
+    mother, rang, ming, apple, wash = (
+        ids[("妈妈", "E")],
+        ids[("让", "P")],
+        ids[("小明", "E")],
+        ids[("苹果", "E")],
+        ids[("洗", "P")],
+    )
+    assert rows[(rang, "S")] == (mother,)
+    assert rows[(rang, "O")] == (ming,)
+    assert rows[(wash, "S")] == (ming,)
+    assert rows[(wash, "O")] == (apple,)
+    assert rows[(mother, "N")] == (rang, ming)
+    assert rows[(apple, "N")] == (ming, wash)
+    assert rows[(ming, "N")] == (mother, rang, apple, wash)
+    # Non-shared nodes never cross frames.
+    assert set(rows[(rang, "S")]) | set(rows[(rang, "O")]) <= {mother, ming}
+    assert set(rows[(wash, "S")]) | set(rows[(wash, "O")]) <= {ming, apple}
+    assert mother not in rows[(apple, "N")] and rang not in rows[(apple, "N")]
+    assert apple not in rows[(mother, "N")] and wash not in rows[(mother, "N")]
+    # Modifiers write no Neighbor rows and never appear as neighbors.
+    modifier_ids = {ids[(text, "E")] for text in ("昨天晚上", "在厨房", "桌上", "两个", "红", "干净")}
+    assert all(write.atom_id not in modifier_ids for write in plan.neighbors)
     for write in plan.neighbors:
-        for bit in write.neighbor_atom_ids:
-            assert (write.atom_id in (beat, sauce)) == (bit in (beat, sauce)), (
-                "no parent-frame atom may pair with a child-frame atom"
-            )
+        assert not (set(write.neighbor_atom_ids) & modifier_ids)
 
 
 def test_nested_cooccurrence_still_writes_every_occurrence():
@@ -502,7 +592,7 @@ def test_nested_cooccurrence_still_writes_every_occurrence():
             atom(1, "妈妈", "E", "agent", 2),
             atom(2, "让", "P", "predicate", None),
             atom(3, "小明", "E", "patient", 2),
-            atom(4, "打", "P", "predicate", 2),
+            atom(4, "打", "P", "predicate", 3),
             atom(5, "酱油", "E", "patient", 4),
         ]
     )
@@ -513,6 +603,9 @@ def test_nested_cooccurrence_still_writes_every_occurrence():
         (ids[lit], 904) for lit in (("打", "P"), ("酱油", "E"))
     }
     assert {write.event_id for write in plan.cooccurrences} == {555}
+    # Requirement 08 §8.1: the borrowed member adds no second Cooccurrence key.
+    ming_keys = {(write.atom_id, write.anchor_id) for write in plan.cooccurrences if write.atom_id == ids[("小明", "E")]}
+    assert ming_keys == {(ids[("小明", "E")], 902)}
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 # Cosine DISTANCE reuse gate (requirement 05 §6.4): reuse when
 # ``distance <= REUSE_MAX_DISTANCE``, i.e. cosine similarity >= 0.75.
@@ -76,11 +76,38 @@ class OccurrenceRoute:
 
 
 @dataclass(frozen=True)
+class SemanticFrameMember:
+    """One semantic frame membership of a stored atom occurrence (requirement 08 §5.2).
+
+    ``occurrence_pos`` references a real ``atoms``/``event_atoms`` row,
+    ``frame_pos`` is the predicate frame the member participates in, and
+    ``anchor_route_frame_pos`` is the physical frame whose routed anchor this
+    member reuses. ``borrowed`` marks a parent-clause argument shared into a
+    subordinate clause's frame: it never gets a second occurrence or route.
+    """
+
+    occurrence_pos: int
+    frame_pos: int
+    semantic_role: Literal["agent", "patient", "predicate", "modifier"]
+    anchor_route_frame_pos: int
+    borrowed: bool = False
+
+
+@dataclass(frozen=True)
 class AnchorPlan:
-    """Frozen routing plan for one fact component."""
+    """Frozen routing plan for one fact component.
+
+    ``occurrences`` keeps the requirement 05 physical contract: every atom
+    occurrence has exactly one frame and one anchor route. ``semantic_members``
+    is the requirement 08 semantic view: the physical members plus, per
+    subordinate predicate that targets a parent agent/patient occurrence, one
+    borrowed ``agent`` member reusing the target's real anchor. Borrowed members
+    are never iterated by ``route_anchors`` (requirement 08 §7.2).
+    """
 
     frames: dict[int, PredicateFrame]  # predicate pos -> frame
     occurrences: tuple[OccurrenceRoute, ...]  # every atom occurrence, pos-ascending
+    semantic_members: tuple[SemanticFrameMember, ...]  # (occurrence_pos, frame_pos) ascending
     context_texts: tuple[str, ...]  # unique frame context texts, predicate-pos ascending
 
 
@@ -155,17 +182,37 @@ def _validate_closure(by_pos: dict[int, Any]) -> None:
             )
 
 
+def _borrowed_agent_pos(by_pos: dict[int, Any], predicate: Any) -> int | None:
+    """The parent-clause agent/patient occurrence a subordinate predicate modifies.
+
+    Requirement 08 §6.2: a non-root predicate whose ``target_occ`` points at a
+    parent agent or patient occurrence borrows that occurrence as its frame's
+    semantic agent. A predicate target (the legal fallback of §6.3) or a
+    modifier target (already rejected upstream for predicates) borrows nothing;
+    broken targets are rejected earlier by :func:`_validate_closure`.
+    """
+    target = predicate.target_occ
+    if target is None:
+        return None
+    target_atom = by_pos.get(target)
+    if target_atom is None or target_atom.role not in ("agent", "patient"):
+        return None
+    return target
+
+
 def build_predicate_frames(atoms: Any) -> dict[int, PredicateFrame]:
-    """Build one frame per predicate occurrence (requirement 05 §5.2/§5.3).
+    """Build one frame per predicate occurrence (requirement 05 §5.2/§5.3 + 08).
 
     Predicates are the atoms with ``role == "predicate" and type == "P"``,
     processed in ascending ``pos`` — never in JSON array order. For each
-    predicate ``p`` the agents and patients are the atoms whose
-    ``target_occ == p.pos``, each sorted by ``pos``; the frame's
-    ``context_text`` is ``" ".join(agents + [predicate] + patients)`` with a
-    single ASCII space between elements and no role labels, punctuation,
-    ``pos``, ``type``, or disambiguation suffixes. Modifiers never enter the
-    context text.
+    predicate ``p`` the agents are the atoms whose ``target_occ == p.pos`` plus,
+    for a non-root predicate targeting a parent agent/patient occurrence, that
+    borrowed occurrence (requirement 08 §6.2/§7.1); agents and patients are each
+    sorted by ``pos``. The frame's ``context_text`` is
+    ``" ".join(agents + [predicate] + patients)`` with a single ASCII space
+    between elements and no role labels, punctuation, ``pos``, ``type``, or
+    disambiguation suffixes. Modifiers never enter the context text and a
+    predicate target (the legal fallback) borrows nothing.
 
     Violations raise :class:`AnchorFrameError`: an agent/patient whose
     ``target_occ`` points at a non-predicate occurrence, a G-typed atom (the
@@ -186,6 +233,9 @@ def build_predicate_frames(atoms: Any) -> dict[int, PredicateFrame]:
             (atom for atom in by_pos.values() if atom.role == "agent" and atom.target_occ == predicate.pos),
             key=lambda atom: atom.pos,
         )
+        borrowed_pos = _borrowed_agent_pos(by_pos, predicate)
+        if borrowed_pos is not None and all(agent.pos != borrowed_pos for agent in agents):
+            agents = sorted([*agents, by_pos[borrowed_pos]], key=lambda atom: atom.pos)
         patients = sorted(
             (atom for atom in by_pos.values() if atom.role == "patient" and atom.target_occ == predicate.pos),
             key=lambda atom: atom.pos,
@@ -262,9 +312,13 @@ def plan_anchor_routing(atoms: Any) -> AnchorPlan:
     """Combine frame construction and assignment into one routing plan.
 
     ``occurrences`` lists every atom occurrence in ascending ``pos`` with its
-    ``(text, atom_type)`` literal and its frame; ``context_texts`` lists the
-    unique frame context texts in ascending predicate pos, so identical texts
-    are embedded exactly once per component (requirement 05 §7.5).
+    ``(text, atom_type)`` literal and its physical frame; ``semantic_members``
+    lists every physical member plus the borrowed agent members (requirement 08
+    §5.2/§6.2), sorted by ``(occurrence_pos, frame_pos)``. ``context_texts``
+    lists the unique frame context texts in ascending predicate pos, so
+    identical texts are embedded exactly once per component (requirement 05
+    §7.5). Only ``occurrences`` is routed — a borrowed member reuses its
+    target's already-routed anchor (requirement 08 §7.2).
     """
     atom_list = list(atoms)
     for atom in atom_list:
@@ -279,12 +333,35 @@ def plan_anchor_routing(atoms: Any) -> AnchorPlan:
         OccurrenceRoute(atom.pos, (atom.text, atom.type), occurrence_frames[atom.pos])
         for atom in sorted(atom_list, key=lambda a: a.pos)
     )
+    by_pos = _index_by_pos(atom_list)
+    semantic_members: list[SemanticFrameMember] = []
+    for atom in sorted(atom_list, key=lambda a: a.pos):
+        physical_frame = occurrence_frames[atom.pos]
+        semantic_members.append(SemanticFrameMember(atom.pos, physical_frame, atom.role, physical_frame, False))
+        if atom.role == "predicate":
+            borrowed_pos = _borrowed_agent_pos(by_pos, atom)
+            if borrowed_pos is not None:
+                semantic_members.append(
+                    SemanticFrameMember(
+                        borrowed_pos,
+                        atom.pos,
+                        "agent",
+                        occurrence_frames[borrowed_pos],
+                        True,
+                    )
+                )
+    semantic_members.sort(key=lambda member: (member.occurrence_pos, member.frame_pos))
     context_texts: list[str] = []
     for predicate_pos in sorted(frames):
         context_text = frames[predicate_pos].context_text
         if context_text not in context_texts:
             context_texts.append(context_text)
-    return AnchorPlan(frames=frames, occurrences=occurrences, context_texts=tuple(context_texts))
+    return AnchorPlan(
+        frames=frames,
+        occurrences=occurrences,
+        semantic_members=tuple(semantic_members),
+        context_texts=tuple(context_texts),
+    )
 
 
 def should_reuse(distance: float) -> bool:

@@ -116,8 +116,41 @@ def golden_fact_time() -> FactComponent:
     return FactComponent.model_validate(GOLDEN_FACT_TIME_JSON)
 
 
+GOLDEN_FACT_PIVOT_JSON = {
+    "utterance_type": "fact",
+    "atoms": [
+        {"pos": 1, "text": "妈妈", "type": "E", "role": "agent", "target_occ": 2, "resolved": None},
+        {"pos": 2, "text": "让", "type": "P", "role": "predicate", "target_occ": None, "resolved": None},
+        {"pos": 3, "text": "小明", "type": "E", "role": "patient", "target_occ": 2, "resolved": None},
+        {"pos": 4, "text": "打", "type": "P", "role": "predicate", "target_occ": 3, "resolved": None},
+        {"pos": 5, "text": "酱油", "type": "E", "role": "patient", "target_occ": 4, "resolved": None},
+    ],
+    "tree": {
+        "predicate": "让",
+        "agent": [{"text": "妈妈", "modifier": [], "implied": False}],
+        "patient": [{"text": "小明", "modifier": [], "implied": False}],
+        "modifier": [],
+        "nested": [
+            {
+                "predicate": "打",
+                "agent": [{"text": "小明", "modifier": [], "implied": True}],
+                "patient": [{"text": "酱油", "modifier": [], "implied": False}],
+                "modifier": [],
+                "nested": [],
+                "conditional": [],
+            }
+        ],
+        "conditional": [],
+    },
+}
+
+
 def golden_fact_recursive() -> FactComponent:
     return FactComponent.model_validate(GOLDEN_FACT_RECURSIVE_JSON)
+
+
+def golden_fact_pivot() -> FactComponent:
+    return FactComponent.model_validate(GOLDEN_FACT_PIVOT_JSON)
 
 
 def golden_hypothesis() -> HypothesisComponent:

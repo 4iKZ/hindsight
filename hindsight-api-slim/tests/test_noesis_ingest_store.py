@@ -25,6 +25,7 @@ from tests.noesis_fakes import (
     FakeExtractOnceFactory,
     FakeStore,
     embedding_factory_for,
+    golden_fact_pivot,
     golden_fact_recursive,
     golden_fact_time,
     llm_config,
@@ -134,6 +135,36 @@ async def test_event_atoms_anchor_id_is_routed_non_null(monkeypatch):
     for row in rows:
         assert len(row) == 6  # (event_id, occurrence_id, atom_id, role_type, target_occ, anchor_id)
         assert row[5] is not None
+
+
+async def test_shared_pivot_borrows_real_anchor_without_a_second_row(monkeypatch):
+    """需求 08 §12.4: one row per real atom, the pivot reuses its physical anchor,
+    and the borrowed member adds neither an event_atom row nor a bitmap key."""
+    store = FakeStore()
+    await run(store, one_fact_contents(), [golden_fact_pivot()])
+
+    rows = event_atom_args(store)
+    assert len(rows) == 5  # 妈妈 让 小明 打 酱油 — no implied duplicate row
+    by_occurrence = {row[1]: row for row in rows}
+    ming_id = by_occurrence[3][2]
+    assert by_occurrence[4][4] == 3  # 打 targets 小明, not the parent predicate
+    assert sum(1 for row in rows if row[2] == ming_id) == 1
+    assert all(isinstance(row[5], int) and row[5] > 0 for row in rows)
+
+    ming_anchor_rows = [row for row in store.anchors_rows() if row["atom_id"] == ming_id]
+    assert len(ming_anchor_rows) == 1
+    assert ming_anchor_rows[0]["total_count"] == 1  # routed once with the parent frame
+    ming_anchor = ming_anchor_rows[0]["anchor_id"]
+    assert by_occurrence[3][5] == ming_anchor
+
+    cooccurrence_keys = {(atom_id, anchor_id) for atom_id, anchor_id in store.cooccurrence_bitmaps}
+    assert len(cooccurrence_keys) == 5
+    assert len({key for key in cooccurrence_keys if key[0] == ming_id}) == 1
+
+    ming_neighbors = store.neighbor_bitmaps.get((ming_id, ming_anchor, "N"))
+    assert ming_neighbors == {by_occurrence[1][2], by_occurrence[2][2], by_occurrence[4][2], by_occurrence[5][2]}
+    beat_s = store.neighbor_bitmaps.get((by_occurrence[4][2], by_occurrence[4][5], "S"))
+    assert beat_s == {ming_id}
 
 
 async def test_event_insert_carries_no_context_vector(monkeypatch):

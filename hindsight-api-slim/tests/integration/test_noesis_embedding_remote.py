@@ -1,9 +1,12 @@
 """Remote bge-m3 + PostgreSQL smoke test (requirement 03 §15.6).
 
-Runs the REAL write path (real ``NoesisEmbeddingClient`` against
-``http://10.0.0.8:8010``, real asyncpg, real ``noesis_core``) inside one outer
-transaction so the final ``ROLLBACK`` leaves zero business rows. Gated: skipped
-unless ``NOESIS_REMOTE_TEST=1`` and the SSH env vars are present.
+Runs the REAL write path (real ``NoesisEmbeddingClient`` against the bge-m3
+service reached through the same SSH tunnel as ``noesis_core`` — the 3138 host
+runs an identical ``semnorm`` service on ``localhost:8010``, with the legacy
+direct ``http://10.0.0.8:8010`` kept only as the default fallback, real asyncpg,
+real ``noesis_core``) inside one outer transaction so the final ``ROLLBACK``
+leaves zero business rows. Gated: skipped unless ``NOESIS_REMOTE_TEST=1`` and
+the SSH env vars are present.
 
 It proves:
   * ``GET /health`` reports dim=1024 and a model whose normalized basename is
@@ -78,9 +81,14 @@ remote_group = pytest.mark.xdist_group("noesis_remote")
 
 
 class _SshTunnel:
-    """Minimal paramiko direct-tcpip forwarder (one local port, N sockets)."""
+    """Minimal paramiko direct-tcpip forwarder (N local ports, M sockets each).
 
-    def __init__(self) -> None:
+    ``remote_ports`` are forwarded from a bound local port to
+    ``localhost:<remote_port>`` on the SSH host; ``ports[remote_port]`` is the
+    matching local port. ``port`` stays the PostgreSQL alias for compatibility.
+    """
+
+    def __init__(self, remote_ports: tuple[int, ...] = (5432,)) -> None:
         import paramiko
 
         self._paramiko = paramiko
@@ -92,26 +100,30 @@ class _SshTunnel:
             self.transport.close()
             raise RuntimeError("remote host key mismatch — refusing to connect")
         self.transport.auth_password(username=os.environ["NOESIS_SSH_USER"], password=os.environ["NOESIS_SSH_PW"])
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))
-        self._server.listen(8)
-        self.port = self._server.getsockname()[1]
         self._stopping = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        self._servers: list[socket.socket] = []
+        self.ports: dict[int, int] = {}
+        for remote_port in remote_ports:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            self._servers.append(server)
+            self.ports[remote_port] = server.getsockname()[1]
+            threading.Thread(target=self._serve, args=(server, remote_port), daemon=True).start()
+        self.port = self.ports.get(5432, next(iter(self.ports.values())))
 
-    def _serve(self) -> None:
+    def _serve(self, server: socket.socket, remote_port: int) -> None:
         while not self._stopping.is_set():
             try:
-                client, _ = self._server.accept()
+                client, _ = server.accept()
             except OSError:
                 return
-            threading.Thread(target=self._forward, args=(client,), daemon=True).start()
+            threading.Thread(target=self._forward, args=(client, remote_port), daemon=True).start()
 
-    def _forward(self, client: socket.socket) -> None:
+    def _forward(self, client: socket.socket, remote_port: int) -> None:
         try:
-            channel = self.transport.open_channel("direct-tcpip", ("localhost", 5432), client.getsockname())
+            channel = self.transport.open_channel("direct-tcpip", ("localhost", remote_port), client.getsockname())
         except Exception:
             client.close()
             return
@@ -136,10 +148,11 @@ class _SshTunnel:
 
     def close(self) -> None:
         self._stopping.set()
-        try:
-            self._server.close()
-        except OSError:
-            pass
+        for server in self._servers:
+            try:
+                server.close()
+            except OSError:
+                pass
         self.transport.close()
 
 
@@ -202,9 +215,9 @@ async def _apply_migration_003(pool):
     await pool.execute(content)
 
 
-async def _real_bge_client() -> NoesisEmbeddingClient:
+async def _real_bge_client(base_url: str = _REAL_BGE_URL) -> NoesisEmbeddingClient:
     return NoesisEmbeddingClient(
-        base_url=_REAL_BGE_URL,
+        base_url=base_url,
         model="bge-m3",
         revision="bge-m3-1024-v1",
         dimension=1024,
@@ -217,9 +230,11 @@ async def _real_bge_client() -> NoesisEmbeddingClient:
 @remote_group
 async def test_remote_identity_health_and_cosine_smoke():
     # 1. Real /health: dim=1024 and exact normalized basename.
-    client = await _real_bge_client()
-    await client.ensure_ready()
+    tunnel = _SshTunnel(remote_ports=(8010,))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
+    client = await _real_bge_client(bge_url)
     try:
+        await client.ensure_ready()
         response = await client._http.get("/health")
         payload = response.json()
         assert payload["dim"] == 1024
@@ -239,6 +254,7 @@ async def test_remote_identity_health_and_cosine_smoke():
         assert _cosine(v_apple, v_iphone) > _cosine(v_apple, v_carrier)
     finally:
         await client.aclose()
+        tunnel.close()
 
 
 @requires_remote
@@ -246,10 +262,11 @@ async def test_remote_identity_health_and_cosine_smoke():
 async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
     import asyncpg
 
-    tunnel = _SshTunnel()
+    tunnel = _SshTunnel(remote_ports=(5432, 8010))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
     conn = None
     try:
-        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
+        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.ports[5432], user="postgres", database="noesis")
 
         # 4. Migration 003 idempotent (applied twice) — no business rows, safe.
         await _apply_migration_003(conn)
@@ -260,7 +277,7 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
         pool = _SingleConnPool(conn)
 
         # 6. Real ingest with a real bge client + fake LLM.
-        client = await _real_bge_client()
+        client = await _real_bge_client(bge_url)
         original_extract = noesis_ingest.extract_noesis_components
 
         def fake_extract(text, *, extract_once):
@@ -271,7 +288,7 @@ async def test_remote_identity_ingest_writes_real_vector_and_rolls_back():
         noesis_ingest.extract_noesis_components = fake_extract
         try:
             cfg = noesis_config(
-                noesis_embedding_base_url=_REAL_BGE_URL,
+                noesis_embedding_base_url=bge_url,
                 noesis_embedding_model="bge-m3",
                 noesis_embedding_revision="bge-m3-1024-v1",
                 noesis_embedding_dimension=1024,
@@ -338,11 +355,12 @@ async def test_remote_embedding_rebuild_stages_and_atomically_cuts_over():
     """Exercise the production rebuild SQL against real pgvector/PostgreSQL."""
     import asyncpg
 
-    tunnel = _SshTunnel()
+    tunnel = _SshTunnel(remote_ports=(5432, 8010))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
     conn = None
     client = None
     try:
-        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
+        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.ports[5432], user="postgres", database="noesis")
         outer_tx = conn.transaction()
         await outer_tx.start()
         schema = f"noesis_embedding_test_{uuid.uuid4().hex[:12]}"
@@ -431,7 +449,7 @@ async def test_remote_embedding_rebuild_stages_and_atomically_cuts_over():
                 target,
             )
 
-        client = await _real_bge_client()
+        client = await _real_bge_client(bge_url)
         result = await run_embedding_rebuild(
             pool=_SingleConnPool(conn),
             schema=schema,

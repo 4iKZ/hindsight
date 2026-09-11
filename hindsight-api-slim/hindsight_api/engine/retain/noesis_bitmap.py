@@ -9,16 +9,20 @@ E/P occurrence (modifiers included), keyed by the real non-zero Anchor routed
 for that occurrence's predicate frame.
 
 Neighbor Bitmap — ``(atom_id, anchor_id, role_type) -> {neighbor_atom_id}``
-with ``role_type`` in ``{'S', 'O', 'N'}``: E sources write ``'N'`` (all other
-core atoms of their frame), P sources write ``'S'`` (agents) and ``'O'``
-(patients). Modifiers never enter Neighbor pairing, bits never cross predicate
-frames, self-loops are never written, and no empty S/O row is created.
+with ``role_type`` in ``{'S', 'O', 'N'}``: grouped by the requirement 08
+semantic frame membership, each member resolves its anchor through
+``(atom_id, anchor_route_frame_pos)`` so a borrowed shared pivot reuses its real
+physical anchor and is the one node allowed to appear in two frames. E sources
+write ``'N'`` (all other core atoms of their frame), P sources write ``'S'``
+(agents) and ``'O'`` (patients). Modifiers never enter Neighbor pairing,
+non-shared bits never cross predicate frames, self-loops are never written, and
+no empty S/O row is created.
 
 The planner is pure CPU and consumes only the requirement 05 ``AnchorPlan``:
-no database, no network, no global state, no re-reading of the tree, no implied
-occurrence, and no event-size special-casing of any kind. The writer runs on
-the caller's existing transaction connection only — no pool acquire, no nested
-transaction, no commit, no swallowed exception. Both upserts are single
+no database, no network, no global state, no re-reading of the tree, no
+occurrence duplication, and no event-size special-casing of any kind. The writer
+runs on the caller's existing transaction connection only — no pool acquire, no
+nested transaction, no commit, no swallowed exception. Both upserts are single
 ``INSERT ... ON CONFLICT DO UPDATE`` statements whose merge is the
 database-side ``rb64_or``, so a Python read-modify-write can never lose a
 concurrent update.
@@ -113,16 +117,25 @@ def plan_bitmap_writes(
 ) -> BitmapWritePlan:
     """Plan the two bitmap upserts for one fact component (pure CPU).
 
-    Every occurrence of ``anchor_plan.occurrences`` resolves to
-    ``(atom_id, frame_pos, anchor_id)``; any missing piece raises
-    :class:`BitmapPlanError` immediately. Cooccurrence rows are the deduplicated
-    ``(atom_id, anchor_id)`` keys of all E/P occurrences (modifiers included),
-    sorted ascending. Neighbor rows group occurrences by ``frame_pos`` and pair
-    only the core roles (agent/patient/predicate): each E occurrence writes its
-    frame's other core atom IDs under ``N`` (self filtered); each P predicate
-    writes all agent IDs under ``S`` and all patient IDs under ``O`` (empty side
-    omitted). Neighbor atom IDs are deduplicated and ascending; rows are sorted
-    by ``(atom_id, anchor_id, role_type)`` for a deterministic lock order.
+    Cooccurrence (requirement 08 §8.1) iterates the physical
+    ``anchor_plan.occurrences`` only: every E/P occurrence (modifiers included)
+    resolves to its real ``(atom_id, anchor_id)`` bucket, so a borrowed shared
+    pivot never produces a second key. Neighbor (requirement 08 §8.2) groups
+    ``anchor_plan.semantic_members`` by ``frame_pos``; each member resolves its
+    anchor through ``(atom_id, anchor_route_frame_pos)`` — a borrowed member
+    reuses the real anchor of its parent-frame occurrence. Within one frame only
+    the core roles pair: each E occurrence writes its frame's other core atom IDs
+    under ``N`` (self filtered); each P predicate writes all agent IDs under
+    ``S`` and all patient IDs under ``O`` (empty side omitted). Neighbor atom IDs
+    are deduplicated and ascending; rows are sorted by
+    ``(atom_id, anchor_id, role_type)`` for a deterministic lock order.
+
+    Every physical occurrence must be planned exactly once and every
+    non-borrowed member must match its atom's role and its own frame; a member
+    set that misses an occurrence, a duplicate member, an illegal role, a
+    borrowed member that is not a shared agent, or a missing ``atom_id`` /
+    ``anchor_id`` raises :class:`BitmapPlanError` immediately instead of storing
+    half a plan.
     """
     by_pos = _index_atoms(atoms)
 
@@ -161,16 +174,60 @@ def plan_bitmap_writes(
         CooccurrenceBitmapWrite(atom_id, anchor_id, event_id) for atom_id, anchor_id in cooccurrence_keys
     )
 
-    frame_occurrences: dict[int, list[tuple[int, int, int, str]]] = {}
-    for entry in resolved:
-        frame_occurrences.setdefault(entry[0], []).append(entry)
+    physical_members: dict[int, Any] = {}
+    frame_members: dict[int, list[tuple[int, int, str]]] = {}
+    seen_members: set[tuple[int, int]] = set()
+    for member in anchor_plan.semantic_members:
+        key = (member.occurrence_pos, member.frame_pos)
+        if key in seen_members:
+            raise BitmapPlanError(f"duplicate semantic member (occurrence={key[0]}, frame={key[1]})")
+        seen_members.add(key)
+        atom = by_pos.get(member.occurrence_pos)
+        if atom is None:
+            raise BitmapPlanError(f"semantic member pos {member.occurrence_pos} has no atom")
+        if member.occurrence_pos not in resolved_positions:
+            raise BitmapPlanError(f"semantic member pos {member.occurrence_pos} is not a planned occurrence")
+        if member.semantic_role not in _ALLOWED_ROLES:
+            raise BitmapPlanError(
+                f"semantic member pos {member.occurrence_pos} has illegal role {member.semantic_role!r}"
+            )
+        if member.borrowed:
+            if member.semantic_role != "agent" or atom.role not in ("agent", "patient"):
+                raise BitmapPlanError(f"borrowed semantic member pos {member.occurrence_pos} is not a shared agent")
+        else:
+            if member.semantic_role != atom.role or member.frame_pos != member.anchor_route_frame_pos:
+                raise BitmapPlanError(
+                    f"physical semantic member pos {member.occurrence_pos} does not match its atom role/frame"
+                )
+            if member.occurrence_pos in physical_members:
+                raise BitmapPlanError(f"duplicate physical semantic member pos {member.occurrence_pos}")
+            physical_members[member.occurrence_pos] = member
+        literal = (atom.text, atom.type)
+        atom_id = atom_ids.get(literal)
+        if atom_id is None:
+            raise BitmapPlanError(f"missing atom_id for literal {literal!r}")
+        anchor_id = anchor_routes.get((atom_id, member.anchor_route_frame_pos))
+        if not isinstance(anchor_id, int) or anchor_id <= 0:
+            raise BitmapPlanError(
+                f"missing or non-positive anchor_id for (atom_id={atom_id}, frame_pos={member.anchor_route_frame_pos})"
+            )
+        frame_members.setdefault(member.frame_pos, []).append((atom_id, anchor_id, member.semantic_role))
+
+    if set(physical_members) != resolved_positions:
+        raise BitmapPlanError("semantic members do not cover every atom occurrence")
+    for member in anchor_plan.semantic_members:
+        if not member.borrowed:
+            continue
+        physical = physical_members.get(member.occurrence_pos)
+        if physical is None or physical.anchor_route_frame_pos != member.anchor_route_frame_pos:
+            raise BitmapPlanError("borrowed semantic member must reuse its physical occurrence's anchor route")
 
     neighbor_sets: dict[tuple[int, int, str], set[int]] = {}
-    for frame_pos in sorted(frame_occurrences):
-        core = [entry for entry in sorted(frame_occurrences[frame_pos]) if entry[3] in _CORE_ROLES]
-        agents = {atom_id for _, atom_id, _, role in core if role == "agent"}
-        patients = {atom_id for _, atom_id, _, role in core if role == "patient"}
-        for _, atom_id, anchor_id, role in core:
+    for frame_pos in sorted(frame_members):
+        core = [entry for entry in sorted(frame_members[frame_pos]) if entry[2] in _CORE_ROLES]
+        agents = {atom_id for atom_id, _, role in core if role == "agent"}
+        patients = {atom_id for atom_id, _, role in core if role == "patient"}
+        for atom_id, anchor_id, role in core:
             if role == "predicate":
                 source_agents = agents - {atom_id}
                 source_patients = patients - {atom_id}
@@ -179,7 +236,7 @@ def plan_bitmap_writes(
                 if source_patients:
                     neighbor_sets.setdefault((atom_id, anchor_id, "O"), set()).update(source_patients)
             else:
-                others = {other_id for _, other_id, _, _ in core if other_id != atom_id}
+                others = {other_id for other_id, _, _ in core if other_id != atom_id}
                 if others:
                     neighbor_sets.setdefault((atom_id, anchor_id, "N"), set()).update(others)
 

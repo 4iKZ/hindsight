@@ -63,7 +63,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _MIGRATION_003 = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
 _REAL_BGE_URL = "http://10.0.0.8:8010"
 _SCHEMA = "noesis_core"
-_TABLES = ("events", "atoms", "anchors", "event_atoms")
+_TABLES = ("events", "atoms", "anchors", "event_atoms", "cooccurrence_bitmaps", "neighbor_bitmaps")
 
 
 def _remote_enabled() -> bool:
@@ -83,9 +83,14 @@ remote_group = pytest.mark.xdist_group("noesis_remote")
 
 
 class _SshTunnel:
-    """Minimal paramiko direct-tcpip forwarder (one local port, N sockets)."""
+    """Minimal paramiko direct-tcpip forwarder (N local ports, M sockets each).
 
-    def __init__(self) -> None:
+    ``remote_ports`` are forwarded from a bound local port to
+    ``localhost:<remote_port>`` on the SSH host; ``ports[remote_port]`` is the
+    matching local port. ``port`` stays the PostgreSQL alias for compatibility.
+    """
+
+    def __init__(self, remote_ports: tuple[int, ...] = (5432,)) -> None:
         import paramiko
 
         self._paramiko = paramiko
@@ -98,26 +103,30 @@ class _SshTunnel:
             raise RuntimeError("remote host key mismatch — refusing to connect")
         self.transport.auth_password(username=os.environ["NOESIS_SSH_USER"], password=os.environ["NOESIS_SSH_PW"])
 
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))
-        self._server.listen(8)
-        self.port = self._server.getsockname()[1]
         self._stopping = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        self._servers: list[socket.socket] = []
+        self.ports: dict[int, int] = {}
+        for remote_port in remote_ports:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            self._servers.append(server)
+            self.ports[remote_port] = server.getsockname()[1]
+            threading.Thread(target=self._serve, args=(server, remote_port), daemon=True).start()
+        self.port = self.ports.get(5432, next(iter(self.ports.values())))
 
-    def _serve(self) -> None:
+    def _serve(self, server: socket.socket, remote_port: int) -> None:
         while not self._stopping.is_set():
             try:
-                client, _ = self._server.accept()
+                client, _ = server.accept()
             except OSError:
                 return
-            threading.Thread(target=self._forward, args=(client,), daemon=True).start()
+            threading.Thread(target=self._forward, args=(client, remote_port), daemon=True).start()
 
-    def _forward(self, client: socket.socket) -> None:
+    def _forward(self, client: socket.socket, remote_port: int) -> None:
         try:
-            channel = self.transport.open_channel("direct-tcpip", ("localhost", 5432), client.getsockname())
+            channel = self.transport.open_channel("direct-tcpip", ("localhost", remote_port), client.getsockname())
         except Exception:
             client.close()
             return
@@ -142,10 +151,11 @@ class _SshTunnel:
 
     def close(self) -> None:
         self._stopping.set()
-        try:
-            self._server.close()
-        except OSError:
-            pass
+        for server in self._servers:
+            try:
+                server.close()
+            except OSError:
+                pass
         self.transport.close()
 
 
@@ -185,9 +195,9 @@ def _async_return(value):
     return factory
 
 
-async def _real_bge_client() -> NoesisEmbeddingClient:
+async def _real_bge_client(base_url: str = _REAL_BGE_URL) -> NoesisEmbeddingClient:
     return NoesisEmbeddingClient(
-        base_url=_REAL_BGE_URL,
+        base_url=base_url,
         model="bge-m3",
         revision="bge-m3-1024-v1",
         dimension=1024,
@@ -228,11 +238,11 @@ def _atom(pos, text, type_, role, target):
     return {"pos": pos, "text": text, "type": type_, "role": role, "target_occ": target, "resolved": None}
 
 
-_CASE_MAMA = [  # 妈妈让小明打酱油: Frame(2)="妈妈 让 小明", Frame(4)="打 酱油"
+_CASE_MAMA = [  # 妈妈让小明打酱油: Frame(2)="妈妈 让 小明", Frame(4)="小明 打 酱油"
     _atom(1, "妈妈", "E", "agent", 2),
     _atom(2, "让", "P", "predicate", None),
     _atom(3, "小明", "E", "patient", 2),
-    _atom(4, "打", "P", "predicate", 2),
+    _atom(4, "打", "P", "predicate", 3),
     _atom(5, "酱油", "E", "patient", 4),
 ]
 _CASE_SALE = [  # 苹果公司销售苹果: Frame(2)="苹果公司 销售 苹果"
@@ -254,6 +264,20 @@ _CASE_MULTIFRAME = [  # 小明吃苹果，苹果发布手机: Frame(2)="小明 �
     _atom(4, "苹果", "E", "agent", 5),
     _atom(5, "发布", "P", "predicate", 2),
     _atom(6, "手机", "E", "patient", 5),
+]
+_CASE_WASH = [  # 昨天晚上，妈妈在厨房让小明把桌上的两个红苹果洗干净。
+    # Requirement 08 §0.1: Frame(4)="妈妈 让 小明", Frame(10)="小明 洗 苹果".
+    _atom(1, "昨天晚上", "E", "modifier", 4),
+    _atom(2, "妈妈", "E", "agent", 4),
+    _atom(3, "在厨房", "E", "modifier", 4),
+    _atom(4, "让", "P", "predicate", None),
+    _atom(5, "小明", "E", "patient", 4),
+    _atom(6, "桌上", "E", "modifier", 9),
+    _atom(7, "两个", "E", "modifier", 9),
+    _atom(8, "红", "E", "modifier", 9),
+    _atom(9, "苹果", "E", "patient", 10),
+    _atom(10, "洗", "P", "predicate", 5),
+    _atom(11, "干净", "E", "modifier", 10),
 ]
 
 
@@ -288,11 +312,12 @@ async def test_remote_anchor_full_pipeline_smoke_and_rollback():
     inside one outer transaction that ROLLs BACK leaving zero residue."""
     import asyncpg
 
-    tunnel = _SshTunnel()
+    tunnel = _SshTunnel(remote_ports=(5432, 8010))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
     conn = None
     client = None
     try:
-        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis")
+        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.ports[5432], user="postgres", database="noesis")
 
         # Same migration-003 gate bootstrap as the other remote tests (only
         # when the profile table is missing; multi-statement CREATE twice on
@@ -326,10 +351,10 @@ async def test_remote_anchor_full_pipeline_smoke_and_rollback():
 
         original_extract = noesis_ingest.extract_noesis_components
         noesis_ingest.extract_noesis_components = fake_extract
-        client = await _real_bge_client()
+        client = await _real_bge_client(bge_url)
         try:
             cfg = noesis_config(
-                noesis_embedding_base_url=_REAL_BGE_URL,
+                noesis_embedding_base_url=bge_url,
                 noesis_embedding_model="bge-m3",
                 noesis_embedding_revision="bge-m3-1024-v1",
                 noesis_embedding_dimension=1024,
@@ -416,7 +441,7 @@ async def test_remote_anchor_full_pipeline_smoke_and_rollback():
         #    打/酱油 ride Frame(4) twice; 销售 group rides Frame(2) once;
         #    修复 group rides its single frame once with the SAME context.
         vec_mama = await client.embed_context("妈妈 让 小明")
-        vec_da = await client.embed_context("打 酱油")
+        vec_da = await client.embed_context("小明 打 酱油")
         vec_sale = await client.embed_context("苹果公司 销售 苹果")
         vec_fix = await client.embed_context("张三 李四 修复 服务器 数据库")
 
@@ -476,6 +501,176 @@ async def test_remote_anchor_full_pipeline_smoke_and_rollback():
         tunnel.close()
 
 
+@requires_remote
+@remote_group
+async def test_remote_shared_pivot_complex_sentence_and_rollback():
+    """需求 08 §12.6: the single 小明 occurrence is borrowed into the 洗 frame on
+    real bge-m3 + PostgreSQL; both frames' Anchor/Cooccurrence/Neighbor rows are
+    correct and isolated, and the outer rollback leaves zero residue."""
+    import asyncpg
+
+    tunnel = _SshTunnel(remote_ports=(5432, 8010))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
+    conn = None
+    client = None
+    try:
+        conn = await asyncpg.connect(host="127.0.0.1", port=tunnel.ports[5432], user="postgres", database="noesis")
+        exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='noesis_core' AND table_name='embedding_profiles')"
+        )
+        if not exists:
+            await conn.execute(_MIGRATION_003.read_text(encoding="utf-8"))
+
+        snapshot = {table: await _table_count(conn, table) for table in _TABLES}
+        outer_tx = conn.transaction()
+        await outer_tx.start()
+        pool = _SingleConnPool(conn)
+
+        components = [_fact(_CASE_WASH)]
+
+        def fake_extract(text, *, extract_once):
+            return ExtractionOutcome(components=list(components), alerts=[], attempts=1)
+
+        original_extract = noesis_ingest.extract_noesis_components
+        noesis_ingest.extract_noesis_components = fake_extract
+        client = await _real_bge_client(bge_url)
+        try:
+            cfg = noesis_config(
+                noesis_embedding_base_url=bge_url,
+                noesis_embedding_model="bge-m3",
+                noesis_embedding_revision="bge-m3-1024-v1",
+                noesis_embedding_dimension=1024,
+                noesis_embedding_timeout_seconds=8.0,
+                noesis_embedding_max_retries=1,
+            )
+            await noesis_ingest.ingest_noesis_batch(
+                [
+                    {
+                        "content": "昨天晚上，妈妈在厨房让小明把桌上的两个红苹果洗干净。",
+                        "event_date": datetime(2026, 9, 5, 2, 0, 0, tzinfo=UTC),
+                        "document_id": "pivot-smoke-doc",
+                    }
+                ],
+                "pivot-smoke-bank",
+                cfg,
+                llm_config=llm_config(),
+                analyzer=_NullAnalyzer(),
+                extract_once_factory=FakeExtractOnceFactory(),
+                pool_factory=_async_return(pool),
+                embedding_client_factory=_async_return(client),
+            )
+        finally:
+            noesis_ingest.extract_noesis_components = original_extract
+
+        event_id = await conn.fetchval(
+            "SELECT event_id FROM noesis_core.events WHERE data->>'document_id' = 'pivot-smoke-doc'"
+        )
+        rows = await conn.fetch(
+            "SELECT ea.occurrence_id, ea.atom_id, ea.anchor_id, a.text FROM noesis_core.event_atoms ea "
+            "JOIN noesis_core.atoms a USING (atom_id) WHERE ea.event_id = $1 ORDER BY ea.occurrence_id",
+            event_id,
+        )
+        assert len(rows) == 11
+        assert [row["occurrence_id"] for row in rows] == list(range(1, 12))
+        assert all(row["anchor_id"] is not None for row in rows)
+        ming_rows = [row for row in rows if row["text"] == "小明"]
+        assert len(ming_rows) == 1, "the shared pivot keeps exactly one event_atom row"
+        by_text = {row["text"]: row for row in rows}
+        assert len(by_text) == 11
+        anchor_ids = sorted({row["anchor_id"] for row in rows})
+        assert len(anchor_ids) == 11, "one anchor per occurrence, no second route"
+
+        ming_anchor_rows = await conn.fetch(
+            "SELECT anchor_id, total_count FROM noesis_core.anchors WHERE atom_id = $1",
+            ming_rows[0]["atom_id"],
+        )
+        assert len(ming_anchor_rows) == 1, "the shared pivot carries one anchor bucket"
+        assert ming_anchor_rows[0]["total_count"] == 1, "the shared pivot is sampled once"
+
+        vec_rang = await client.embed_context("妈妈 让 小明")
+        vec_wash = await client.embed_context("小明 洗 苹果")
+        for text, vector in (("让", vec_rang), ("小明", vec_rang), ("洗", vec_wash), ("苹果", vec_wash)):
+            row = await conn.fetchrow(
+                "SELECT total_count, centroid_vector::text AS centroid_text FROM noesis_core.anchors WHERE anchor_id = $1",
+                by_text[text]["anchor_id"],
+            )
+            assert row["total_count"] == 1
+            _assert_close(parse_centroid_text(row["centroid_text"]), vector, what=f"{text} centroid")
+        assert by_text["小明"]["anchor_id"] != by_text["让"]["anchor_id"]
+
+        cooc_rows = await conn.fetch(
+            "SELECT atom_id, anchor_id FROM noesis_core.cooccurrence_bitmaps WHERE anchor_id = ANY($1)",
+            anchor_ids,
+        )
+        assert {(row["atom_id"], row["anchor_id"]) for row in cooc_rows} == {
+            (row["atom_id"], row["anchor_id"]) for row in rows
+        }
+        ming_cooc = await conn.fetchval(
+            "SELECT count(*) FROM noesis_core.cooccurrence_bitmaps WHERE atom_id = $1",
+            ming_rows[0]["atom_id"],
+        )
+        assert ming_cooc == 1, "no second Cooccurrence key for the borrowed pivot"
+
+        async def neighbor_cardinality(source_text: str, role: str) -> int:
+            value = await conn.fetchval(
+                "SELECT rb64_cardinality(neighbor_bitmap) FROM noesis_core.neighbor_bitmaps "
+                "WHERE atom_id = $1 AND anchor_id = $2 AND role_type = $3::text::\"char\"",
+                by_text[source_text]["atom_id"],
+                by_text[source_text]["anchor_id"],
+                role,
+            )
+            return int(value) if value is not None else 0
+
+        async def neighbor_contains(source_text: str, role: str, target_text: str) -> bool:
+            value = await conn.fetchval(
+                "SELECT rb64_and_cardinality(neighbor_bitmap, rb64_build(ARRAY[$1]::bigint[])) "
+                "FROM noesis_core.neighbor_bitmaps "
+                "WHERE atom_id = $2 AND anchor_id = $3 AND role_type = $4::text::\"char\"",
+                by_text[target_text]["atom_id"],
+                by_text[source_text]["atom_id"],
+                by_text[source_text]["anchor_id"],
+                role,
+            )
+            return bool(value)
+
+        assert await neighbor_cardinality("让", "S") == 1
+        assert await neighbor_contains("让", "S", "妈妈")
+        assert await neighbor_cardinality("让", "O") == 1
+        assert await neighbor_contains("让", "O", "小明")
+        assert await neighbor_cardinality("洗", "S") == 1
+        assert await neighbor_contains("洗", "S", "小明")
+        assert await neighbor_cardinality("洗", "O") == 1
+        assert await neighbor_contains("洗", "O", "苹果")
+        assert await neighbor_cardinality("小明", "N") == 4
+        for target in ("妈妈", "让", "苹果", "洗"):
+            assert await neighbor_contains("小明", "N", target)
+        assert await neighbor_cardinality("妈妈", "N") == 2
+        assert await neighbor_cardinality("苹果", "N") == 2
+        assert not await neighbor_contains("妈妈", "N", "洗")
+        assert not await neighbor_contains("妈妈", "N", "苹果")
+        assert not await neighbor_contains("苹果", "N", "妈妈")
+        assert not await neighbor_contains("苹果", "N", "让")
+        modifier_ids = [
+            by_text[text]["atom_id"] for text in ("昨天晚上", "在厨房", "桌上", "两个", "红", "干净")
+        ]
+        modifier_rows = await conn.fetchval(
+            "SELECT count(*) FROM noesis_core.neighbor_bitmaps WHERE atom_id = ANY($1)", modifier_ids
+        )
+        assert modifier_rows == 0, "modifiers never write Neighbor rows"
+
+        await outer_tx.rollback()
+        for table in _TABLES:
+            remaining = await _table_count(conn, table)
+            assert remaining == snapshot[table], f"{table} leaked: {remaining} != {snapshot[table]}"
+    finally:
+        if client is not None:
+            await client.aclose()
+        if conn is not None:
+            await conn.close()
+        tunnel.close()
+
+
 # ---------------------------------------------------------------------------
 # Group B: real-PostgreSQL concurrency on route_anchors (§13.4)
 # ---------------------------------------------------------------------------
@@ -484,6 +679,7 @@ def _single_occurrence_plan(literal: tuple[str, str], context_text: str) -> Anch
     return AnchorPlan(
         frames={1: PredicateFrame(1, context_text)},
         occurrences=(OccurrenceRoute(1, literal, 1),),
+        semantic_members=(),
         context_texts=(context_text,),
     )
 
@@ -512,15 +708,16 @@ async def test_remote_anchor_concurrency_real_locks():
     explicit noesis05-test- cleanup."""
     import asyncpg
 
-    tunnel = _SshTunnel()
+    tunnel = _SshTunnel(remote_ports=(5432, 8010))
+    bge_url = f"http://127.0.0.1:{tunnel.ports[8010]}"
     pool = None
     client = None
     snapshot: dict[str, int] = {}
     try:
         pool = await asyncpg.create_pool(
-            host="127.0.0.1", port=tunnel.port, user="postgres", database="noesis", min_size=2, max_size=4
+            host="127.0.0.1", port=tunnel.ports[5432], user="postgres", database="noesis", min_size=2, max_size=4
         )
-        client = await _real_bge_client()
+        client = await _real_bge_client(bge_url)
         async with pool.acquire() as conn:
             snapshot = {table: await _table_count(conn, table) for table in _TABLES}
 
