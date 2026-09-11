@@ -11,7 +11,8 @@ row locks, nearest-active cosine query, insert-with-count-1, EMA update,
 transaction snapshots) and the unified ``FakeEmbeddingClient`` bge stand-in
 (``embed_identity`` + ``embed_context``). Requirement 06 adds the two
 write-maintenance bitmap tables (set-based ``rb64_build``/``rb64_or`` upserts
-with ON CONFLICT semantics and rollback snapshots).
+with ON CONFLICT semantics and rollback snapshots). Requirement 07 adds the
+database-side ``rb64_andnot`` expired-window prune simulation.
 """
 
 from __future__ import annotations
@@ -346,6 +347,20 @@ class FakeStore:
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         self.calls.append(("fetchval", sql, args))
+        if ".cooccurrence_bitmaps" in sql and "rb64_andnot" in sql:
+            # Requirement 07: expired-window ANDNOT prune. Only buckets whose
+            # bitmap intersects the expired IDs are updated, emptied rows are
+            # kept (never deleted), and the neighbor bitmaps are never touched.
+            if self.interleave is not None and self._tx_depth > 0:
+                await self.interleave()
+            self._maybe_fail(sql)
+            expired = set(args[0])
+            updated = 0
+            for key, bits in self.cooccurrence_bitmaps.items():
+                if bits.intersection(expired):
+                    self.cooccurrence_bitmaps[key] = bits.difference(expired)
+                    updated += 1
+            return updated
         if "format_type" in sql:
             # Requirement 06 preflight probes the bitmap payload types.
             if len(args) > 1 and args[1] in ("event_bitmap", "neighbor_bitmap"):
