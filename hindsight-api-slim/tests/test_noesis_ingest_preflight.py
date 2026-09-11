@@ -27,15 +27,44 @@ class _CatalogConn:
 
     async def fetchval(self, sql, *args):
         self.sqls.append(sql)
+        # Requirement 06 §8.3 catalog probes (dispatched before the generic
+        # branches so the contype='c' constraint probes are not misrouted).
+        if "indisprimary" in sql:
+            table = args[0].rsplit(".", 1)[-1] if args else ""
+            if table == "cooccurrence_bitmaps":
+                return None if "cooccurrence_pk" in self.missing else "atom_id,anchor_id"
+            return None if "neighbor_pk" in self.missing else "atom_id,anchor_id,role_type"
         if "format_type" in sql:
-            # Requirement 03 §11: the declared atoms.embedding width. The fake
-            # catalog models the fully migrated VECTOR(1024) column; tests can
-            # override with ``missing={"atoms_embedding_dimension"}``.
+            if len(args) > 1 and args[1] == "event_bitmap":
+                return "roaringbitmap32" if "event_bitmap_type" in self.missing else "roaringbitmap64"
+            if len(args) > 1 and args[1] == "neighbor_bitmap":
+                return "roaringbitmap32" if "neighbor_bitmap_type" in self.missing else "roaringbitmap64"
+            if args and str(args[0]).endswith(".neighbor_bitmaps"):
+                return "text" if "neighbor_role_type" in self.missing else '"char"'
             if "centroid_vector" in sql:
                 # Requirement 05 §10.3: the declared anchors.centroid_vector
                 # width (override: ``missing={"centroid_vector_dimension"}``).
                 return "vector(768)" if "centroid_vector_dimension" in self.missing else "vector(1024)"
             return "vector(768)" if "atoms_embedding_dimension" in self.missing else "vector(1024)"
+        if "pg_proc" in sql:
+            return "rb64_function" not in self.missing
+        if "rb64_or(" in sql:
+            return "rb64_callable" not in self.missing
+        if "information_schema.columns" in sql and "column_default" in sql:
+            hint = f"{args[1]}_anchor_default"
+            return "0" if hint in self.missing else None
+        if "pg_constraint" in sql and "pg_get_constraintdef" in sql:
+            if "role_type" in sql:
+                if "role_check" in self.missing:
+                    return None
+                if "role_check_partial" in self.missing:
+                    return "CHECK ((role_type = ANY (ARRAY['S'::\"char\", 'O'::\"char\"])))"
+                return "CHECK ((role_type = ANY (ARRAY['S'::\"char\", 'O'::\"char\", 'N'::\"char\"])))"
+            if "anchor_id" in sql:
+                table = args[0].rsplit(".", 1)[-1] if args else ""
+                if f"{table}_anchor_check" in self.missing:
+                    return "CHECK ((anchor_id >= 0))"
+                return "CHECK ((anchor_id > 0))"
         if "pg_extension" in sql:
             return args[0] not in self.missing
         if "timescaledb_information.hypertables" in sql:
@@ -65,8 +94,10 @@ class _CatalogConn:
                     return hint not in self.missing
             return "dedupe_key_nullable" not in self.missing
         if "information_schema.columns" in sql:
-            # existence probe: args = (schema, table, column)
-            return args[2] not in self.missing
+            # existence probe: args = (schema, table, column); a
+            # ``<table>_<column>`` hint targets one table unambiguously.
+            table_specific = f"{args[1]}_{args[2]}"
+            return args[2] not in self.missing and table_specific not in self.missing
         if "pg_constraint" in sql and "contype = 'f'" in sql:
             # FK probes (requirement 05): args = (referencing, referenced)
             pair = tuple(part.rsplit(".", 1)[-1] for part in args[:2])
@@ -252,6 +283,82 @@ async def test_missing_atom_unique_constraint_fails():
 async def test_dedupe_key_nullable_fails():
     with pytest.raises(SchemaPreflightError, match="dedupe_key is not NOT NULL"):
         await _run(["dedupe_key_nullable"])
+
+
+# ---------------------------------------------------------------------------
+# Requirement 06 §8.3: metric-layer bitmap tables, keys, checks, rb64 functions
+# ---------------------------------------------------------------------------
+
+async def test_missing_cooccurrence_bitmaps_table_fails():
+    with pytest.raises(SchemaPreflightError, match="table 'noesis_core.cooccurrence_bitmaps' does not exist"):
+        await _run(["cooccurrence_bitmaps"])
+
+
+async def test_missing_neighbor_bitmaps_table_fails():
+    with pytest.raises(SchemaPreflightError, match="table 'noesis_core.neighbor_bitmaps' does not exist"):
+        await _run(["neighbor_bitmaps"])
+
+
+async def test_missing_neighbor_role_type_column_fails():
+    with pytest.raises(SchemaPreflightError, match="column 'noesis_core.neighbor_bitmaps.role_type' does not exist"):
+        await _run(["neighbor_bitmaps_role_type"])
+
+
+async def test_wrong_event_bitmap_type_fails():
+    with pytest.raises(SchemaPreflightError, match=r"event_bitmap.*roaringbitmap64"):
+        await _run(["event_bitmap_type"])
+
+
+async def test_wrong_neighbor_bitmap_type_fails():
+    with pytest.raises(SchemaPreflightError, match=r"neighbor_bitmap.*roaringbitmap64"):
+        await _run(["neighbor_bitmap_type"])
+
+
+async def test_wrong_neighbor_role_type_fails():
+    with pytest.raises(SchemaPreflightError, match=r"role_type.*expected"):
+        await _run(["neighbor_role_type"])
+
+
+async def test_wrong_cooccurrence_pk_fails():
+    with pytest.raises(SchemaPreflightError, match="cooccurrence_bitmaps' primary key"):
+        await _run(["cooccurrence_pk"])
+
+
+async def test_wrong_neighbor_pk_fails():
+    with pytest.raises(SchemaPreflightError, match="neighbor_bitmaps' primary key"):
+        await _run(["neighbor_pk"])
+
+
+async def test_missing_role_check_fails():
+    with pytest.raises(SchemaPreflightError, match="role_type.*S/O/N"):
+        await _run(["role_check"])
+
+
+async def test_partial_role_check_fails():
+    with pytest.raises(SchemaPreflightError, match="role_type.*S/O/N"):
+        await _run(["role_check_partial"])
+
+
+@pytest.mark.parametrize("table", ["cooccurrence_bitmaps", "neighbor_bitmaps"])
+async def test_anchor_id_default_zero_fails(table):
+    with pytest.raises(SchemaPreflightError, match=f"{table}.anchor_id' still declares a DEFAULT"):
+        await _run([f"{table}_anchor_default"])
+
+
+@pytest.mark.parametrize("table", ["cooccurrence_bitmaps", "neighbor_bitmaps"])
+async def test_missing_anchor_positive_check_fails(table):
+    with pytest.raises(SchemaPreflightError, match=f"{table}.anchor_id' CHECK"):
+        await _run([f"{table}_anchor_check"])
+
+
+async def test_missing_rb64_function_fails():
+    with pytest.raises(SchemaPreflightError, match="rb64_build/rb64_or"):
+        await _run(["rb64_function"])
+
+
+async def test_rb64_function_not_callable_fails():
+    with pytest.raises(SchemaPreflightError, match="not callable"):
+        await _run(["rb64_callable"])
 
 
 # ---------------------------------------------------------------------------

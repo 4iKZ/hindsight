@@ -9,7 +9,9 @@ tests can prove zero-half-state. Requirement 03 adds the identity-vector
 embedding/profile emulation; requirement 05 adds the anchors emulation (atom
 row locks, nearest-active cosine query, insert-with-count-1, EMA update,
 transaction snapshots) and the unified ``FakeEmbeddingClient`` bge stand-in
-(``embed_identity`` + ``embed_context``).
+(``embed_identity`` + ``embed_context``). Requirement 06 adds the two
+write-maintenance bitmap tables (set-based ``rb64_build``/``rb64_or`` upserts
+with ON CONFLICT semantics and rollback snapshots).
 """
 
 from __future__ import annotations
@@ -192,6 +194,10 @@ class FakeStore:
         # FOR UPDATE atom row locks taken inside the fact transaction.
         self.anchors: dict[int, dict[str, Any]] = {}
         self.locked_atoms: list[int] = []
+        # Requirement 06: the two write-maintenance bitmap tables, emulating
+        # rb64_build (set construction) + rb64_or (union) on ON CONFLICT.
+        self.cooccurrence_bitmaps: dict[tuple[int, int], set[int]] = {}
+        self.neighbor_bitmaps: dict[tuple[int, int, str], set[int]] = {}
         self.calls: list[tuple[str, str, tuple]] = []
         self.tx_log: list[str] = []  # "begin" / "commit" / "rollback" markers
         self.commits = 0
@@ -341,8 +347,26 @@ class FakeStore:
     async def fetchval(self, sql: str, *args: Any) -> Any:
         self.calls.append(("fetchval", sql, args))
         if "format_type" in sql:
+            # Requirement 06 preflight probes the bitmap payload types.
+            if len(args) > 1 and args[1] in ("event_bitmap", "neighbor_bitmap"):
+                return "roaringbitmap64"
+            if args and str(args[0]).endswith(".neighbor_bitmaps"):
+                return '"char"'
             # The fake catalog models the fully migrated VECTOR(1024) column.
             return f"vector({self.embedding_dimension})"
+        if "indisprimary" in sql:
+            table = args[0].rsplit(".", 1)[-1] if args else ""
+            return "atom_id,anchor_id,role_type" if table == "neighbor_bitmaps" else "atom_id,anchor_id"
+        if "pg_get_constraintdef" in sql:
+            if "role_type" in sql:
+                return "CHECK ((role_type = ANY (ARRAY['S'::\"char\", 'O'::\"char\", 'N'::\"char\"])))"
+            return "CHECK ((anchor_id > 0))"
+        if "column_default" in sql and "anchor_id" in sql:
+            return None  # the migrated shape carries no DEFAULT 0
+        if "pg_proc" in sql:
+            return True  # both required function names are installed
+        if "rb64_or(" in sql:
+            return True  # the installed signature is callable
         if "pg_try_advisory_lock" in sql:
             return self.advisory_lock_available
         # Requirement 05A rebuild: staging and active-atom coverage counts.
@@ -373,6 +397,12 @@ class FakeStore:
     async def execute(self, sql: str, *args: Any) -> str:
         self._maybe_fail(sql)
         self.calls.append(("execute", sql, args))
+        # Requirement 06 dispatches first: the bitmap upserts carry no
+        # RETURNING and are the only write path into these tables.
+        if ".cooccurrence_bitmaps" in sql:
+            return self._bitmap_cooccurrence_upsert(args)
+        if ".neighbor_bitmaps" in sql:
+            return self._bitmap_neighbor_upsert(args)
         if ".anchors" in sql and "total_count = total_count + 1" in sql:
             return self._ema_update_anchor(args)
         if ".event_atoms" in sql:
@@ -592,6 +622,21 @@ class FakeStore:
         anchor["total_count"] += 1
         return "UPDATE 1"
 
+    def _bitmap_cooccurrence_upsert(self, args: tuple) -> str:
+        # INSERT ... VALUES ($1, $2, rb64_build(ARRAY[$3]::bigint[]))
+        # ON CONFLICT (atom_id, anchor_id) DO UPDATE SET event_bitmap = rb64_or(...)
+        atom_id, anchor_id, event_id = int(args[0]), int(args[1]), int(args[2])
+        self.cooccurrence_bitmaps.setdefault((atom_id, anchor_id), set()).add(event_id)
+        return "INSERT 0 1"
+
+    def _bitmap_neighbor_upsert(self, args: tuple) -> str:
+        # INSERT ... VALUES ($1, $2, $3::text::"char", rb64_build($4::bigint[]))
+        # ON CONFLICT (atom_id, anchor_id, role_type) DO UPDATE SET neighbor_bitmap = rb64_or(...)
+        atom_id, anchor_id, role_type, neighbor_ids = int(args[0]), int(args[1]), str(args[2]), args[3]
+        bucket = self.neighbor_bitmaps.setdefault((atom_id, anchor_id, role_type), set())
+        bucket.update(int(neighbor_id) for neighbor_id in neighbor_ids)
+        return "INSERT 0 1"
+
     # -- helpers ------------------------------------------------------------
 
     def event_rows(self) -> list[dict[str, Any]]:
@@ -605,6 +650,14 @@ class FakeStore:
 
     def anchors_rows(self) -> list[dict[str, Any]]:
         return list(self.anchors.values())
+
+    def cooccurrence_bucket(self, atom_id: int, anchor_id: int) -> set[int]:
+        """Committed event IDs of one (atom_id, anchor_id) cooccurrence row."""
+        return set(self.cooccurrence_bitmaps.get((atom_id, anchor_id), set()))
+
+    def neighbor_bucket(self, atom_id: int, anchor_id: int, role_type: str) -> set[int]:
+        """Committed neighbor atom IDs of one (atom_id, anchor_id, role_type) row."""
+        return set(self.neighbor_bitmaps.get((atom_id, anchor_id, role_type), set()))
 
     def seed_anchor(
         self, atom_id: int, centroid: tuple[float, ...], *, status: str = "A", total_count: int = 0
@@ -670,6 +723,8 @@ class _FakeTransaction:
                 self._store.embedding_context_stage,
                 self._store.embedding_anchor_sample_stage,
                 self._store.embedding_anchor_stage,
+                self._store.cooccurrence_bitmaps,
+                self._store.neighbor_bitmaps,
                 self._store._ids,
             )
         )
@@ -699,6 +754,8 @@ class _FakeTransaction:
             context_stage,
             sample_stage,
             anchor_stage,
+            cooccurrence_bitmaps,
+            neighbor_bitmaps,
             ids,
         ) = self._snapshot
         self._store.events = events
@@ -711,6 +768,8 @@ class _FakeTransaction:
         self._store.embedding_context_stage = context_stage
         self._store.embedding_anchor_sample_stage = sample_stage
         self._store.embedding_anchor_stage = anchor_stage
+        self._store.cooccurrence_bitmaps = cooccurrence_bitmaps
+        self._store.neighbor_bitmaps = neighbor_bitmaps
         self._store._ids = ids
         self._store._marker_counts = self._marker_counts
         self._store.rollbacks += 1
