@@ -426,6 +426,12 @@ class FakeStore:
             return len(self.embedding_atom_stage)
         if "noesis_embedding_anchor_stage" in sql and "count(*)" in sql:
             return len(self.embedding_anchor_stage)
+        if "status = 'A'" in sql and "count(*)" in sql:
+            return sum(
+                1
+                for (text, atom_type), atom in self.atoms.items()
+                if atom_type in ("E", "P") and atom.get("status", "A") == "A"
+            )
         if "status = 'active'" in sql and "count(*)" in sql:
             return sum(
                 1
@@ -554,7 +560,7 @@ class FakeStore:
                 "indexdef": (
                     "CREATE INDEX idx_atoms_embedding_ivfflat ON noesis_core.atoms "
                     "USING ivfflat (embedding vector_cosine_ops) WITH (lists='100') "
-                    "WHERE ((status = 'active') AND (atom_type IN ('E', 'P')) "
+                    "WHERE ((status = 'A') AND (atom_type IN ('E', 'P')) "
                     "AND (embedding IS NOT NULL))"
                 ),
             }

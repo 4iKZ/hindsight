@@ -42,7 +42,7 @@ WITH nearest AS MATERIALIZED (
         WHERE atom_id = $1
     ) AS s
     WHERE a.atom_id <> $1
-      AND a.status = 'active'
+      AND a.status = 'A'
       AND a.atom_type = 'E'
       AND a.embedding IS NOT NULL
     ORDER BY a.embedding <=> s.embedding
@@ -86,7 +86,7 @@ class AnnSourceNotFound(AnnRecallError):
 
 
 class AnnSourceIneligible(AnnRecallError):
-    """The source is inactive, G, or has no Identity Vector."""
+    """The source is deprecated (D), G, or has no Identity Vector."""
 
 
 class AnnProfileUnavailable(AnnRecallError):
@@ -176,9 +176,9 @@ async def recall_ann_candidates(
     atom_type = str(_row_value(source, "atom_type") or "").strip()
     source_status = _row_value(source, "status")
     embedding = _row_value(source, "embedding")
-    if source_status != "active" or atom_type not in ("E", "P") or embedding is None:
+    if source_status != "A" or atom_type not in ("E", "P") or embedding is None:
         raise AnnSourceIneligible(
-            f"atom_id {source_atom_id} is not an active E/P atom with an Identity Vector"
+            f"atom_id {source_atom_id} is not an active (status='A') E/P atom with an Identity Vector"
         )
 
     query = _ANN_QUERY_BY_TYPE[atom_type]

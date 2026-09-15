@@ -7,11 +7,15 @@ Task 6.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hindsight_api.engine.retain.noesis_ann_index import (
+    _MODEL_SWITCH_EPILOG,
     AnnIndexBusy,
     AnnIndexConflict,
+    AnnIndexError,
     AnnIndexMissing,
     AnnIndexStatus,
     build_ann_index,
@@ -28,7 +32,7 @@ def _healthy_definition(schema: str = "noesis_core") -> str:
     return (
         f"CREATE INDEX {INDEX_NAME} ON {schema}.atoms USING ivfflat "
         "(embedding vector_cosine_ops) WITH (lists='100') "
-        "WHERE ((status = 'active') AND (atom_type IN ('E', 'P')) "
+        "WHERE ((status = 'A') AND (atom_type IN ('E', 'P')) "
         "AND (embedding IS NOT NULL))"
     )
 
@@ -54,7 +58,7 @@ def _status_is_healthy(status: AnnIndexStatus, schema: str = "noesis_core") -> b
         and "vector_cosine_ops" in definition
         and ("lists='100'" in definition or "lists = 100" in definition)
         and "status" in definition
-        and "active" in definition
+        and "status = 'A'" in definition
         and "atom_type" in definition
         and "embedding IS NOT NULL" in definition
         and INDEX_NAME in definition
@@ -71,10 +75,14 @@ class _IndexConn:
         catalog=None,
         eligible_rows: int = 0,
         lock_available: bool = True,
+        create_valid: bool = True,
+        create_ready: bool = True,
     ) -> None:
         self.catalog = None if catalog is None else dict(catalog)
         self.eligible_rows = eligible_rows
         self.lock_available = lock_available
+        self.create_valid = create_valid
+        self.create_ready = create_ready
         self.lock_held = False
         self.calls: list[tuple[str, str, tuple]] = []
         self.analyzed = False
@@ -122,7 +130,7 @@ class _IndexConn:
                 raise AssertionError("build must use CREATE INDEX CONCURRENTLY")
             if INDEX_NAME not in sql:
                 raise AssertionError("build must use the frozen index name")
-            self.catalog = _catalog()
+            self.catalog = _catalog(valid=self.create_valid, ready=self.create_ready)
             return "CREATE INDEX"
         if upper.startswith("REINDEX"):
             if "CONCURRENTLY" not in upper:
@@ -245,6 +253,7 @@ async def test_build_at_threshold_creates_index():
     created = await build_ann_index(conn, schema="noesis_core")
     assert created is True
     assert any("CREATE INDEX" in sql.upper() and "CONCURRENTLY" in sql.upper() for sql in _sqls(conn))
+    assert any("status = 'A'" in sql for sql in _sqls(conn))
     assert conn.analyzed is True
     assert conn.lock_held is False
     assert conn.transaction_used is False
@@ -275,6 +284,33 @@ async def test_build_refuses_same_name_wrong_definition():
         await build_ann_index(conn, schema="noesis_core")
     assert not any("CREATE INDEX" in sql.upper() for sql in _sqls(conn))
     assert conn.lock_held is False
+
+
+async def test_build_refuses_invalid_or_unready_frozen_index():
+    invalid = _IndexConn(catalog=_catalog(valid=False), eligible_rows=THRESHOLD)
+    with pytest.raises(AnnIndexConflict):
+        await build_ann_index(invalid, schema="noesis_core")
+    assert not any("CREATE INDEX" in sql.upper() for sql in _sqls(invalid))
+    assert invalid.lock_held is False
+
+    unready = _IndexConn(catalog=_catalog(ready=False), eligible_rows=THRESHOLD)
+    with pytest.raises(AnnIndexConflict):
+        await build_ann_index(unready, schema="noesis_core", force=True)
+    assert not any("CREATE INDEX" in sql.upper() for sql in _sqls(unready))
+    assert unready.lock_held is False
+
+
+async def test_build_raises_if_create_leaves_index_unhealthy():
+    invalid = _IndexConn(catalog=None, eligible_rows=THRESHOLD, create_valid=False)
+    with pytest.raises(AnnIndexError):
+        await build_ann_index(invalid, schema="noesis_core")
+    assert any("CREATE INDEX" in sql.upper() for sql in _sqls(invalid))
+    assert invalid.lock_held is False
+
+    unready = _IndexConn(catalog=None, eligible_rows=THRESHOLD, create_ready=False)
+    with pytest.raises(AnnIndexError):
+        await build_ann_index(unready, schema="noesis_core")
+    assert unready.lock_held is False
 
 
 async def test_build_refuses_when_advisory_lock_is_busy():
@@ -396,6 +432,21 @@ async def test_cli_unhealthy_or_conflict_exits_3():
     assert await _run_cli(["build"], conflict) == 3
     assert conflict.closed is True
     assert conflict.lock_held is False
+    invalid = _IndexConn(catalog=_catalog(valid=False), eligible_rows=THRESHOLD)
+    assert await _run_cli(["build"], invalid) == 3
+    assert invalid.closed is True
+    unready = _IndexConn(catalog=_catalog(ready=False), eligible_rows=10)
+    assert await _run_cli(["build", "--force"], unready) == 3
+    assert not any("CREATE INDEX" in sql.upper() for sql in _sqls(unready))
+
+
+async def test_cli_build_create_unhealthy_exits_4():
+    invalid = _IndexConn(catalog=None, eligible_rows=THRESHOLD, create_valid=False)
+    assert await _run_cli(["build"], invalid) == 4
+    assert invalid.closed is True
+    unready = _IndexConn(catalog=None, eligible_rows=10, create_ready=False)
+    assert await _run_cli(["build", "--force"], unready) == 4
+    assert unready.closed is True
 
 
 async def test_cli_reindex_missing_exits_4_and_closes():
@@ -416,3 +467,35 @@ async def test_cli_ddl_exception_exits_4_and_closes(monkeypatch):
     monkeypatch.setattr(index_mod, "build_ann_index", boom)
     assert await _run_cli(["build"], conn) == 4
     assert conn.closed is True
+
+
+def test_cli_epilog_names_embedding_rebuild_not_identity_rebuild():
+    assert "noesis_embedding_rebuild" in _MODEL_SWITCH_EPILOG
+    assert "identity_rebuild" not in _MODEL_SWITCH_EPILOG
+    assert "REINDEX" in _MODEL_SWITCH_EPILOG
+    assert "drop that index" in _MODEL_SWITCH_EPILOG
+
+
+def test_schema_defers_frozen_ivfflat_and_points_at_embedding_rebuild():
+    schema_sql = (
+        Path(__file__).resolve().parents[3] / "docs" / "db" / "noesis-stage1-schema.sql"
+    )
+    text = schema_sql.read_text(encoding="utf-8")
+    live_lines = [
+        line for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("--")
+    ]
+    live = "\n".join(live_lines)
+    assert "idx_atoms_embedding_ivfflat" not in live
+    assert "ivfflat" not in live.lower()
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_atoms_embedding_ivfflat" in text
+    assert "USING ivfflat (embedding vector_cosine_ops)" in text
+    assert "WITH (lists = 100)" in text
+    assert "status = 'A'" in text
+    assert "atom_type IN ('E', 'P')" in text
+    assert "embedding IS NOT NULL" in text
+    assert "empty-database initialization" in text
+    assert "cannot run inside a" in text and "transaction block" in text
+    assert "noesis_ann_index build" in text
+    assert "noesis_embedding_rebuild" in text
+    assert "noesis_identity_rebuild" not in text

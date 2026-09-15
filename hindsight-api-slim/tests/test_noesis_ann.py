@@ -47,7 +47,7 @@ def _atom(
     *,
     text: str = "苹果手机",
     atom_type: str = "E",
-    status: str = "active",
+    status: str = "A",
     embedding,
 ) -> dict:
     return {
@@ -151,7 +151,7 @@ class _AnnConn:
         for atom_id, atom in self.atoms.items():
             if atom_id == source_atom_id:
                 continue
-            if atom["status"] != "active" or atom["atom_type"] != required_type:
+            if atom["status"] != "A" or atom["atom_type"] != required_type:
                 continue
             if atom["embedding"] is None:
                 continue
@@ -180,7 +180,7 @@ def _mixed_atoms() -> dict[int, dict]:
         1: _atom(1, text="苹果手机", embedding=[1.0, 0.0]),
         2: _atom(2, text="iPhone", embedding=[0.95, 0.05]),
         3: _atom(3, text="智能手机", embedding=[0.7, 0.3]),
-        4: _atom(4, text="旧手机", status="inactive", embedding=[0.99, 0.01]),
+        4: _atom(4, text="旧手机", status="D", embedding=[0.99, 0.01]),
         5: _atom(5, text="无向量", embedding=None),
         6: _atom(6, text="周末计划", atom_type="G", embedding=None),
         10: _atom(10, text="买", atom_type="P", embedding=[1.0, 0.0]),
@@ -243,11 +243,11 @@ async def test_missing_source_raises_not_found():
 @pytest.mark.parametrize(
     "atom",
     [
-        _atom(1, status="inactive", embedding=_vector()),
+        _atom(1, status="D", embedding=_vector()),
         _atom(2, text="周末计划", atom_type="G", embedding=None),
         _atom(3, embedding=None),
     ],
-    ids=["inactive", "type_g", "null_embedding"],
+    ids=["status_d", "type_g", "null_embedding"],
 )
 async def test_ineligible_source_raises(atom):
     conn = _AnnConn(profile=_ready_profile(), atoms={atom["atom_id"]: atom})
@@ -313,6 +313,8 @@ async def test_illegal_limit_raises(limit):
 def test_frozen_sql_templates_are_literal_e_and_p():
     e_sql = ann_module._ANN_QUERY_BY_TYPE["E"]
     p_sql = ann_module._ANN_QUERY_BY_TYPE["P"]
+    assert "status = 'A'" in e_sql
+    assert "status = 'active'" not in e_sql
     assert "atom_type = 'E'" in e_sql
     assert "atom_type = 'P'" not in e_sql
     assert "atom_type = 'P'" in p_sql
@@ -323,6 +325,21 @@ def test_frozen_sql_templates_are_literal_e_and_p():
     assert "MATERIALIZED" in e_sql
     assert "{atom_type}" not in e_sql
     assert p_sql == e_sql.replace("atom_type = 'E'", "atom_type = 'P'")
+
+
+def test_explain_uses_frozen_recall_sql_not_a_simplified_substitute():
+    schema = "n04ann_example"
+    query = ann_module._sql(schema, ann_module._ANN_QUERY_BY_TYPE["E"])
+    explain_sql = "EXPLAIN\n" + query
+    assert explain_sql.startswith("EXPLAIN\n")
+    assert query == explain_sql[len("EXPLAIN\n") :]
+    assert "WITH nearest AS MATERIALIZED" in explain_sql
+    assert "CROSS JOIN" in explain_sql
+    assert "ORDER BY a.embedding <=> s.embedding" in explain_sql
+    assert "ORDER BY distance + 0, atom_id" in explain_sql
+    assert "1.0 - distance AS similarity" in explain_sql
+    assert f"FROM {schema}.atoms" in explain_sql
+    assert "SELECT a.atom_id" not in explain_sql
 
 
 async def test_e_source_returns_only_e():
@@ -342,7 +359,7 @@ async def test_p_source_returns_only_p():
     assert {item.atom_id for item in candidates} == {11, 12}
 
 
-async def test_candidates_exclude_self_inactive_g_and_null():
+async def test_candidates_exclude_self_deprecated_g_and_null():
     conn = _AnnConn(profile=_ready_profile(), atoms=_mixed_atoms())
     candidates = await _recall(conn, source_atom_id=1)
     ids = {item.atom_id for item in candidates}

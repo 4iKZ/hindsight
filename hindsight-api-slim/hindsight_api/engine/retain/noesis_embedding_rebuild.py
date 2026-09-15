@@ -64,6 +64,23 @@ _ADVISORY_LOCK_KEY = 0x4E4F4553_495352  # "NOESISR"
 # Requirement 05A §6.12: the single frozen requirement-04 ANN index name.
 _FROZEN_ANN_INDEX = "idx_atoms_embedding_ivfflat"
 
+# Requirement 04 §11 / 05A §6.12: unknown ANN shapes refuse. This command never
+# drops them. A healthy frozen IVFFlat is REINDEX-ed in the cutover transaction
+# (not refused). Tests assert this copy.
+_ANN_UNKNOWN_INDEX_HINT = (
+    "unknown/invalid ANN index shape on %s.atoms.embedding (%s); refusing a model rebuild. "
+    "This command does not drop or guess indexes. Frozen operations order: "
+    "1. python -m hindsight_api.engine.retain.noesis_ann_index status; "
+    "2. python -m hindsight_api.engine.retain.noesis_ann_index drop; "
+    "3. python -m hindsight_api.engine.retain.noesis_embedding_rebuild [--force-full]; "
+    "4. Confirm embedding_profiles.identity.status = ready; "
+    "5. python -m hindsight_api.engine.retain.noesis_ann_index build --force; "
+    "6. python -m hindsight_api.engine.retain.noesis_ann_index status; "
+    "7. Run a Top-100 smoke for one E and one P. "
+    "A healthy frozen idx_atoms_embedding_ivfflat is not dropped: this command "
+    "REINDEX-es it in the cutover transaction."
+)
+
 # Requirement 05A §6.7: fixed keyset page size.
 _PAGE_SIZE = 256
 
@@ -305,6 +322,17 @@ def _classify_ann_indexes(rows: list[Any]) -> tuple[bool, str | None]:
     return False, None
 
 
+def _ann_index_names(rows: list[Any]) -> str:
+    names: list[str] = []
+    for row in rows:
+        definition = (row["indexdef"] or "").lower()
+        if "embedding" not in definition:
+            continue
+        if "using ivfflat" in definition or "using hnsw" in definition:
+            names.append(str(row["indexname"]))
+    return ",".join(names) or "unknown"
+
+
 # ---------------------------------------------------------------------------
 # State machine (requirement 05A §6.4)
 # ---------------------------------------------------------------------------
@@ -346,12 +374,7 @@ async def _rebuild_locked(conn, schema, client, spec, *, repair_null_only: bool,
         rows = await conn.fetch(_ann_index_check(schema), schema)
         allowed, reindex_target = _classify_ann_indexes(list(rows))
         if not allowed:
-            logger.error(
-                "unknown/invalid ANN index shape on %s.atoms.embedding; refusing a model rebuild "
-                "(expected no index or the frozen %s)",
-                schema,
-                _FROZEN_ANN_INDEX,
-            )
+            logger.error(_ANN_UNKNOWN_INDEX_HINT, schema, _ann_index_names(list(rows)))
             return _EXIT_ANN_UNKNOWN
 
     # Health-gate the client before reading profile state.
@@ -791,7 +814,17 @@ def _load_config() -> Any:
 async def _main(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Noesis shared embedding-space rebuild")
+    parser = argparse.ArgumentParser(
+        description="Noesis shared embedding-space rebuild",
+        epilog=(
+            "Model switch: this command rebuilds atoms + anchors + the frozen "
+            "idx_atoms_embedding_ivfflat (REINDEX INDEX in the cutover "
+            "transaction). It does not CREATE a missing IVFFlat and does not "
+            "drop unknown ANN indexes. Create a missing index with "
+            "python -m hindsight_api.engine.retain.noesis_ann_index build. "
+            "Unknown ANN shapes refuse with the frozen seven-step hint."
+        ),
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--repair-null-only",

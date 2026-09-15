@@ -44,19 +44,28 @@ WHERE n.nspname = $1
 
 _ELIGIBLE_COUNT = (
     "SELECT count(*) FROM {s}.atoms "
-    "WHERE status = 'active' AND atom_type IN ('E', 'P') AND embedding IS NOT NULL"
+    "WHERE status = 'A' AND atom_type IN ('E', 'P') AND embedding IS NOT NULL"
 )
 
 _CREATE_INDEX = (
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS {index} "
     "ON {s}.atoms USING ivfflat (embedding vector_cosine_ops) "
     "WITH (lists = 100) "
-    "WHERE status = 'active' AND atom_type IN ('E', 'P') AND embedding IS NOT NULL"
+    "WHERE status = 'A' AND atom_type IN ('E', 'P') AND embedding IS NOT NULL"
 ).replace("{index}", INDEX_NAME)
 
 _REINDEX = "REINDEX INDEX CONCURRENTLY {s}.{index}".replace("{index}", INDEX_NAME)
 _DROP_INDEX = "DROP INDEX CONCURRENTLY IF EXISTS {s}.{index}".replace("{index}", INDEX_NAME)
 _ANALYZE = "ANALYZE {s}.atoms"
+
+# Model-switch copy for the index CLI. Rebuild lives in noesis_embedding_rebuild
+# (requirement 05A): a healthy frozen IVFFlat is REINDEX-ed there, not dropped.
+_MODEL_SWITCH_EPILOG = (
+    "Model switch uses python -m hindsight_api.engine.retain.noesis_embedding_rebuild "
+    "[--force-full], which REINDEX-es a healthy frozen idx_atoms_embedding_ivfflat "
+    "in its cutover transaction. Do not drop that index to change models. "
+    "Create a missing index with this command's build / build --force."
+)
 
 
 @dataclass(frozen=True)
@@ -107,7 +116,7 @@ def definition_is_frozen(definition: str | None, *, schema: str) -> bool:
         and "ivfflat" in definition.lower()
         and "vector_cosine_ops" in definition
         and ("lists='100'" in definition or "lists = 100" in definition)
-        and "active" in definition
+        and "status = 'A'" in definition
         and "atom_type" in definition
         and "embedding IS NOT NULL" in definition
     )
@@ -162,9 +171,14 @@ async def build_ann_index(conn, *, schema: str, force: bool = False) -> bool:
         status = await get_ann_index_status(conn, schema=schema)
         if status_is_healthy(status, schema=schema):
             return False
-        if status.exists and not definition_is_frozen(status.definition, schema=schema):
+        if status.exists:
+            if not definition_is_frozen(status.definition, schema=schema):
+                raise AnnIndexConflict(
+                    f"{INDEX_NAME} exists with a non-frozen definition; report to Leader"
+                )
             raise AnnIndexConflict(
-                f"{INDEX_NAME} exists with a non-frozen definition; report to Leader"
+                f"{INDEX_NAME} exists but is not valid/ready; refuse build success. "
+                "Use reindex or drop."
             )
         if status.eligible_rows < _ELIGIBLE_THRESHOLD and not force:
             logger.info("ann index build cold_start eligible_rows=%s forced=%s", status.eligible_rows, False)
@@ -174,7 +188,11 @@ async def build_ann_index(conn, *, schema: str, force: bool = False) -> bool:
         await conn.execute(_sql(schema, _CREATE_INDEX))
         await conn.execute(_sql(schema, _ANALYZE))
         rebuilt = await get_ann_index_status(conn, schema=schema)
-        return status_is_healthy(rebuilt, schema=schema)
+        if not status_is_healthy(rebuilt, schema=schema):
+            raise AnnIndexError(
+                f"{INDEX_NAME} CREATE finished but the catalog is not valid/ready"
+            )
+        return True
     finally:
         await _release_lock(conn)
 
@@ -215,7 +233,10 @@ async def _connect(config: Any):
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Noesis ANN IVFFlat index manager")
+    parser = argparse.ArgumentParser(
+        description="Noesis ANN IVFFlat index manager",
+        epilog=_MODEL_SWITCH_EPILOG,
+    )
     parser.add_argument("action", choices=("status", "build", "reindex", "drop"))
     parser.add_argument(
         "--force",
@@ -246,6 +267,9 @@ async def _run_action(conn, *, schema: str, action: str, force: bool) -> int:
         return 0
     if action == "build":
         await build_ann_index(conn, schema=schema, force=force)
+        status = await get_ann_index_status(conn, schema=schema)
+        if status.exists and not status_is_healthy(status, schema=schema):
+            return 3
         return 0
     if action == "reindex":
         await reindex_ann_index(conn, schema=schema)

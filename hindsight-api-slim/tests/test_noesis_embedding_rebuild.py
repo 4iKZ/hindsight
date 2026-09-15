@@ -15,6 +15,7 @@ import json
 import pytest
 
 from hindsight_api.engine.retain.noesis_embedding_rebuild import (
+    _ANN_UNKNOWN_INDEX_HINT,
     BuildSpec,
     _replay_anchor_centroids,
     run_embedding_rebuild,
@@ -327,7 +328,7 @@ async def test_frozen_ivfflat_index_is_reindexed_in_final_transaction():
     assert "CONCURRENTLY" not in reindex_calls[0][1]
 
 
-async def test_unknown_ann_index_fails_closed():
+async def test_unknown_ann_index_fails_closed(caplog):
     store = _store_with_history()
     store.pg_indexes = [
         {
@@ -335,8 +336,19 @@ async def test_unknown_ann_index_fails_closed():
             "indexdef": "CREATE INDEX atoms_embedding_hnsw ON noesis_core.atoms USING hnsw (embedding)",
         }
     ]
-    assert await _run(store) == 3
+    with caplog.at_level("ERROR"):
+        assert await _run(store) == 3
     assert store.profile["status"] == "ready"
+    sqls = [sql for _method, sql, _args in store.calls]
+    assert not any("DROP INDEX" in sql.upper() for sql in sqls)
+    assert not any("CREATE INDEX" in sql.upper() for sql in sqls)
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    expected = _ANN_UNKNOWN_INDEX_HINT % ("noesis_core", "atoms_embedding_hnsw")
+    assert expected in joined
+    assert "noesis_embedding_rebuild" in joined
+    assert "noesis_identity_rebuild" not in joined
+    assert "noesis_ann_index drop" in joined
+    assert "noesis_ann_index build --force" in joined
 
 
 async def test_multiple_ann_indexes_fail_closed():
@@ -349,6 +361,7 @@ async def test_multiple_ann_indexes_fail_closed():
         },
     ]
     assert await _run(store) == 3
+    assert not any("DROP INDEX" in sql.upper() for _method, sql, _args in store.calls)
 
 
 # ---------------------------------------------------------------------------
