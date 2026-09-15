@@ -248,6 +248,8 @@ class FakeStore:
         # Rebuild-command knobs (requirement 03 §10.4 tests).
         self.advisory_lock_available = True
         self.pg_indexes: list[dict[str, Any]] = []
+        # Requirement 04: ANN IVFFlat catalog row (None = index missing).
+        self.ann_index_catalog: dict[str, Any] | None = None
         self._marker_counts: dict[str, int] = {}
         self._ids = {"event": 1000, "atom": 500, "alert": 9000, "anchor": 100}
         self._tx_depth = 0
@@ -277,6 +279,8 @@ class FakeStore:
         upper = sql.lstrip().upper()
         if ".embedding_profiles" in sql:
             return self._profile_dispatch(upper, args)
+        if "idx_atoms_embedding_ivfflat" in sql or "pg_get_indexdef" in sql:
+            return None if self.ann_index_catalog is None else dict(self.ann_index_catalog)
         if ".events" in sql and upper.startswith("INSERT"):
             return self._insert_event(args)
         # Requirement 05 dispatches. The atom row lock must precede the generic
@@ -422,11 +426,11 @@ class FakeStore:
             return len(self.embedding_atom_stage)
         if "noesis_embedding_anchor_stage" in sql and "count(*)" in sql:
             return len(self.embedding_anchor_stage)
-        if "status = 'active'" in sql and "count(*)" in sql:
+        if "status = 'A'" in sql and "count(*)" in sql:
             return sum(
                 1
                 for (text, atom_type), atom in self.atoms.items()
-                if atom_type in ("E", "P") and atom.get("status", "active") == "active"
+                if atom_type in ("E", "P") and atom.get("status", "A") == "A"
             )
         if "embedding IS NOT NULL" in sql and "count(*)" in sql:
             return sum(
@@ -445,6 +449,7 @@ class FakeStore:
     async def execute(self, sql: str, *args: Any) -> str:
         self._maybe_fail(sql)
         self.calls.append(("execute", sql, args))
+        upper = sql.lstrip().upper()
         # Requirement 06 dispatches first: the bitmap upserts carry no
         # RETURNING and are the only write path into these tables.
         if ".cooccurrence_bitmaps" in sql:
@@ -530,6 +535,35 @@ class FakeStore:
                 anchor["total_count"] = int(total_count)
                 updated += 1
             return f"UPDATE {updated}"
+        if ".atoms" in sql and "SET embedding" in sql:
+            null_guard = "AND embedding IS NULL" in sql
+            for atom in self.atoms.values():
+                if atom["atom_id"] == args[0]:
+                    if not (null_guard and atom["embedding"] is not None):
+                        atom["embedding"] = _parse_vector_literal(args[1])
+                    return "UPDATE 1"
+            return "UPDATE 0"
+        if "CREATE INDEX" in upper and "idx_atoms_embedding_ivfflat" in sql:
+            self.ann_index_catalog = {
+                "schemaname": "noesis_core",
+                "tablename": "atoms",
+                "indexname": "idx_atoms_embedding_ivfflat",
+                "amname": "ivfflat",
+                "indisvalid": True,
+                "indisready": True,
+                "indexdef": (
+                    "CREATE INDEX idx_atoms_embedding_ivfflat ON noesis_core.atoms "
+                    "USING ivfflat (embedding vector_cosine_ops) WITH (lists='100') "
+                    "WHERE ((status = 'A') AND (atom_type IN ('E', 'P')) "
+                    "AND (embedding IS NOT NULL))"
+                ),
+            }
+            return "CREATE INDEX"
+        if "DROP INDEX" in upper and "idx_atoms_embedding_ivfflat" in sql:
+            self.ann_index_catalog = None
+            return "DROP INDEX"
+        if upper.startswith("ANALYZE"):
+            return "ANALYZE"
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
     # -- table emulation ----------------------------------------------------
