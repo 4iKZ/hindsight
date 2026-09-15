@@ -320,7 +320,10 @@ def test_frozen_sql_templates_are_literal_e_and_p():
     assert "atom_type = 'P'" in p_sql
     assert "atom_type = 'E'" not in p_sql
     assert "support_count" not in e_sql and "support_count" not in p_sql
-    assert "ORDER BY a.embedding <=> s.embedding" in e_sql
+    assert "WITH source AS MATERIALIZED" in e_sql
+    assert "CROSS JOIN" not in e_sql
+    assert "a.embedding <=> (SELECT embedding FROM source)" in e_sql
+    assert "ORDER BY a.embedding <=> (SELECT embedding FROM source)" in e_sql
     assert "ORDER BY distance + 0, atom_id" in e_sql
     assert "MATERIALIZED" in e_sql
     assert "{atom_type}" not in e_sql
@@ -333,9 +336,10 @@ def test_explain_uses_frozen_recall_sql_not_a_simplified_substitute():
     explain_sql = "EXPLAIN\n" + query
     assert explain_sql.startswith("EXPLAIN\n")
     assert query == explain_sql[len("EXPLAIN\n") :]
-    assert "WITH nearest AS MATERIALIZED" in explain_sql
-    assert "CROSS JOIN" in explain_sql
-    assert "ORDER BY a.embedding <=> s.embedding" in explain_sql
+    assert "WITH source AS MATERIALIZED" in explain_sql
+    assert "WITH nearest AS MATERIALIZED" not in explain_sql
+    assert "CROSS JOIN" not in explain_sql
+    assert "ORDER BY a.embedding <=> (SELECT embedding FROM source)" in explain_sql
     assert "ORDER BY distance + 0, atom_id" in explain_sql
     assert "1.0 - distance AS similarity" in explain_sql
     assert f"FROM {schema}.atoms" in explain_sql

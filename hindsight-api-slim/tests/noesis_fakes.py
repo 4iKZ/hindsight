@@ -432,12 +432,6 @@ class FakeStore:
                 for (text, atom_type), atom in self.atoms.items()
                 if atom_type in ("E", "P") and atom.get("status", "A") == "A"
             )
-        if "status = 'active'" in sql and "count(*)" in sql:
-            return sum(
-                1
-                for (text, atom_type), atom in self.atoms.items()
-                if atom_type in ("E", "P") and atom.get("status", "active") == "active"
-            )
         if "embedding IS NOT NULL" in sql and "count(*)" in sql:
             return sum(
                 1

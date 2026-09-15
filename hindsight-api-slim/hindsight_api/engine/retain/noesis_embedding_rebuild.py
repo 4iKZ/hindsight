@@ -145,7 +145,7 @@ def _atoms_page(schema: str, null_only: bool) -> str:
     return _sql(
         schema,
         "SELECT atom_id, text, atom_type FROM {s}.atoms "
-        "WHERE status = 'active' AND atom_type IN ('E', 'P') " + guard
+        "WHERE status = 'A' AND atom_type IN ('E', 'P') " + guard
         + "AND atom_id > $1 ORDER BY atom_id LIMIT {page_size}",
     )
 
@@ -175,7 +175,7 @@ def _anchors_by_ids(schema: str) -> str:
 
 
 def _active_ep_count(schema: str) -> str:
-    return _sql(schema, "SELECT count(*) FROM {s}.atoms WHERE status = 'active' AND atom_type IN ('E', 'P')")
+    return _sql(schema, "SELECT count(*) FROM {s}.atoms WHERE status = 'A' AND atom_type IN ('E', 'P')")
 
 
 def _all_anchor_count(schema: str) -> str:
@@ -278,7 +278,7 @@ def _atoms_cutover_update(schema: str, null_only: bool) -> str:
     return (
         "UPDATE {s}.atoms a SET embedding = st.embedding "
         "FROM pg_temp.noesis_embedding_atom_stage st "
-        "WHERE a.atom_id = st.atom_id AND a.status = 'active' "
+        "WHERE a.atom_id = st.atom_id AND a.status = 'A' "
         "AND a.atom_type IN ('E', 'P') {guard}"
     ).format(s=schema, guard=guard)
 

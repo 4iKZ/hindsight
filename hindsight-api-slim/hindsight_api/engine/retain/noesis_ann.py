@@ -29,23 +29,23 @@ _SOURCE_SELECT = (
     "WHERE atom_id = $1"
 )
 _ANN_QUERY_E = """
-WITH nearest AS MATERIALIZED (
+WITH source AS MATERIALIZED (
+    SELECT embedding
+    FROM {s}.atoms
+    WHERE atom_id = $1
+),
+nearest AS (
     SELECT
         a.atom_id,
         a.text,
         a.atom_type,
-        a.embedding <=> s.embedding AS distance
+        a.embedding <=> (SELECT embedding FROM source) AS distance
     FROM {s}.atoms AS a
-    CROSS JOIN (
-        SELECT embedding
-        FROM {s}.atoms
-        WHERE atom_id = $1
-    ) AS s
     WHERE a.atom_id <> $1
       AND a.status = 'A'
       AND a.atom_type = 'E'
       AND a.embedding IS NOT NULL
-    ORDER BY a.embedding <=> s.embedding
+    ORDER BY a.embedding <=> (SELECT embedding FROM source)
     LIMIT $2
 )
 SELECT

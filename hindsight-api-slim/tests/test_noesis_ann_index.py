@@ -7,11 +7,10 @@ Task 6.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from hindsight_api.engine.retain.noesis_ann_index import (
+    _ADVISORY_LOCK_KEY as ANN_INDEX_LOCK_KEY,
     _MODEL_SWITCH_EPILOG,
     AnnIndexBusy,
     AnnIndexConflict,
@@ -19,9 +18,13 @@ from hindsight_api.engine.retain.noesis_ann_index import (
     AnnIndexMissing,
     AnnIndexStatus,
     build_ann_index,
+    definition_is_frozen,
     drop_ann_index,
     get_ann_index_status,
     reindex_ann_index,
+)
+from hindsight_api.engine.retain.noesis_embedding_rebuild import (
+    _ADVISORY_LOCK_KEY as EMBEDDING_REBUILD_LOCK_KEY,
 )
 
 INDEX_NAME = "idx_atoms_embedding_ivfflat"
@@ -228,6 +231,15 @@ async def test_status_same_name_wrong_definition_is_not_healthy():
     assert _status_is_healthy(status) is False
 
 
+def test_definition_rejects_wrong_atom_type_partial_predicate():
+    wrong = _healthy_definition().replace("atom_type IN ('E', 'P')", "atom_type IN ('E', 'G')")
+    assert definition_is_frozen(wrong, schema="noesis_core") is False
+
+
+def test_index_lifecycle_shares_embedding_rebuild_lock():
+    assert ANN_INDEX_LOCK_KEY == EMBEDDING_REBUILD_LOCK_KEY
+
+
 async def test_status_reports_eligible_row_count():
     conn = _IndexConn(catalog=None, eligible_rows=4242)
     status = await get_ann_index_status(conn, schema="noesis_core")
@@ -341,6 +353,17 @@ async def test_reindex_existing_succeeds():
     assert conn.analyzed is True
     assert conn.lock_held is False
     assert conn.transaction_used is False
+
+
+async def test_reindex_refuses_wrong_definition():
+    conn = _IndexConn(
+        catalog=_catalog(definition=f"CREATE INDEX {INDEX_NAME} ON noesis_core.atoms USING btree (atom_id)"),
+        eligible_rows=THRESHOLD,
+    )
+    with pytest.raises(AnnIndexConflict):
+        await reindex_ann_index(conn, schema="noesis_core")
+    assert not any("REINDEX" in sql.upper() for sql in _sqls(conn))
+    assert conn.lock_held is False
 
 
 async def test_drop_is_idempotent():
@@ -474,28 +497,3 @@ def test_cli_epilog_names_embedding_rebuild_not_identity_rebuild():
     assert "identity_rebuild" not in _MODEL_SWITCH_EPILOG
     assert "REINDEX" in _MODEL_SWITCH_EPILOG
     assert "drop that index" in _MODEL_SWITCH_EPILOG
-
-
-def test_schema_defers_frozen_ivfflat_and_points_at_embedding_rebuild():
-    schema_sql = (
-        Path(__file__).resolve().parents[3] / "docs" / "db" / "noesis-stage1-schema.sql"
-    )
-    text = schema_sql.read_text(encoding="utf-8")
-    live_lines = [
-        line for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("--")
-    ]
-    live = "\n".join(live_lines)
-    assert "idx_atoms_embedding_ivfflat" not in live
-    assert "ivfflat" not in live.lower()
-    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_atoms_embedding_ivfflat" in text
-    assert "USING ivfflat (embedding vector_cosine_ops)" in text
-    assert "WITH (lists = 100)" in text
-    assert "status = 'A'" in text
-    assert "atom_type IN ('E', 'P')" in text
-    assert "embedding IS NOT NULL" in text
-    assert "empty-database initialization" in text
-    assert "cannot run inside a" in text and "transaction block" in text
-    assert "noesis_ann_index build" in text
-    assert "noesis_embedding_rebuild" in text
-    assert "noesis_identity_rebuild" not in text

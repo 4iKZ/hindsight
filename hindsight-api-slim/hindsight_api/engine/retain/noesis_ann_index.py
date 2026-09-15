@@ -11,17 +11,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .noesis_embedding_rebuild import _ADVISORY_LOCK_KEY
 from .noesis_ingest import validate_schema_identifier
 
 logger = logging.getLogger(__name__)
 
 INDEX_NAME = "idx_atoms_embedding_ivfflat"
 _ELIGIBLE_THRESHOLD = 10_000
-# Dedicated session key; must not equal the identity-rebuild lock.
-_ADVISORY_LOCK_KEY = 0x4E4F4553_041446  # "NOESIS" + 04 IVF
+# Index lifecycle and embedding rebuild mutate one shared embedding generation,
+# so they must be mutually exclusive across their full sessions.
 
 _CATALOG_SELECT = """
 SELECT
@@ -110,15 +112,21 @@ def _row_value(row: Any, key: str) -> Any:
 def definition_is_frozen(definition: str | None, *, schema: str) -> bool:
     if not definition:
         return False
+    normalized = re.sub(r'[\s"()]', "", definition).lower()
+    normalized = normalized.replace("::bpchar", "").replace("::text", "")
+    normalized = normalized.replace("'100'", "100")
+    atom_type_is_ep = (
+        "atom_typein'e','p'" in normalized
+        or "atom_type=anyarray['e','p']" in normalized
+    )
     return (
-        INDEX_NAME in definition
-        and schema in definition
-        and "ivfflat" in definition.lower()
-        and "vector_cosine_ops" in definition
-        and ("lists='100'" in definition or "lists = 100" in definition)
-        and "status = 'A'" in definition
-        and "atom_type" in definition
-        and "embedding IS NOT NULL" in definition
+        INDEX_NAME.lower() in normalized
+        and f"on{schema.lower()}.atomsusingivfflat" in normalized
+        and "embeddingvector_cosine_ops" in normalized
+        and "lists=100" in normalized
+        and "status='a'" in normalized
+        and atom_type_is_ep
+        and "embeddingisnotnull" in normalized
     )
 
 
@@ -204,8 +212,17 @@ async def reindex_ann_index(conn, *, schema: str) -> None:
         status = await get_ann_index_status(conn, schema=schema)
         if not status.exists:
             raise AnnIndexMissing(f"{INDEX_NAME} does not exist; refuse silent build")
+        if not definition_is_frozen(status.definition, schema=schema):
+            raise AnnIndexConflict(
+                f"{INDEX_NAME} exists with a non-frozen definition; refuse reindex"
+            )
         await conn.execute(_sql(schema, _REINDEX))
         await conn.execute(_sql(schema, _ANALYZE))
+        rebuilt = await get_ann_index_status(conn, schema=schema)
+        if not status_is_healthy(rebuilt, schema=schema):
+            raise AnnIndexError(
+                f"{INDEX_NAME} REINDEX finished but the catalog is not valid/ready"
+            )
     finally:
         await _release_lock(conn)
 

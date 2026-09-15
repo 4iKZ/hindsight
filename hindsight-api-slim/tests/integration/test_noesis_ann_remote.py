@@ -51,13 +51,30 @@ _LOG = logging.getLogger(__name__)
 
 
 def _remote_enabled() -> bool:
-    return all(
+    return os.environ.get("NOESIS_REMOTE_TEST") == "1" and all(
         os.environ.get(key)
         for key in ("NOESIS_SSH_HOST", "NOESIS_SSH_PORT", "NOESIS_SSH_USER", "NOESIS_SSH_PW")
     )
 
 
-requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_SSH_* env not set")
+requires_remote = pytest.mark.skipif(
+    not _remote_enabled(),
+    reason="NOESIS_REMOTE_TEST=1 and all NOESIS_SSH_* env vars are required",
+)
+
+
+def test_remote_gate_requires_explicit_opt_in(monkeypatch):
+    for key in ("NOESIS_SSH_HOST", "NOESIS_SSH_PORT", "NOESIS_SSH_USER", "NOESIS_SSH_PW"):
+        monkeypatch.setenv(key, "set")
+    monkeypatch.delenv("NOESIS_REMOTE_TEST", raising=False)
+    assert _remote_enabled() is False
+
+
+def test_remote_gate_accepts_opt_in_with_all_ssh_values(monkeypatch):
+    monkeypatch.setenv("NOESIS_REMOTE_TEST", "1")
+    for key in ("NOESIS_SSH_HOST", "NOESIS_SSH_PORT", "NOESIS_SSH_USER", "NOESIS_SSH_PW"):
+        monkeypatch.setenv(key, "set")
+    assert _remote_enabled() is True
 
 
 class _SshTunnel:
@@ -310,9 +327,9 @@ async def test_ann_temp_schema_recall_ivfflat_and_cleanup():
         # Production recall SQL (MATERIALIZED CTE), not a simplified substitute.
         query = _sql(schema, _ANN_QUERY_BY_TYPE["E"])
         explain_sql = "EXPLAIN\n" + query
-        assert "WITH nearest AS MATERIALIZED" in query
-        assert "CROSS JOIN" in query
-        assert "ORDER BY a.embedding <=> s.embedding" in query
+        assert "WITH source AS MATERIALIZED" in query
+        assert "CROSS JOIN" not in query
+        assert "ORDER BY a.embedding <=> (SELECT embedding FROM source)" in query
         assert "1.0 - distance AS similarity" in query
         assert "status = 'A'" in query
         assert "atom_type = 'E'" in query
@@ -323,16 +340,10 @@ async def test_ann_temp_schema_recall_ivfflat_and_cleanup():
             plan_rows = await conn.fetch(explain_sql, ids["苹果手机"], 10)
         plan = "\n".join(row[0] for row in plan_rows)
         _LOG.info("ann remote explain=\n%s", plan)
-        # This is the frozen recall SQL. On this 126-row CROSS JOIN CTE the
-        # planner still seq-scans (enable_seqscan=off shows Disabled: true)
-        # and does not name IVFFlat. Catalog already proved the index exists.
-        assert "CTE nearest" in plan
+        # The production query shape must expose a KNN execution parameter so
+        # PostgreSQL can select the frozen IVFFlat index.
+        assert INDEX_NAME in plan
         assert "a.embedding <=> " in plan or "embedding <=> " in plan
-        if INDEX_NAME not in plan:
-            _LOG.warning(
-                "ann remote explain did not name %s; frozen CTE plan logged above",
-                INDEX_NAME,
-            )
 
         await reindex_ann_index(conn, schema=schema)
         reindexed = await get_ann_index_status(conn, schema=schema)
