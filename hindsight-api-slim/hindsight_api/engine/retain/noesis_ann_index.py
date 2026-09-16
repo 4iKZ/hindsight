@@ -105,10 +105,6 @@ def _require_schema(schema: str) -> str:
     return schema
 
 
-def _row_value(row: Any, key: str) -> Any:
-    return row[key]
-
-
 def definition_is_frozen(definition: str | None, *, schema: str) -> bool:
     if not definition:
         return False
@@ -151,12 +147,12 @@ async def get_ann_index_status(conn, *, schema: str) -> AnnIndexStatus:
             definition=None,
             eligible_rows=int(eligible or 0),
         )
-    definition = _row_value(row, "indexdef")
-    exists = str(_row_value(row, "indexname") or "") == INDEX_NAME
+    definition = row["indexdef"]
+    exists = str(row["indexname"] or "") == INDEX_NAME
     return AnnIndexStatus(
         exists=exists,
-        valid=bool(_row_value(row, "indisvalid")),
-        ready=bool(_row_value(row, "indisready")),
+        valid=bool(row["indisvalid"]),
+        ready=bool(row["indisready"]),
         definition=None if definition is None else str(definition),
         eligible_rows=int(eligible or 0),
     )

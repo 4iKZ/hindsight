@@ -115,10 +115,6 @@ def _require_limit(limit: Any) -> int:
     return limit
 
 
-def _row_value(row: Any, key: str) -> Any:
-    return row[key]
-
-
 def _finite_float(value: Any, name: str) -> float:
     try:
         number = float(value)
@@ -130,16 +126,14 @@ def _finite_float(value: Any, name: str) -> float:
 
 
 def _candidate_from_row(row: Any) -> AnnCandidate:
-    atom_type = str(_row_value(row, "atom_type") or "").strip()
+    atom_type = str(row["atom_type"] or "").strip()
     if atom_type not in ("E", "P"):
         raise AnnRecallError(f"candidate atom_type must be E or P, got {atom_type!r}")
-    distance = _finite_float(_row_value(row, "distance"), "distance")
+    distance = _finite_float(row["distance"], "distance")
     similarity = 1.0 - distance
-    if not math.isfinite(similarity):
-        raise AnnRecallError("candidate similarity is not finite")
     return AnnCandidate(
-        atom_id=int(_row_value(row, "atom_id")),
-        text=str(_row_value(row, "text")),
+        atom_id=int(row["atom_id"]),
+        text=str(row["text"]),
         atom_type=atom_type,  # type: ignore[arg-type]
         distance=distance,
         similarity=similarity,
@@ -160,9 +154,9 @@ async def recall_ann_candidates(
     profile = await conn.fetchrow(_sql(schema, _PROFILE_SELECT))
     if profile is None:
         raise AnnProfileUnavailable("identity embedding profile is missing")
-    status = _row_value(profile, "status")
+    status = profile["status"]
     try:
-        dimension = int(_row_value(profile, "dimension"))
+        dimension = int(profile["dimension"])
     except (TypeError, ValueError) as error:
         raise AnnProfileUnavailable("identity embedding profile dimension is invalid") from error
     if status != _READY_STATUS or dimension != _IDENTITY_DIMENSION:
@@ -173,9 +167,9 @@ async def recall_ann_candidates(
     source = await conn.fetchrow(_sql(schema, _SOURCE_SELECT), source_atom_id)
     if source is None:
         raise AnnSourceNotFound(f"atom_id {source_atom_id} does not exist")
-    atom_type = str(_row_value(source, "atom_type") or "").strip()
-    source_status = _row_value(source, "status")
-    embedding = _row_value(source, "embedding")
+    atom_type = str(source["atom_type"] or "").strip()
+    source_status = source["status"]
+    embedding = source["embedding"]
     if source_status != "A" or atom_type not in ("E", "P") or embedding is None:
         raise AnnSourceIneligible(
             f"atom_id {source_atom_id} is not an active (status='A') E/P atom with an Identity Vector"
