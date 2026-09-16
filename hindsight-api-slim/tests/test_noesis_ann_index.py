@@ -11,6 +11,8 @@ import pytest
 
 from hindsight_api.engine.retain.noesis_ann_index import (
     _ADVISORY_LOCK_KEY as ANN_INDEX_LOCK_KEY,
+)
+from hindsight_api.engine.retain.noesis_ann_index import (
     _MODEL_SWITCH_EPILOG,
     AnnIndexBusy,
     AnnIndexConflict,
@@ -22,6 +24,7 @@ from hindsight_api.engine.retain.noesis_ann_index import (
     drop_ann_index,
     get_ann_index_status,
     reindex_ann_index,
+    status_is_healthy,
 )
 from hindsight_api.engine.retain.noesis_embedding_rebuild import (
     _ADVISORY_LOCK_KEY as EMBEDDING_REBUILD_LOCK_KEY,
@@ -50,23 +53,6 @@ def _catalog(*, definition=None, amname="ivfflat", valid=True, ready=True, schem
         "indisready": ready,
         "indexdef": definition if definition is not None else _healthy_definition(schema),
     }
-
-
-def _status_is_healthy(status: AnnIndexStatus, schema: str = "noesis_core") -> bool:
-    definition = status.definition or ""
-    return (
-        status.exists
-        and status.valid
-        and status.ready
-        and "vector_cosine_ops" in definition
-        and ("lists='100'" in definition or "lists = 100" in definition)
-        and "status" in definition
-        and "status = 'A'" in definition
-        and "atom_type" in definition
-        and "embedding IS NOT NULL" in definition
-        and INDEX_NAME in definition
-        and schema in definition
-    )
 
 
 class _IndexConn:
@@ -191,7 +177,7 @@ async def test_status_missing_index():
     assert status.ready is False
     assert status.definition is None
     assert status.eligible_rows == 3
-    assert _status_is_healthy(status) is False
+    assert status_is_healthy(status, schema="noesis_core") is False
 
 
 async def test_status_healthy_index():
@@ -201,7 +187,7 @@ async def test_status_healthy_index():
     assert status.valid is True
     assert status.ready is True
     assert status.eligible_rows == 12
-    assert _status_is_healthy(status) is True
+    assert status_is_healthy(status, schema="noesis_core") is True
 
 
 async def test_status_invalid_index_is_not_healthy():
@@ -209,7 +195,7 @@ async def test_status_invalid_index_is_not_healthy():
     status = await get_ann_index_status(conn, schema="noesis_core")
     assert status.exists is True
     assert status.valid is False
-    assert _status_is_healthy(status) is False
+    assert status_is_healthy(status, schema="noesis_core") is False
 
 
 async def test_status_not_ready_index_is_not_healthy():
@@ -217,7 +203,7 @@ async def test_status_not_ready_index_is_not_healthy():
     status = await get_ann_index_status(conn, schema="noesis_core")
     assert status.exists is True
     assert status.ready is False
-    assert _status_is_healthy(status) is False
+    assert status_is_healthy(status, schema="noesis_core") is False
 
 
 async def test_status_same_name_wrong_definition_is_not_healthy():
@@ -228,7 +214,7 @@ async def test_status_same_name_wrong_definition_is_not_healthy():
     status = await get_ann_index_status(conn, schema="noesis_core")
     assert status.exists is True
     assert "vector_cosine_ops" not in (status.definition or "")
-    assert _status_is_healthy(status) is False
+    assert status_is_healthy(status, schema="noesis_core") is False
 
 
 def test_definition_rejects_wrong_atom_type_partial_predicate():

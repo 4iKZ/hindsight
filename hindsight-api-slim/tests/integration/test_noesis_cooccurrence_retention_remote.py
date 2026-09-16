@@ -26,9 +26,7 @@ import base64
 import hashlib
 import os
 import random
-import socket
 import string
-import threading
 import uuid
 from pathlib import Path
 
@@ -49,19 +47,18 @@ from hindsight_api.engine.retain.noesis_cooccurrence_retention import (  # noqa:
     check_cooccurrence_retention_ready,
     prune_cooccurrence_event_ids,
 )
+from tests.integration.noesis_remote_support import (  # noqa: E402
+    SshTunnel as _SshTunnel,
+)
+from tests.integration.noesis_remote_support import (
+    remote_enabled as _remote_enabled,
+)
 
 _EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
 _REPO_ROOT = Path(__file__).resolve().parents[4]  # wxs-noesis/
 _BASE_SQL_PATH = _REPO_ROOT / "docs" / "db" / "noesis-stage1-schema.sql"
 _SCHEMA = "noesis_core"
 _TABLES = ("events", "atoms", "anchors", "event_atoms", "cooccurrence_bitmaps", "neighbor_bitmaps")
-
-
-def _remote_enabled() -> bool:
-    return (
-        os.environ.get("NOESIS_REMOTE_TEST") == "1"
-        and all(os.environ.get(k) for k in ("NOESIS_SSH_HOST", "NOESIS_SSH_PORT", "NOESIS_SSH_USER", "NOESIS_SSH_PW"))
-    )
 
 
 requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_REMOTE_TEST/SSH env not set")
@@ -127,72 +124,6 @@ class _Remote:
 
     def close(self) -> None:
         self.sftp.close()
-        self.transport.close()
-
-
-class _SshTunnel:
-    """Minimal paramiko direct-tcpip forwarder (one local port, N sockets)."""
-
-    def __init__(self) -> None:
-        import paramiko
-
-        self.transport = paramiko.Transport((os.environ["NOESIS_SSH_HOST"], int(os.environ["NOESIS_SSH_PORT"])))
-        self.transport.start_client(timeout=20)
-        key = self.transport.get_remote_server_key()
-        fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-        if fingerprint != _EXPECTED_HOST_KEY:
-            self.transport.close()
-            raise RuntimeError("remote host key mismatch — refusing to connect")
-        self.transport.auth_password(username=os.environ["NOESIS_SSH_USER"], password=os.environ["NOESIS_SSH_PW"])
-
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))
-        self._server.listen(8)
-        self.port = self._server.getsockname()[1]
-        self._stopping = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def _serve(self) -> None:
-        while not self._stopping.is_set():
-            try:
-                client, _ = self._server.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._forward, args=(client,), daemon=True).start()
-
-    def _forward(self, client) -> None:
-        try:
-            channel = self.transport.open_channel("direct-tcpip", ("localhost", 5432), client.getsockname())
-        except Exception:
-            client.close()
-            return
-
-        def pump(src, dst):
-            try:
-                while True:
-                    data = src.recv(65536)
-                    if not data:
-                        break
-                    dst.sendall(data)
-            except OSError:
-                pass
-            finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-
-        threading.Thread(target=pump, args=(client, channel), daemon=True).start()
-        pump(channel, client)
-
-    def close(self) -> None:
-        self._stopping.set()
-        try:
-            self._server.close()
-        except OSError:
-            pass
         self.transport.close()
 
 

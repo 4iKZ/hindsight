@@ -23,12 +23,7 @@ to the source, fixtures, or logs.
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
 import math
-import os
-import socket
-import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,25 +47,23 @@ from hindsight_api.engine.retain.noesis_anchor import (  # noqa: E402
     route_anchors,
 )
 from hindsight_api.engine.retain.noesis_embedding import NoesisEmbeddingClient  # noqa: E402
+from tests.integration.noesis_remote_support import (  # noqa: E402
+    SshTunnel as _SshTunnel,
+)
+from tests.integration.noesis_remote_support import (
+    remote_enabled as _remote_enabled,
+)
 from tests.noesis_fakes import (  # noqa: E402
     FakeExtractOnceFactory,
     llm_config,
     noesis_config,
 )
 
-_EXPECTED_HOST_KEY = "SHA256:fYPgM4a2OY1ZRhdQbx2z2YjiQ9bOMx4zo/c1ewn+WCs"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _MIGRATION_003 = _REPO_ROOT / "docs" / "db" / "migrations" / "003-noesis-identity-embedding-profile.sql"
 _REAL_BGE_URL = "http://10.0.0.8:8010"
 _SCHEMA = "noesis_core"
 _TABLES = ("events", "atoms", "anchors", "event_atoms", "cooccurrence_bitmaps", "neighbor_bitmaps")
-
-
-def _remote_enabled() -> bool:
-    return (
-        os.environ.get("NOESIS_REMOTE_TEST") == "1"
-        and all(os.environ.get(k) for k in ("NOESIS_SSH_HOST", "NOESIS_SSH_PORT", "NOESIS_SSH_USER", "NOESIS_SSH_PW"))
-    )
 
 
 requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_REMOTE_TEST/SSH env not set")
@@ -80,83 +73,6 @@ requires_remote = pytest.mark.skipif(not _remote_enabled(), reason="NOESIS_REMOT
 # every remote noesis_core test must serialize under pytest-xdist (otherwise a
 # parallel sibling's visible window breaks the zero-residue assertions).
 remote_group = pytest.mark.xdist_group("noesis_remote")
-
-
-class _SshTunnel:
-    """Minimal paramiko direct-tcpip forwarder (N local ports, M sockets each).
-
-    ``remote_ports`` are forwarded from a bound local port to
-    ``localhost:<remote_port>`` on the SSH host; ``ports[remote_port]`` is the
-    matching local port. ``port`` stays the PostgreSQL alias for compatibility.
-    """
-
-    def __init__(self, remote_ports: tuple[int, ...] = (5432,)) -> None:
-        import paramiko
-
-        self._paramiko = paramiko
-        self.transport = paramiko.Transport((os.environ["NOESIS_SSH_HOST"], int(os.environ["NOESIS_SSH_PORT"])))
-        self.transport.start_client(timeout=20)
-        key = self.transport.get_remote_server_key()
-        fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-        if fingerprint != _EXPECTED_HOST_KEY:
-            self.transport.close()
-            raise RuntimeError("remote host key mismatch — refusing to connect")
-        self.transport.auth_password(username=os.environ["NOESIS_SSH_USER"], password=os.environ["NOESIS_SSH_PW"])
-
-        self._stopping = threading.Event()
-        self._servers: list[socket.socket] = []
-        self.ports: dict[int, int] = {}
-        for remote_port in remote_ports:
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(("127.0.0.1", 0))
-            server.listen(8)
-            self._servers.append(server)
-            self.ports[remote_port] = server.getsockname()[1]
-            threading.Thread(target=self._serve, args=(server, remote_port), daemon=True).start()
-        self.port = self.ports.get(5432, next(iter(self.ports.values())))
-
-    def _serve(self, server: socket.socket, remote_port: int) -> None:
-        while not self._stopping.is_set():
-            try:
-                client, _ = server.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._forward, args=(client, remote_port), daemon=True).start()
-
-    def _forward(self, client: socket.socket, remote_port: int) -> None:
-        try:
-            channel = self.transport.open_channel("direct-tcpip", ("localhost", remote_port), client.getsockname())
-        except Exception:
-            client.close()
-            return
-
-        def pump(src, dst):
-            try:
-                while True:
-                    data = src.recv(65536)
-                    if not data:
-                        break
-                    dst.sendall(data)
-            except OSError:
-                pass
-            finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
-
-        threading.Thread(target=pump, args=(client, channel), daemon=True).start()
-        pump(channel, client)
-
-    def close(self) -> None:
-        self._stopping.set()
-        for server in self._servers:
-            try:
-                server.close()
-            except OSError:
-                pass
-        self.transport.close()
 
 
 class _SingleConnAcquire:
