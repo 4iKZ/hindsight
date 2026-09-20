@@ -178,6 +178,32 @@ def build_source_envelope(*, item: NoesisInputItem, attempts: int) -> dict[str, 
     }
 
 
+def _render_extraction_text(content: str) -> str:
+    """Render Hindsight's JSON message array as plain text for extraction.
+
+    The original ``content`` remains the audit source and idempotency input.
+    Unknown JSON shapes deliberately pass through unchanged.
+    """
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return content
+    if not isinstance(payload, list) or not payload:
+        return content
+
+    rendered: list[str] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            return content
+        value = entry.get("content")
+        if not isinstance(value, str):
+            return content
+        value = value.strip()
+        if value:
+            rendered.append(value)
+    return "\n".join(rendered) if rendered else content
+
+
 # ---------------------------------------------------------------------------
 # event_time resolution (requirement 02 §9.2)
 # ---------------------------------------------------------------------------
@@ -1578,7 +1604,12 @@ async def _ingest_item(
     failures are isolated — cancellation propagates. (R02-04)"""
     try:
         try:
-            outcome = await asyncio.to_thread(extract_noesis_components, item.content, extract_once=extract_once)
+            extraction_text = _render_extraction_text(item.content)
+            outcome = await asyncio.to_thread(
+                extract_noesis_components,
+                extraction_text,
+                extract_once=extract_once,
+            )
         except Exception as error:
             logger.error("noesis extraction crashed for item %s: %s", item.item_index, type(error).__name__)
             await _item_alert_safe(

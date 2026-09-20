@@ -98,6 +98,49 @@ async def test_blank_items_skipped_without_llm_or_alerts(monkeypatch):
     assert store.events == {}
 
 
+async def test_json_message_array_renders_content_for_extraction_but_preserves_audit_source(monkeypatch):
+    original = json.dumps(
+        [
+            {
+                "role": "user",
+                "content": "用户中心登录超时",
+                "timestamp": "2026-09-20T09:00:00+08:00",
+            },
+            {
+                "role": "assistant",
+                "content": "检查 order-api-7d9c，P99 为 1.6s。",
+                "timestamp": "2026-09-20T09:00:05+08:00",
+            },
+        ],
+        ensure_ascii=False,
+    )
+    calls = patch_outcomes(monkeypatch, [outcome([golden_fact_recursive()])])
+    store = FakeStore()
+
+    await run_ingest(store, [content_item(original)], monkeypatch)
+
+    assert calls == ["用户中心登录超时\n检查 order-api-7d9c，P99 为 1.6s。"]
+    event = next(iter(store.events.values()))
+    assert event["data"]["source_text"] == original
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "普通自然语言",
+        '{"content":"不是消息数组"}',
+        '[{"role":"user","content":42}]',
+    ],
+)
+async def test_unknown_or_plain_content_passes_to_extraction_unchanged(monkeypatch, content):
+    calls = patch_outcomes(monkeypatch, [outcome()])
+    store = FakeStore()
+
+    await run_ingest(store, [content_item(content)], monkeypatch)
+
+    assert calls == [content]
+
+
 async def test_every_nonempty_item_extracted_once_with_own_envelope(monkeypatch):
     calls = patch_outcomes(monkeypatch, [outcome(), outcome(), outcome()])
     store = FakeStore()
