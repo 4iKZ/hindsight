@@ -83,7 +83,12 @@ _UNSAFE_PROVIDERS = frozenset({"gemini", "vertexai", "bedrock"})
 # top-level request-body field via ChatOpenAI's extra_body. Other model
 # families may reject the parameter, so it is only sent when the resolved
 # extraction model is a DeepSeek one.
+#
+# Max reasoning consumes completion budget before the JSON closure is emitted:
+# with the default output cap the response gets truncated mid-JSON
+# (LengthFinishReasonError), so the extraction call also raises the output cap.
 NOESIS_EXTRACT_REASONING_EFFORT = "max"
+NOESIS_EXTRACT_MAX_TOKENS = 32768
 
 
 class NoesisConfigError(Exception):
@@ -407,7 +412,12 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
         api_key=api_key,
         temperature=0,
         **(
-            {"extra_body": {"reasoning_effort": NOESIS_EXTRACT_REASONING_EFFORT}}
+            {
+                "extra_body": {
+                    "reasoning_effort": NOESIS_EXTRACT_REASONING_EFFORT,
+                    "max_tokens": NOESIS_EXTRACT_MAX_TOKENS,
+                }
+            }
             if "deepseek" in model.lower()
             else {}
         ),

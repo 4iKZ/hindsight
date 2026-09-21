@@ -3,8 +3,10 @@
 The extraction client is built through Hyper-Extract's ``create_llm`` with the
 retain LLM's provider/model. DeepSeek V4 reasoning models take an explicit
 ``reasoning_effort`` as a top-level request-body field, forwarded via
-ChatOpenAI's ``extra_body``. Non-DeepSeek models must not receive the
-parameter (they may reject it outright).
+ChatOpenAI's ``extra_body``. Max reasoning consumes completion budget before
+the JSON closure, so the call also raises ``max_tokens`` to keep the response
+from being truncated (LengthFinishReasonError). Non-DeepSeek models must not
+receive either parameter (they may reject them outright).
 """
 
 from types import SimpleNamespace
@@ -50,6 +52,7 @@ def test_deepseek_extraction_sends_reasoning_effort_max(captured_create_llm):
     assert call["spec"]["model"] == "deepseek-ai/DeepSeek-V4-Flash"
     assert call["temperature"] == 0
     assert call["extra_body"]["reasoning_effort"] == "max"
+    assert call["extra_body"]["max_tokens"] == noesis_ingest.NOESIS_EXTRACT_MAX_TOKENS
 
 
 def test_non_deepseek_extraction_does_not_send_reasoning_effort(captured_create_llm):
@@ -57,7 +60,9 @@ def test_non_deepseek_extraction_does_not_send_reasoning_effort(captured_create_
 
     assert factory is not None
     call = captured_create_llm[0]
-    assert (call.get("extra_body") or {}).get("reasoning_effort") is None
+    extra_body = call.get("extra_body") or {}
+    assert "reasoning_effort" not in extra_body
+    assert "max_tokens" not in extra_body
 
 
 def test_multi_member_chain_uses_primary_member_for_reasoning_effort(
@@ -75,7 +80,9 @@ def test_multi_member_chain_uses_primary_member_for_reasoning_effort(
     assert factory is not None
     call = captured_create_llm[0]
     assert call["spec"]["model"] == "gpt-4o-mini"
-    assert (call.get("extra_body") or {}).get("reasoning_effort") is None
+    extra_body = call.get("extra_body") or {}
+    assert "reasoning_effort" not in extra_body
+    assert "max_tokens" not in extra_body
 
 
 def test_hyperextract_create_llm_forwards_extra_body_to_chat_open_ai():
