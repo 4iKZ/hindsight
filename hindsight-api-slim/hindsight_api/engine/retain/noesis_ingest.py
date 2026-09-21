@@ -78,6 +78,13 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # yields a noesis_llm_config_invalid alert instead of a silently swapped model.
 _UNSAFE_PROVIDERS = frozenset({"gemini", "vertexai", "bedrock"})
 
+# DeepSeek V4 reasoning models accept an explicit reasoning effort and benefit
+# from "max" on the extraction path; OpenAI-compatible gateways receive it as a
+# top-level request-body field via ChatOpenAI's extra_body. Other model
+# families may reject the parameter, so it is only sent when the resolved
+# extraction model is a DeepSeek one.
+NOESIS_EXTRACT_REASONING_EFFORT = "max"
+
 
 class NoesisConfigError(Exception):
     """The retain LLM / Noesis deployment configuration cannot run extraction."""
@@ -399,6 +406,11 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
         {"provider": provider, "model": model, "base_url": base_url},
         api_key=api_key,
         temperature=0,
+        **(
+            {"extra_body": {"reasoning_effort": NOESIS_EXTRACT_REASONING_EFFORT}}
+            if "deepseek" in model.lower()
+            else {}
+        ),
     )
     return create_noesis_extractor(llm_client=client)
 
