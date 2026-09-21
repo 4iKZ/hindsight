@@ -1,12 +1,13 @@
-"""Noesis extraction LLM must send reasoning_effort=max for DeepSeek models.
+"""Noesis extraction LLM must send an elevated reasoning_effort for DeepSeek
+models.
 
 The extraction client is built through Hyper-Extract's ``create_llm`` with the
 retain LLM's provider/model. DeepSeek V4 reasoning models take an explicit
 ``reasoning_effort`` as a top-level request-body field, forwarded via
-ChatOpenAI's ``extra_body``. Max reasoning consumes completion budget before
-the JSON closure, so the call also raises ``max_tokens`` to keep the response
-from being truncated (LengthFinishReasonError). Non-DeepSeek models must not
-receive either parameter (they may reject them outright).
+ChatOpenAI's ``extra_body``. Elevated reasoning consumes completion budget
+before the JSON closure, so the call also raises ``max_tokens`` to keep the
+response from being truncated (LengthFinishReasonError). Non-DeepSeek models
+must not receive either parameter (they may reject them outright).
 """
 
 from types import SimpleNamespace
@@ -41,7 +42,7 @@ def captured_create_llm(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     return calls
 
 
-def test_deepseek_extraction_sends_reasoning_effort_max(captured_create_llm):
+def test_deepseek_extraction_sends_configured_reasoning_effort(captured_create_llm):
     factory = noesis_ingest._production_extract_once_factory(
         _llm_config("deepseek-ai/DeepSeek-V4-Flash")
     )
@@ -51,7 +52,9 @@ def test_deepseek_extraction_sends_reasoning_effort_max(captured_create_llm):
     call = captured_create_llm[0]
     assert call["spec"]["model"] == "deepseek-ai/DeepSeek-V4-Flash"
     assert call["temperature"] == 0
-    assert call["extra_body"]["reasoning_effort"] == "max"
+    assert call["extra_body"]["reasoning_effort"] == (
+        noesis_ingest.NOESIS_EXTRACT_REASONING_EFFORT
+    )
     assert call["extra_body"]["max_tokens"] == noesis_ingest.NOESIS_EXTRACT_MAX_TOKENS
 
 
@@ -95,8 +98,14 @@ def test_hyperextract_create_llm_forwards_extra_body_to_chat_open_ai():
         {"provider": "openai", "model": "deepseek-ai/DeepSeek-V4-Flash"},
         api_key="sk-test",
         temperature=0,
-        extra_body={"reasoning_effort": noesis_ingest.NOESIS_EXTRACT_REASONING_EFFORT},
+        extra_body={
+            "reasoning_effort": noesis_ingest.NOESIS_EXTRACT_REASONING_EFFORT,
+            "max_tokens": noesis_ingest.NOESIS_EXTRACT_MAX_TOKENS,
+        },
     )
     assert isinstance(llm, ChatOpenAI)
-    assert llm.extra_body == {"reasoning_effort": "max"}
-    assert llm._default_params["extra_body"] == {"reasoning_effort": "max"}
+    assert llm.extra_body == {
+        "reasoning_effort": noesis_ingest.NOESIS_EXTRACT_REASONING_EFFORT,
+        "max_tokens": noesis_ingest.NOESIS_EXTRACT_MAX_TOKENS,
+    }
+    assert llm._default_params["extra_body"] == llm.extra_body

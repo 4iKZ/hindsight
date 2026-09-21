@@ -79,15 +79,17 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _UNSAFE_PROVIDERS = frozenset({"gemini", "vertexai", "bedrock"})
 
 # DeepSeek V4 reasoning models accept an explicit reasoning effort and benefit
-# from "max" on the extraction path; OpenAI-compatible gateways receive it as a
-# top-level request-body field via ChatOpenAI's extra_body. Other model
-# families may reject the parameter, so it is only sent when the resolved
-# extraction model is a DeepSeek one.
+# from an elevated effort on the extraction path; OpenAI-compatible gateways
+# receive it as a top-level request-body field via ChatOpenAI's extra_body.
+# Other model families may reject the parameter, so it is only sent when the
+# resolved extraction model is a DeepSeek one.
 #
-# Max reasoning consumes completion budget before the JSON closure is emitted:
-# with the default output cap the response gets truncated mid-JSON
-# (LengthFinishReasonError), so the extraction call also raises the output cap.
-NOESIS_EXTRACT_REASONING_EFFORT = "max"
+# Effort is pinned to "high": "max" was measured on the production gateway at
+# 15+ minutes per extraction call (unusable for the synchronous retain path)
+# and, before the output cap below, truncated the closure mid-JSON
+# (LengthFinishReasonError). The output cap stays in place so the longer
+# reasoning plus the JSON closure fit the gateway's output budget.
+NOESIS_EXTRACT_REASONING_EFFORT = "high"
 NOESIS_EXTRACT_MAX_TOKENS = 32768
 
 
