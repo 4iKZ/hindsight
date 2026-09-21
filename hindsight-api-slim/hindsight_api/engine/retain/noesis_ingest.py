@@ -1628,10 +1628,11 @@ async def _ingest_item(
         pool = await _acquire_pool(config, pool_factory)
         envelope = build_source_envelope(item=item, attempts=outcome.attempts)
         for alert in outcome.alerts:
+            alert_details = alert.details or {}
             await _write_alert_safe(
                 pool, schema, item, stage=alert.stage, alert_code=alert.alert_code, severity=alert.severity,
-                message=alert.message, component_index=None, event_id=None,
-                details={**envelope, **(alert.details or {})},
+                message=alert.message, component_index=alert_details.get("component_index"), event_id=None,
+                details={**envelope, **alert_details},
             )
         for component_index, component in enumerate(outcome.components):
             if component.utterance_type == "hypothesis":

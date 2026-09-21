@@ -11,6 +11,7 @@ import json
 from datetime import UTC, datetime
 
 import pytest
+from hyperextract.noesis import ExtractionAlert
 
 import hindsight_api.engine.retain.noesis_ingest as noesis_ingest
 from hindsight_api.engine.retain.noesis_ingest import ingest_noesis_batch
@@ -315,6 +316,38 @@ async def test_hyper_extract_alerts_mapped_with_safe_envelope(monkeypatch):
     assert len(envelope["content_sha256"]) == 64
     # original HE alert details preserved
     assert envelope["rule"] == "closure"
+
+
+async def test_component_rejections_keep_distinct_alerts_and_clean_sibling(monkeypatch):
+    rejected = [
+        ExtractionAlert(
+            stage="hyper_extract",
+            alert_code="invalid_component_dropped",
+            severity="warning",
+            message="entity atom resembles a complete proposition",
+            details={
+                "component_index": index,
+                "rule": "entity_clause_shape",
+                "atom_positions": [3],
+                "signals": ["entity_contains_clause_cue"],
+            },
+        )
+        for index in (0, 2)
+    ]
+    patch_outcomes(
+        monkeypatch,
+        [outcome([golden_fact_recursive()], alerts=rejected, attempts=2)],
+    )
+    store = FakeStore()
+
+    await run_ingest(store, [content_item()], monkeypatch)
+
+    alerts = store.alerts_by_code("invalid_component_dropped")
+    assert len(alerts) == 2
+    assert {alert["details"]["component_index"] for alert in alerts} == {0, 2}
+    assert all(alert["event_id"] is None for alert in alerts)
+    assert all(alert["details"]["attempts"] == 2 for alert in alerts)
+    assert len(store.events) == 1
 
 
 async def test_extraction_failure_alert_and_isolation(monkeypatch):
