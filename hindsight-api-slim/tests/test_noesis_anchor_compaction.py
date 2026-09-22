@@ -138,6 +138,21 @@ def test_missing_exemplar_uses_forced_geometry_fallback():
     assert plans[0].evidence.forced is True
 
 
+def test_no_dotted_control_marks_every_pair_forced():
+    plans = plan_atom_compaction(
+        atom_type="E",
+        atom_text="苹果",
+        anchors=[anchor(1, 2, 0.0), anchor(2, 1, 0.01)],
+        neighbors={1: {"N": {10}}, 2: {"N": {10, 11}}},
+        exemplars={1: ["吃苹果"], 2: ["削苹果"]},
+        max_active=1,
+        dotted_scorer=None,
+    )
+    assert len(plans) == 1
+    assert plans[0].evidence.forced is True
+    assert plans[0].evidence.dotted_score == 0.0
+
+
 def test_dotted_total_failure_is_fail_closed():
     def unavailable(*_args):
         raise DottedUnavailableError("model unavailable")

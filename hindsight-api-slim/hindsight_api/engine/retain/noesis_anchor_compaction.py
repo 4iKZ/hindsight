@@ -309,10 +309,12 @@ def plan_atom_compaction(
                 for value in current_exemplars.get(right_id, [])
                 if _mark_single_occurrence(value, atom_text) is not None
             ]
-            forced = not left_examples or not right_examples
+            forced = dotted_scorer is None or not left_examples or not right_examples
             pending.append((left_id, right_id, left_examples, right_examples, forced))
         scoreable = [(left, right) for _, _, left, right, forced in pending if not forced]
-        if hasattr(dotted_scorer, "score_many"):
+        if dotted_scorer is None:
+            scored = iter(())
+        elif hasattr(dotted_scorer, "score_many"):
             scored = iter(dotted_scorer.score_many(atom_text, scoreable))
         else:
             scored = iter(dotted_scorer(atom_text, left, right) for left, right in scoreable)
@@ -718,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dotted-model",
         default="/data/models/lopentu__google-bert-bert-base-chinese-DottedWSD",
     )
+    parser.add_argument(
+        "--no-dotted",
+        action="store_true",
+        help="control run: rank pairs by Neighbor Jaccard + centroid alone",
+    )
     return parser
 
 
@@ -727,7 +734,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     )
     pool = await asyncpg.create_pool(to_libpq_url(database_url), min_size=1, max_size=2)
     try:
-        scorer = DottedWSDScorer(args.dotted_model)
+        scorer = None if args.no_dotted else DottedWSDScorer(args.dotted_model)
         result = await run_compaction(
             pool,
             schema=args.schema,
