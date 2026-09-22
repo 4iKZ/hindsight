@@ -147,16 +147,26 @@ class DottedWSDScorer:
     """Lazy, offline-only Dotted-WSD pair scorer used by the background CLI."""
 
     def __init__(self, model_dir: str | Path, *, device: str = "cpu") -> None:
+        self._model_dir = Path(model_dir)
+        self._device = device
+        self._model: Any | None = None
+        self._tokenizer: Any | None = None
+        self._torch: Any | None = None
+        self._yes_index: int | None = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
         try:
             import torch
             from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            path = Path(model_dir)
-            self._tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
-            self._model = AutoModelForSequenceClassification.from_pretrained(path, local_files_only=True).to(device)
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_dir, local_files_only=True)
+            self._model = AutoModelForSequenceClassification.from_pretrained(self._model_dir, local_files_only=True).to(
+                self._device
+            )
             self._model.eval()
             self._torch = torch
-            self._device = device
             labels = getattr(self._model.config, "id2label", {}) or {}
             self._yes_index = next(
                 (
@@ -173,6 +183,11 @@ class DottedWSDScorer:
         return self.score_many(word, [(left, right)])[0]
 
     def score_many(self, word: str, pairs: Sequence[tuple[Sequence[str], Sequence[str]]]) -> list[float]:
+        self._ensure_loaded()
+        assert self._tokenizer is not None
+        assert self._model is not None
+        assert self._torch is not None
+        assert self._yes_index is not None
         contexts: list[str] = []
         candidates: list[str] = []
         owners: list[int] = []

@@ -8,6 +8,7 @@ import pytest
 from hindsight_api.engine.retain.noesis_anchor_compaction import (
     AnchorSnapshot,
     DottedUnavailableError,
+    DottedWSDScorer,
     PairEvidence,
     apply_merge,
     choose_survivor,
@@ -51,6 +52,11 @@ def test_dotted_score_is_symmetric_median():
     assert combine_dotted_scores([0.9, 0.8, 0.1, 0.2]) == pytest.approx(0.5)
     with pytest.raises(DottedUnavailableError):
         combine_dotted_scores([])
+
+
+def test_dotted_model_loading_is_lazy_for_empty_compaction_runs():
+    scorer = DottedWSDScorer("/definitely/not/a/model")
+    assert scorer._model is None
 
 
 def test_pair_ranking_uses_dotted_then_jaccard_distance_and_ids():
