@@ -19,11 +19,12 @@ from hindsight_api.engine.retain.noesis_anchor import (
     AnchorFrameError,
     AnchorPlan,
     AnchorRouteError,
+    AnchorRoutingPolicy,
     OccurrenceRoute,
     PredicateFrame,
     assign_occurrence_frames,
     build_predicate_frames,
-    ema_centroid,
+    incremental_centroid,
     parse_centroid_text,
     plan_anchor_routing,
     prepare_context_vectors,
@@ -64,7 +65,9 @@ def fact(atoms):
             "atoms": atoms,
             "tree": {
                 "predicate": root["text"],
-                "agent": [{"text": a["text"], "modifier": [], "implied": False} for a in direct if a["role"] == "agent"],
+                "agent": [
+                    {"text": a["text"], "modifier": [], "implied": False} for a in direct if a["role"] == "agent"
+                ],
                 "patient": [
                     {"text": a["text"], "modifier": [], "implied": False} for a in direct if a["role"] == "patient"
                 ],
@@ -118,8 +121,13 @@ def member_tuples(plan):
     ]
 
 
-async def route(store, *, atom_ids, plan, context_vectors):
-    return await route_anchors(FakeConn(store), SCHEMA, atom_ids=atom_ids, plan=plan, context_vectors=context_vectors)
+async def route(store, *, atom_ids, plan, context_vectors, policy=None):
+    kwargs = {}
+    if policy is not None:
+        kwargs["policy"] = policy
+    return await route_anchors(
+        FakeConn(store), SCHEMA, atom_ids=atom_ids, plan=plan, context_vectors=context_vectors, **kwargs
+    )
 
 
 def anchor_sql_calls(store):
@@ -504,7 +512,10 @@ async def test_no_active_anchor_creates_with_count_one():
     plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
 
     routes = await route(
-        store, atom_ids={("苹果", "E"): atom_id}, plan=plan, context_vectors={"妈妈 买 苹果": list(basis(0))}
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(0))},
     )
 
     assert set(routes) == {(atom_id, 4)}
@@ -525,6 +536,14 @@ def test_reuse_gate_is_cosine_distance_not_similarity():
     assert should_reuse(0.75) is False  # 0.75 as a distance is far beyond the gate
 
 
+def test_reuse_gate_requires_top1_top2_margin_when_two_candidates_exist():
+    policy = AnchorRoutingPolicy(reuse_max_distance=0.25, reuse_min_margin=0.02)
+
+    assert should_reuse(0.10, second_distance=0.13, policy=policy) is True
+    assert should_reuse(0.10, second_distance=0.119, policy=policy) is False
+    assert should_reuse(0.10, second_distance=None, policy=policy) is True
+
+
 def test_cosine_distance_exactly_threshold_reuses():
     # cosine distance exactly 0.25 (similarity exactly 0.75) is a reuse — the
     # boundary is inclusive; asserted on the pure gate to avoid fp jitter.
@@ -541,7 +560,10 @@ async def test_distance_slightly_above_threshold_creates_new():
     plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
 
     routes = await route(
-        store, atom_ids={("苹果", "E"): atom_id}, plan=plan, context_vectors={"妈妈 买 苹果": list(basis(0))}
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(0))},
     )
 
     # orthogonal context (cosine distance 1.0) → a new anchor; existing untouched
@@ -574,7 +596,11 @@ async def test_distance_tie_smallest_anchor_id_wins():
     plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
 
     routes = await route(
-        store, atom_ids={("苹果", "E"): atom_id}, plan=plan, context_vectors={"妈妈 买 苹果": list(basis(0))}
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(0))},
+        policy=AnchorRoutingPolicy(reuse_min_margin=0.0),
     )
 
     assert first < second  # seeded ascending
@@ -603,14 +629,66 @@ async def test_dormant_and_merged_status_excluded_from_routing():
     assert store.anchors[merged]["total_count"] == 0
 
 
-def test_ema_centroid_exact_weights():
+def test_incremental_centroid_uses_total_count_as_sample_weight():
     old = [10.0] * DIMENSION
     context = [20.0] * DIMENSION
-    assert ema_centroid(old, context) == [0.9 * 10.0 + 0.1 * 20.0] * DIMENSION
-    assert ema_centroid([0.0] * DIMENSION, [1.0] * DIMENSION) == [0.1] * DIMENSION
+    assert incremental_centroid(old, context, total_count=3) == [12.5] * DIMENSION
+    assert incremental_centroid([0.0] * DIMENSION, [1.0] * DIMENSION, total_count=1) == [0.5] * DIMENSION
 
     with pytest.raises(AnchorRouteError):
-        ema_centroid([0.0] * 512, [0.0] * 512)  # wrong dimension
+        incremental_centroid([0.0] * 512, [0.0] * 512, total_count=1)
+    with pytest.raises(AnchorRouteError):
+        incremental_centroid(old, context, total_count=0)
+
+
+async def test_small_margin_creates_while_below_cap():
+    store = FakeStore()
+    atom_id = seed_atom(store, "苹果", "E")
+    store.seed_anchor(atom_id, basis(0), total_count=3)
+    store.seed_anchor(atom_id, basis(0), total_count=2)
+    plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
+
+    routes = await route(
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(0))},
+        policy=AnchorRoutingPolicy(max_active=5),
+    )
+
+    assert len(store.anchors_rows()) == 3
+    assert store.anchors[routes[(atom_id, 4)]]["total_count"] == 1
+
+
+async def test_cap_allows_one_overflow_anchor_then_forces_nearest_reuse():
+    store = FakeStore()
+    atom_id = seed_atom(store, "苹果", "E")
+    for index in range(5):
+        store.seed_anchor(atom_id, basis(index), total_count=index + 1)
+    plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
+    policy = AnchorRoutingPolicy(reuse_max_distance=0.15, reuse_min_margin=0.02, max_active=5, max_overflow=1)
+
+    first = await route(
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(10))},
+        policy=policy,
+    )
+    overflow_id = first[(atom_id, 4)]
+    assert len([row for row in store.anchors_rows() if row["status"] == "A"]) == 6
+    assert store.anchors[overflow_id]["total_count"] == 1
+
+    second = await route(
+        store,
+        atom_ids={("苹果", "E"): atom_id},
+        plan=plan,
+        context_vectors={"妈妈 买 苹果": list(basis(11))},
+        policy=policy,
+    )
+    assert len([row for row in store.anchors_rows() if row["status"] == "A"]) == 6
+    assert second[(atom_id, 4)] in store.anchors
+    assert sum(row["total_count"] for row in store.anchors_rows()) == 17
 
 
 async def test_hit_increments_total_count():

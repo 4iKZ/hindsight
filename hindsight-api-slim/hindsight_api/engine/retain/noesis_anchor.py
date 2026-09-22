@@ -4,13 +4,14 @@ Focused module for the pipeline stage between the atom upsert and the
 ``event_atoms`` insert: predicate-frame construction and the occurrence →
 frame mapping over ``target_occ`` (requirement 05 §5), Context Vector
 preparation, and the in-transaction Anchor SQL routing — nearest-active reuse,
-immediate create, EMA centroid update, and strict vector parsing (§6). The
+immediate create, cumulative-mean centroid update, and strict vector parsing (§6). The
 public API and the docstring contracts below are frozen by
 ``tests/test_noesis_anchor_routing.py``.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -19,19 +20,25 @@ from typing import Any, Literal
 # ``distance <= REUSE_MAX_DISTANCE``, i.e. cosine similarity >= 0.75.
 # 0.75 must NEVER be used as a distance threshold.
 REUSE_MAX_DISTANCE = 0.25
+REUSE_MIN_MARGIN = 0.02
+MAX_ACTIVE_ANCHORS = 5
+MAX_OVERFLOW_ANCHORS = 1
+
+logger = logging.getLogger(__name__)
 
 # Anchor routing SQL (requirement 05 §6.3–§6.6). ``{s}`` is the schema
 # placeholder filled by the local ``_sql`` helper; the statement shapes are
 # frozen by the docstrings below and by the fake-store dispatch in
 # ``tests/noesis_fakes.py``.
 _ATOM_LOCK_SQL = "SELECT atom_id FROM {s}.atoms WHERE atom_id = $1 FOR UPDATE"
-_NEAREST_ANCHOR_SQL = (
-    "SELECT anchor_id, centroid_vector::text AS centroid_text, "
+_NEAREST_ANCHORS_SQL = (
+    "SELECT anchor_id, centroid_vector::text AS centroid_text, total_count, "
+    "count(*) OVER () AS active_count, "
     "(centroid_vector <=> $2::vector) AS distance "
     "FROM {s}.anchors WHERE atom_id = $1 AND status = 'A' "
-    "ORDER BY distance, anchor_id LIMIT 1"
+    "ORDER BY distance, anchor_id LIMIT 2"
 )
-_ANCHOR_EMA_UPDATE_SQL = (
+_ANCHOR_CENTROID_UPDATE_SQL = (
     "UPDATE {s}.anchors SET centroid_vector = $2::vector, "
     "total_count = total_count + 1, updated_at = now() "
     "WHERE anchor_id = $1"
@@ -55,7 +62,27 @@ class AnchorFrameError(Exception):
 
 
 class AnchorRouteError(Exception):
-    """Anchor SQL, vector parse, or EMA failure inside the fact transaction."""
+    """Anchor SQL, vector parse, or centroid-update failure inside the fact transaction."""
+
+
+@dataclass(frozen=True)
+class AnchorRoutingPolicy:
+    """Static deployment policy for one online Anchor routing decision."""
+
+    reuse_max_distance: float = REUSE_MAX_DISTANCE
+    reuse_min_margin: float = REUSE_MIN_MARGIN
+    max_active: int = MAX_ACTIVE_ANCHORS
+    max_overflow: int = MAX_OVERFLOW_ANCHORS
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.reuse_max_distance) or not 0.0 <= self.reuse_max_distance <= 2.0:
+            raise ValueError("reuse_max_distance must be finite and between 0 and 2")
+        if not math.isfinite(self.reuse_min_margin) or not 0.0 <= self.reuse_min_margin <= 2.0:
+            raise ValueError("reuse_min_margin must be finite and between 0 and 2")
+        if self.max_active < 1:
+            raise ValueError("max_active must be at least 1")
+        if self.max_overflow != 1:
+            raise ValueError("max_overflow is frozen to 1")
 
 
 @dataclass(frozen=True)
@@ -130,11 +157,7 @@ def _validate_closure(by_pos: dict[int, Any]) -> None:
     self-points or cycles.
     """
     roots = sorted(
-        (
-            atom
-            for atom in by_pos.values()
-            if atom.role == "predicate" and atom.type == "P" and atom.target_occ is None
-        ),
+        (atom for atom in by_pos.values() if atom.role == "predicate" and atom.type == "P" and atom.target_occ is None),
         key=lambda atom: atom.pos,
     )
     if len(roots) != 1:
@@ -270,12 +293,7 @@ def assign_occurrence_frames(atoms: Any, frames: dict[int, PredicateFrame]) -> d
             occurrence_frames[atom.pos] = atom.pos
         elif atom.role in ("agent", "patient"):
             target = atom.target_occ
-            if (
-                target is None
-                or target not in by_pos
-                or by_pos[target].role != "predicate"
-                or target not in frames
-            ):
+            if target is None or target not in by_pos or by_pos[target].role != "predicate" or target not in frames:
                 raise AnchorFrameError(
                     f"{atom.role} pos {atom.pos} does not target a framed predicate",
                     predicate_pos=target,
@@ -364,13 +382,22 @@ def plan_anchor_routing(atoms: Any) -> AnchorPlan:
     )
 
 
-def should_reuse(distance: float) -> bool:
-    """Cosine-distance reuse gate: ``distance <= REUSE_MAX_DISTANCE`` (inclusive).
+def should_reuse(
+    distance: float,
+    *,
+    second_distance: float | None = None,
+    policy: AnchorRoutingPolicy | None = None,
+) -> bool:
+    """Accept a close, unambiguous nearest Anchor.
 
-    Equivalent to cosine similarity >= 0.75; 0.75 itself is never used as a
-    distance threshold.
+    A single candidate only needs the absolute distance gate. With two or more
+    candidates the nearest must additionally lead the runner-up by the frozen
+    relative margin.
     """
-    return distance <= REUSE_MAX_DISTANCE
+    effective = policy or AnchorRoutingPolicy()
+    if distance > effective.reuse_max_distance:
+        return False
+    return second_distance is None or second_distance - distance >= effective.reuse_min_margin
 
 
 def parse_centroid_text(text: str, dimension: int = 1024) -> list[float]:
@@ -410,16 +437,14 @@ def _ensure_finite_vector(vector: Any, *, what: str) -> None:
             raise AnchorRouteError(f"{what} contains a non-finite component")
 
 
-def ema_centroid(old: list[float], context: list[float]) -> list[float]:
-    """Frozen EMA: ``new[i] = 0.9 * old[i] + 0.1 * context[i]`` (§6.5).
-
-    Both inputs must be 1024-dimension finite float lists, otherwise
-    :class:`AnchorRouteError`. The result is not normalized and is not a
-    cumulative average over ``total_count``.
-    """
+def incremental_centroid(old: list[float], context: list[float], *, total_count: int) -> list[float]:
+    """Update a centroid with the exact cumulative mean over routed samples."""
     _ensure_finite_vector(old, what="old centroid")
     _ensure_finite_vector(context, what="context vector")
-    return [0.9 * old_value + 0.1 * context_value for old_value, context_value in zip(old, context)]
+    if total_count < 1:
+        raise AnchorRouteError(f"anchor total_count must be positive, got {total_count}")
+    denominator = total_count + 1
+    return [(total_count * old_value + context_value) / denominator for old_value, context_value in zip(old, context)]
 
 
 async def prepare_context_vectors(client: Any, plan: AnchorPlan) -> dict[str, list[float]]:
@@ -454,6 +479,7 @@ async def route_anchors(
     atom_ids: dict[tuple[str, str], int],
     plan: AnchorPlan,
     context_vectors: dict[str, list[float]],
+    policy: AnchorRoutingPolicy | None = None,
 ) -> dict[tuple[int, int], int]:
     """Route every ``(atom_id, frame_pos)`` of the plan inside the fact transaction.
 
@@ -463,7 +489,7 @@ async def route_anchors(
     (``SELECT atom_id FROM {schema}.atoms WHERE atom_id = $1 FOR UPDATE``):
     query the nearest active anchor
     (``centroid_vector <=> $2::vector``, ties broken by ``anchor_id ASC``);
-    when :func:`should_reuse` accepts the distance, update it with the EMA
+    when :func:`should_reuse` accepts the distance, update it with the cumulative mean
     centroid (``UPDATE {schema}.anchors SET centroid_vector = $2::vector,
     total_count = total_count + 1, updated_at = now() WHERE anchor_id = $1``);
     otherwise insert immediately (``INSERT INTO {schema}.anchors (atom_id,
@@ -474,6 +500,7 @@ async def route_anchors(
     once (requirement 05 §5.6).
     """
     routes: dict[tuple[int, int], int] = {}
+    effective_policy = policy or AnchorRoutingPolicy()
     try:
         entries: dict[tuple[int, int], str] = {}
         for occurrence in plan.occurrences:
@@ -487,11 +514,31 @@ async def route_anchors(
             locked = await conn.fetchrow(_sql(schema, _ATOM_LOCK_SQL), atom_id)
             if locked is None:
                 raise AnchorRouteError(f"atom {atom_id} row missing under FOR UPDATE lock")
-            row = await conn.fetchrow(_sql(schema, _NEAREST_ANCHOR_SQL), atom_id, literal)
-            if row is not None and should_reuse(row["distance"]):
-                anchor_id = row["anchor_id"]
-                updated = ema_centroid(parse_centroid_text(row["centroid_text"]), context)
-                await conn.execute(_sql(schema, _ANCHOR_EMA_UPDATE_SQL), anchor_id, vector_literal(updated))
+            rows = list(await conn.fetch(_sql(schema, _NEAREST_ANCHORS_SQL), atom_id, literal))
+            nearest = rows[0] if rows else None
+            second_distance = float(rows[1]["distance"]) if len(rows) > 1 else None
+            reuse = nearest is not None and should_reuse(
+                float(nearest["distance"]), second_distance=second_distance, policy=effective_policy
+            )
+            active_count = int(nearest["active_count"]) if nearest is not None else 0
+            forced = (
+                nearest is not None
+                and not reuse
+                and active_count >= (effective_policy.max_active + effective_policy.max_overflow)
+            )
+            if reuse or forced:
+                anchor_id = int(nearest["anchor_id"])
+                updated = incremental_centroid(
+                    parse_centroid_text(nearest["centroid_text"]),
+                    context,
+                    total_count=int(nearest["total_count"]),
+                )
+                await conn.execute(_sql(schema, _ANCHOR_CENTROID_UPDATE_SQL), anchor_id, vector_literal(updated))
+                if forced:
+                    logger.warning(
+                        "noesis anchor cap forced reuse",
+                        extra={"atom_id": atom_id, "anchor_id": anchor_id, "active_count": active_count},
+                    )
             else:
                 inserted = await conn.fetchrow(_sql(schema, _ANCHOR_INSERT_SQL), atom_id, literal)
                 anchor_id = inserted["anchor_id"]

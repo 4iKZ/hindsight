@@ -567,6 +567,7 @@ async def test_anchor_sql_runs_only_inside_transaction(monkeypatch):
     store = FakeStore()
     anchor_sql_depths: list[int] = []
     original_fetchrow = store.fetchrow
+    original_fetch = store.fetch
     original_execute = store.execute
 
     async def spy_fetchrow(sql, *args):
@@ -579,7 +580,13 @@ async def test_anchor_sql_runs_only_inside_transaction(monkeypatch):
             anchor_sql_depths.append(store._tx_depth)
         return await original_execute(sql, *args)
 
+    async def spy_fetch(sql, *args):
+        if ".anchors" in sql or "FOR UPDATE" in sql:
+            anchor_sql_depths.append(store._tx_depth)
+        return await original_fetch(sql, *args)
+
     store.fetchrow = spy_fetchrow
+    store.fetch = spy_fetch
     store.execute = spy_execute
     await run(store, one_fact_contents(), [golden_fact_time()])
 

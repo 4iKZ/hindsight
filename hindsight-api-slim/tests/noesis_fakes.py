@@ -7,7 +7,7 @@ precheck, atom upsert, event_atoms insert, alert insert, embedding profile
 gate). Transaction rollback is emulated with snapshots so the failure-injection
 tests can prove zero-half-state. Requirement 03 adds the identity-vector
 embedding/profile emulation; requirement 05 adds the anchors emulation (atom
-row locks, nearest-active cosine query, insert-with-count-1, EMA update,
+row locks, nearest-active cosine query, insert-with-count-1, cumulative-mean update,
 transaction snapshots) and the unified ``FakeEmbeddingClient`` bge stand-in
 (``embed_identity`` + ``embed_context``). Requirement 06 adds the two
 write-maintenance bitmap tables (set-based ``rb64_build``/``rb64_or`` upserts
@@ -184,6 +184,10 @@ def noesis_config(**overrides: Any) -> SimpleNamespace:
         noesis_pool_min_size=1,
         noesis_pool_max_size=5,
         noesis_command_timeout=10,
+        noesis_anchor_reuse_max_distance=0.25,
+        noesis_anchor_reuse_min_margin=0.02,
+        noesis_anchor_max_active=5,
+        noesis_anchor_max_overflow=1,
         # Requirement 03 embedding fields: deliberately NOT the production
         # defaults, so a default leak would be visible in assertions.
         noesis_embedding_base_url="http://identity.test",
@@ -301,6 +305,8 @@ class FakeStore:
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self._maybe_fail(sql)
         self.calls.append(("fetch", sql, args))
+        if ".anchors" in sql and "<=>" in sql:
+            return self._nearest_anchors(args)
         if "unnest" in sql:
             texts, atom_types = args[0], args[1]
             return [self._atom_state_row(text, atom_type) for text, atom_type in zip(texts, atom_types)]
@@ -670,28 +676,31 @@ class FakeStore:
         }
         return {"anchor_id": anchor_id}
 
-    def _nearest_anchor(self, args: tuple) -> dict[str, Any] | None:
-        # Nearest active anchor of the atom by pgvector cosine distance, with
-        # the frozen (distance, anchor_id) ascending tie-break.
+    def _nearest_anchors(self, args: tuple) -> list[dict[str, Any]]:
+        # Two nearest active anchors plus the full active count.
         atom_id, vector_literal = args[0], args[1]
         query = _parse_vector_literal(vector_literal)
         if query is None:
             raise InjectedFailure("pgvector dimension reject")
-        best: tuple[int, float, tuple[float, ...]] | None = None
+        candidates: list[tuple[int, float, tuple[float, ...], int]] = []
         for anchor_id, anchor in self.anchors.items():
             if anchor["atom_id"] != atom_id or anchor["status"] != "A":
                 continue
-            candidate = (anchor_id, _cosine_distance(query, anchor["centroid"]), anchor["centroid"])
-            if best is None or (candidate[1], candidate[0]) < (best[1], best[0]):
-                best = candidate
-        if best is None:
-            return None
-        anchor_id, distance, centroid = best
-        return {
-            "anchor_id": anchor_id,
-            "centroid_text": _format_vector_literal(centroid),
-            "distance": distance,
-        }
+            candidates.append(
+                (anchor_id, _cosine_distance(query, anchor["centroid"]), anchor["centroid"], anchor["total_count"])
+            )
+        candidates.sort(key=lambda candidate: (candidate[1], candidate[0]))
+        active_count = len(candidates)
+        return [
+            {
+                "anchor_id": anchor_id,
+                "centroid_text": _format_vector_literal(centroid),
+                "total_count": total_count,
+                "active_count": active_count,
+                "distance": distance,
+            }
+            for anchor_id, distance, centroid, total_count in candidates[:2]
+        ]
 
     def _ema_update_anchor(self, args: tuple) -> str:
         # UPDATE ... SET centroid_vector = $2::vector, total_count = total_count + 1

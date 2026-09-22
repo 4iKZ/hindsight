@@ -899,6 +899,10 @@ ENV_NOESIS_TIMEZONE = "HINDSIGHT_API_NOESIS_TIMEZONE"
 ENV_NOESIS_POOL_MIN_SIZE = "HINDSIGHT_API_NOESIS_POOL_MIN_SIZE"
 ENV_NOESIS_POOL_MAX_SIZE = "HINDSIGHT_API_NOESIS_POOL_MAX_SIZE"
 ENV_NOESIS_COMMAND_TIMEOUT = "HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT"
+ENV_NOESIS_ANCHOR_REUSE_MAX_DISTANCE = "HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE"
+ENV_NOESIS_ANCHOR_REUSE_MIN_MARGIN = "HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN"
+ENV_NOESIS_ANCHOR_MAX_ACTIVE = "HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE"
+ENV_NOESIS_ANCHOR_MAX_OVERFLOW = "HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW"
 
 # Noesis identity embedding service (requirement 03 §10.1). The switchable
 # bge-m3 identity-vector service; the model/revision/dimension triple forms
@@ -1615,6 +1619,10 @@ DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
 DEFAULT_NOESIS_POOL_MIN_SIZE = 1
 DEFAULT_NOESIS_POOL_MAX_SIZE = 5
 DEFAULT_NOESIS_COMMAND_TIMEOUT = 10
+DEFAULT_NOESIS_ANCHOR_REUSE_MAX_DISTANCE = 0.25
+DEFAULT_NOESIS_ANCHOR_REUSE_MIN_MARGIN = 0.02
+DEFAULT_NOESIS_ANCHOR_MAX_ACTIVE = 5
+DEFAULT_NOESIS_ANCHOR_MAX_OVERFLOW = 1
 
 # Noesis identity embedding service defaults (requirement 03 §10.1). The
 # revision is the operations-auditable weight/pooling generation identifier;
@@ -2876,6 +2884,10 @@ class HindsightConfig:
     noesis_pool_min_size: int = DEFAULT_NOESIS_POOL_MIN_SIZE
     noesis_pool_max_size: int = DEFAULT_NOESIS_POOL_MAX_SIZE
     noesis_command_timeout: int = DEFAULT_NOESIS_COMMAND_TIMEOUT
+    noesis_anchor_reuse_max_distance: float = DEFAULT_NOESIS_ANCHOR_REUSE_MAX_DISTANCE
+    noesis_anchor_reuse_min_margin: float = DEFAULT_NOESIS_ANCHOR_REUSE_MIN_MARGIN
+    noesis_anchor_max_active: int = DEFAULT_NOESIS_ANCHOR_MAX_ACTIVE
+    noesis_anchor_max_overflow: int = DEFAULT_NOESIS_ANCHOR_MAX_OVERFLOW
     # Noesis identity embedding service (requirement 03 §10.1). Drives the
     # bge embedding client in engine/retain/noesis_embedding.py.
     noesis_embedding_base_url: str = DEFAULT_NOESIS_EMBEDDING_BASE_URL
@@ -3323,6 +3335,25 @@ class HindsightConfig:
         if self.noesis_command_timeout <= 0:
             raise ValueError(
                 f"noesis_command_timeout must be > 0, got {self.noesis_command_timeout}"
+            )
+        if not 0.0 <= self.noesis_anchor_reuse_max_distance <= 2.0:
+            raise ValueError(
+                "noesis_anchor_reuse_max_distance must be between 0 and 2, got "
+                f"{self.noesis_anchor_reuse_max_distance}"
+            )
+        if not 0.0 <= self.noesis_anchor_reuse_min_margin <= 2.0:
+            raise ValueError(
+                "noesis_anchor_reuse_min_margin must be between 0 and 2, got "
+                f"{self.noesis_anchor_reuse_min_margin}"
+            )
+        if self.noesis_anchor_max_active < 1:
+            raise ValueError(
+                f"noesis_anchor_max_active must be at least 1, got {self.noesis_anchor_max_active}"
+            )
+        if self.noesis_anchor_max_overflow != 1:
+            raise ValueError(
+                "noesis_anchor_max_overflow is frozen to 1, got "
+                f"{self.noesis_anchor_max_overflow}"
             )
 
         # Noesis identity embedding service fail-fast validation (requirement
@@ -4311,6 +4342,21 @@ class HindsightConfig:
             noesis_pool_min_size=int(os.getenv(ENV_NOESIS_POOL_MIN_SIZE, str(DEFAULT_NOESIS_POOL_MIN_SIZE))),
             noesis_pool_max_size=int(os.getenv(ENV_NOESIS_POOL_MAX_SIZE, str(DEFAULT_NOESIS_POOL_MAX_SIZE))),
             noesis_command_timeout=int(os.getenv(ENV_NOESIS_COMMAND_TIMEOUT, str(DEFAULT_NOESIS_COMMAND_TIMEOUT))),
+            noesis_anchor_reuse_max_distance=float(
+                os.getenv(
+                    ENV_NOESIS_ANCHOR_REUSE_MAX_DISTANCE,
+                    str(DEFAULT_NOESIS_ANCHOR_REUSE_MAX_DISTANCE),
+                )
+            ),
+            noesis_anchor_reuse_min_margin=float(
+                os.getenv(ENV_NOESIS_ANCHOR_REUSE_MIN_MARGIN, str(DEFAULT_NOESIS_ANCHOR_REUSE_MIN_MARGIN))
+            ),
+            noesis_anchor_max_active=int(
+                os.getenv(ENV_NOESIS_ANCHOR_MAX_ACTIVE, str(DEFAULT_NOESIS_ANCHOR_MAX_ACTIVE))
+            ),
+            noesis_anchor_max_overflow=int(
+                os.getenv(ENV_NOESIS_ANCHOR_MAX_OVERFLOW, str(DEFAULT_NOESIS_ANCHOR_MAX_OVERFLOW))
+            ),
             # Noesis identity embedding service (trailing "/" on base_url is
             # normalized away at parse time — requirement 03 §10.1)
             noesis_embedding_base_url=os.getenv(

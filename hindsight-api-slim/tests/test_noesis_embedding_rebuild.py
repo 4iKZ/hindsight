@@ -4,7 +4,7 @@ The rebuild state machine runs against the injected FakeStore + FakeEmbeddingCli
 no real database, no real network. Each test drives ``run_embedding_rebuild``
 directly and asserts the documented invariants: advisory lock, rebuilding
 status, no live mutation on failure, historical reconstruction from
-``events.data.component``, deterministic EMA replay, orphan fail-closed, ANN
+``events.data.component``, deterministic cumulative-mean replay, orphan fail-closed, ANN
 index collaboration, and one atomic atoms + anchors + ANN + profile cutover.
 """
 
@@ -28,10 +28,7 @@ from tests.noesis_fakes import (
     fake_identity_vector,
 )
 
-FROZEN_ANN = (
-    "CREATE INDEX idx_atoms_embedding_ivfflat ON noesis_core.atoms "
-    "USING ivfflat (embedding vector_cosine_ops)"
-)
+FROZEN_ANN = "CREATE INDEX idx_atoms_embedding_ivfflat ON noesis_core.atoms USING ivfflat (embedding vector_cosine_ops)"
 
 
 def _spec(model: str = "bge-m3", revision: str = "bge-m3-1024-v1", dimension: int = 1024) -> BuildSpec:
@@ -127,6 +124,7 @@ def _store_with_history() -> FakeStore:
 # §6.3 lock + §6.4 profile state machine
 # ---------------------------------------------------------------------------
 
+
 async def test_second_rebuild_refused_when_lock_held():
     store = _store_with_history()
     store.advisory_lock_available = False
@@ -164,8 +162,9 @@ async def test_client_not_ready_aborts_without_mutation():
 
 
 # ---------------------------------------------------------------------------
-# §6.8/§6.9/§6.10 rebuild content: atoms + anchors + deterministic EMA
+# §6.8/§6.9/§6.10 rebuild content: atoms + anchors + deterministic cumulative mean
 # ---------------------------------------------------------------------------
+
 
 async def test_rebuild_replaces_atom_vectors_and_anchor_centroids():
     store = _store_with_history()
@@ -181,7 +180,7 @@ async def test_rebuild_replaces_atom_vectors_and_anchor_centroids():
     c1 = fake_context_vector("张三 修复 服务器")
     c2 = fake_context_vector("李四 修复 服务器")
     c3 = fake_context_vector("王五 修复 服务器")
-    expected = tuple(0.9 * (0.9 * a + 0.1 * b) + 0.1 * c for a, b, c in zip(c1, c2, c3))
+    expected = tuple((a + b + c) / 3 for a, b, c in zip(c1, c2, c3))
     assert store.anchors[105]["total_count"] == 3
     assert store.anchors[105]["centroid"] == expected
     # Anchor 101 (张三) has a single sample: centroid == that context.
@@ -241,7 +240,7 @@ async def test_keyset_pagination_uses_256_row_pages():
     assert "LIMIT 256" in pages[0][1]
 
 
-async def test_anchor_replay_uses_bounded_keyset_pages_without_resetting_ema():
+async def test_anchor_replay_uses_bounded_keyset_pages_without_resetting_mean():
     store = FakeStore()
     context = fake_context_vector("shared context")
     for event_id in range(1, 258):
@@ -253,11 +252,7 @@ async def test_anchor_replay_uses_bounded_keyset_pages_without_resetting_ema():
     centroid, total_count = store.embedding_anchor_stage[101]
     assert centroid == pytest.approx(context)
     assert total_count == 257
-    pages = [
-        call
-        for call in store.calls
-        if "noesis_embedding_anchor_sample_stage" in call[1] and "JOIN" in call[1]
-    ]
+    pages = [call for call in store.calls if "noesis_embedding_anchor_sample_stage" in call[1] and "JOIN" in call[1]]
     assert [call[2] for call in pages] == [
         (-1, -1, -1),
         (101, 256, 2),
@@ -269,6 +264,7 @@ async def test_anchor_replay_uses_bounded_keyset_pages_without_resetting_ema():
 # ---------------------------------------------------------------------------
 # §6.11 orphan anchors + §4.4 history consistency fail-closed
 # ---------------------------------------------------------------------------
+
 
 async def test_orphan_anchor_makes_the_rebuild_fail_closed():
     store = _store_with_history()
@@ -311,6 +307,7 @@ async def test_history_rejected_when_component_is_not_a_valid_closure():
 # ---------------------------------------------------------------------------
 # §6.12 ANN index collaboration
 # ---------------------------------------------------------------------------
+
 
 async def test_no_ann_index_is_allowed_and_never_created():
     store = _store_with_history()
@@ -368,6 +365,7 @@ async def test_multiple_ann_indexes_fail_closed():
 # §6.13/§7 fail-closed cutover
 # ---------------------------------------------------------------------------
 
+
 async def test_encoding_failure_leaves_live_data_and_profile_rebuilding():
     store = _store_with_history()
     failing = FakeEmbeddingClient(identity_failures={("张三", "E"): "timeout"})
@@ -424,6 +422,7 @@ async def test_rerun_after_interrupted_rebuild():
 # §6.14 --repair-null-only
 # ---------------------------------------------------------------------------
 
+
 async def test_repair_null_only_fills_nulls_without_touching_anchors_index_or_profile():
     store = _store_with_history()
     store.atoms[("张三", "E")]["embedding"] = None
@@ -467,6 +466,7 @@ async def test_repair_null_only_does_not_scan_events():
 # ---------------------------------------------------------------------------
 # CLI wiring (§6.1)
 # ---------------------------------------------------------------------------
+
 
 def test_cli_load_config_uses_hindsight_config(monkeypatch):
     import hindsight_api.config as config_module
