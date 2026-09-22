@@ -742,9 +742,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="/data/models/lopentu__google-bert-bert-base-chinese-DottedWSD",
     )
     parser.add_argument(
-        "--no-dotted",
+        "--dotted",
         action="store_true",
-        help="control run: rank pairs by Neighbor Jaccard + centroid alone",
+        help="experimental: let Dotted-WSD rank candidate pairs",
     )
     return parser
 
@@ -755,7 +755,7 @@ async def _async_main(args: argparse.Namespace) -> None:
     )
     pool = await asyncpg.create_pool(to_libpq_url(database_url), min_size=1, max_size=2)
     try:
-        scorer = None if args.no_dotted else DottedWSDScorer(args.dotted_model)
+        scorer = DottedWSDScorer(args.dotted_model) if args.dotted else None
         result = await run_compaction(
             pool,
             schema=args.schema,

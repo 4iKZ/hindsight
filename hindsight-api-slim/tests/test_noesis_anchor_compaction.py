@@ -11,6 +11,7 @@ from hindsight_api.engine.retain.noesis_anchor_compaction import (
     DottedWSDScorer,
     PairEvidence,
     apply_merge,
+    build_parser,
     choose_survivor,
     combine_dotted_scores,
     jaccard,
@@ -19,6 +20,13 @@ from hindsight_api.engine.retain.noesis_anchor_compaction import (
     rank_pairs,
     role_aware_jaccard,
 )
+
+
+def test_compactor_cli_requires_explicit_dotted_opt_in():
+    parser = build_parser()
+
+    assert parser.parse_args([]).dotted is False
+    assert parser.parse_args(["--dotted"]).dotted is True
 
 
 def anchor(anchor_id: int, count: int, value: float = 0.0) -> AnchorSnapshot:
