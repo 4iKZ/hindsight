@@ -624,6 +624,7 @@ async def run_compaction(
         )
     merged_pairs = 0
     stale = False
+    planned: list[dict[str, Any]] = []
     try:
         for candidate in candidates:
             current_atom_id = int(candidate["atom_id"])
@@ -638,6 +639,18 @@ async def run_compaction(
                 dotted_scorer=dotted_scorer,
             )
             if dry_run:
+                planned.extend(
+                    {
+                        "atom_id": current_atom_id,
+                        "source_anchor_id": plan.source.anchor_id,
+                        "target_anchor_id": plan.target.anchor_id,
+                        "forced": plan.evidence.forced,
+                        "dotted_score": round(plan.evidence.dotted_score, 6),
+                        "neighbor_jaccard": round(plan.evidence.neighbor_jaccard, 6),
+                        "centroid_distance": round(plan.evidence.centroid_distance, 6),
+                    }
+                    for plan in plans
+                )
                 merged_pairs += len(plans)
                 continue
             async with pool.acquire() as conn:
@@ -684,7 +697,15 @@ async def run_compaction(
                 status,
                 merged_pairs,
             )
-        return {"run_id": run_id, "status": status, "candidate_atoms": len(candidates), "merged_pairs": merged_pairs}
+        result = {
+            "run_id": run_id,
+            "status": status,
+            "candidate_atoms": len(candidates),
+            "merged_pairs": merged_pairs,
+        }
+        if dry_run:
+            result["planned"] = planned
+        return result
     except BaseException as error:
         async with pool.acquire() as conn:
             await conn.execute(
