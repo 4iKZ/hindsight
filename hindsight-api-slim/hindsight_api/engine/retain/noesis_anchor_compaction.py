@@ -170,28 +170,40 @@ class DottedWSDScorer:
             raise DottedUnavailableError(f"Dotted-WSD load failed: {type(error).__name__}") from error
 
     def __call__(self, word: str, left: Sequence[str], right: Sequence[str]) -> float:
-        left_marked = [marked for value in left if (marked := _mark_single_occurrence(value, word))]
-        right_marked = [marked for value in right if (marked := _mark_single_occurrence(value, word))]
-        if not left_marked or not right_marked:
-            raise DottedExemplarError("no unambiguous Dotted-WSD exemplar occurrence")
-        left_gloss = f"{word},该义项曾出现在以下语境：{'；'.join(left)}"
-        right_gloss = f"{word},该义项曾出现在以下语境：{'；'.join(right)}"
-        contexts = left_marked + right_marked
-        candidates = [right_gloss] * len(left_marked) + [left_gloss] * len(right_marked)
+        return self.score_many(word, [(left, right)])[0]
+
+    def score_many(self, word: str, pairs: Sequence[tuple[Sequence[str], Sequence[str]]]) -> list[float]:
+        contexts: list[str] = []
+        candidates: list[str] = []
+        owners: list[int] = []
+        for owner, (left, right) in enumerate(pairs):
+            left_marked = [marked for value in left if (marked := _mark_single_occurrence(value, word))]
+            right_marked = [marked for value in right if (marked := _mark_single_occurrence(value, word))]
+            if not left_marked or not right_marked:
+                raise DottedExemplarError("no unambiguous Dotted-WSD exemplar occurrence")
+            left_gloss = f"{word},该义项曾出现在以下语境：{'；'.join(left)}"
+            right_gloss = f"{word},该义项曾出现在以下语境：{'；'.join(right)}"
+            contexts.extend(left_marked + right_marked)
+            candidates.extend([right_gloss] * len(left_marked) + [left_gloss] * len(right_marked))
+            owners.extend([owner] * (len(left_marked) + len(right_marked)))
         try:
-            encoded = self._tokenizer(
-                contexts,
-                candidates,
-                padding=True,
-                truncation=True,
-                max_length=320,
-                return_tensors="pt",
-            )
-            encoded = {key: value.to(self._device) for key, value in encoded.items()}
-            with self._torch.inference_mode():
-                logits = self._model(**encoded).logits.float()
-                probabilities = self._torch.softmax(logits, dim=-1)[:, self._yes_index]
-            return combine_dotted_scores([float(value) for value in probabilities.cpu().tolist()])
+            grouped: list[list[float]] = [[] for _ in pairs]
+            for start in range(0, len(contexts), 16):
+                encoded = self._tokenizer(
+                    contexts[start : start + 16],
+                    candidates[start : start + 16],
+                    padding=True,
+                    truncation=True,
+                    max_length=320,
+                    return_tensors="pt",
+                )
+                encoded = {key: value.to(self._device) for key, value in encoded.items()}
+                with self._torch.inference_mode():
+                    logits = self._model(**encoded).logits.float()
+                    probabilities = self._torch.softmax(logits, dim=-1)[:, self._yes_index]
+                for owner, value in zip(owners[start : start + 16], probabilities.cpu().tolist(), strict=True):
+                    grouped[owner].append(float(value))
+            return [combine_dotted_scores(scores) for scores in grouped]
         except DottedUnavailableError:
             raise
         except Exception as error:
@@ -268,21 +280,30 @@ def plan_atom_compaction(
                     current_neighbors.get(left.anchor_id, {}),
                     current_neighbors.get(right.anchor_id, {}),
                 )
-        evidence: list[PairEvidence] = []
+        pending: list[tuple[int, int, list[str], list[str], bool]] = []
         for left_id, right_id in sorted(candidate_pairs(ordered, jaccards)):
             left = current[left_id]
             right = current[right_id]
-            left_examples = current_exemplars.get(left_id, [])
-            right_examples = current_exemplars.get(right_id, [])
+            left_examples = [
+                value
+                for value in current_exemplars.get(left_id, [])
+                if _mark_single_occurrence(value, atom_text) is not None
+            ]
+            right_examples = [
+                value
+                for value in current_exemplars.get(right_id, [])
+                if _mark_single_occurrence(value, atom_text) is not None
+            ]
             forced = not left_examples or not right_examples
-            if forced:
-                dotted = 0.0
-            else:
-                try:
-                    dotted = float(dotted_scorer(atom_text, left_examples, right_examples))
-                except DottedExemplarError:
-                    dotted = 0.0
-                    forced = True
+            pending.append((left_id, right_id, left_examples, right_examples, forced))
+        scoreable = [(left, right) for _, _, left, right, forced in pending if not forced]
+        if hasattr(dotted_scorer, "score_many"):
+            scored = iter(dotted_scorer.score_many(atom_text, scoreable))
+        else:
+            scored = iter(dotted_scorer(atom_text, left, right) for left, right in scoreable)
+        evidence: list[PairEvidence] = []
+        for left_id, right_id, _left_examples, _right_examples, forced in pending:
+            dotted = 0.0 if forced else float(next(scored))
             evidence.append(
                 PairEvidence(
                     left_id,
@@ -647,7 +668,7 @@ async def run_compaction(
                 merged_pairs,
             )
         return {"run_id": run_id, "status": status, "candidate_atoms": len(candidates), "merged_pairs": merged_pairs}
-    except Exception as error:
+    except BaseException as error:
         async with pool.acquire() as conn:
             await conn.execute(
                 _sql(

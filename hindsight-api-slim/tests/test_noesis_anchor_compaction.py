@@ -97,6 +97,28 @@ def test_plan_compacts_to_k_and_recomputes_after_each_merge():
     assert plans[0].target_after.total_count == 11
 
 
+def test_candidate_dotted_calls_are_batched_once_per_merge_round():
+    class Scorer:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def score_many(self, _word, pairs):
+            self.batch_sizes.append(len(pairs))
+            return [0.5] * len(pairs)
+
+    scorer = Scorer()
+    plan_atom_compaction(
+        atom_type="E",
+        atom_text="苹果",
+        anchors=[anchor(1, 3, 0.0), anchor(2, 2, 0.1), anchor(3, 1, 0.2)],
+        neighbors={1: {}, 2: {}, 3: {}},
+        exemplars={1: ["吃苹果"], 2: ["削苹果"], 3: ["买苹果"]},
+        max_active=2,
+        dotted_scorer=scorer,
+    )
+    assert scorer.batch_sizes == [3]
+
+
 def test_missing_exemplar_uses_forced_geometry_fallback():
     plans = plan_atom_compaction(
         atom_type="E",
