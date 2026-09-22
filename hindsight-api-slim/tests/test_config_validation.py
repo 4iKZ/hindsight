@@ -1034,6 +1034,10 @@ def test_noesis_config_defaults():
     assert config.noesis_pool_min_size == 1
     assert config.noesis_pool_max_size == 5
     assert config.noesis_command_timeout == 10
+    assert config.noesis_anchor_reuse_max_distance == 0.25
+    assert config.noesis_anchor_reuse_min_margin == 0.02
+    assert config.noesis_anchor_max_active == 5
+    assert config.noesis_anchor_max_overflow == 1
 
 
 def test_noesis_config_env_overrides(monkeypatch):
@@ -1046,6 +1050,10 @@ def test_noesis_config_env_overrides(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "2")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MAX_SIZE", "9")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "30")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "0.2")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN", "0.03")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "3")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "1")
 
     config = HindsightConfig.from_env()
     assert config.noesis_enabled is True
@@ -1054,6 +1062,28 @@ def test_noesis_config_env_overrides(monkeypatch):
     assert config.noesis_pool_min_size == 2
     assert config.noesis_pool_max_size == 9
     assert config.noesis_command_timeout == 30
+    assert config.noesis_anchor_reuse_max_distance == 0.2
+    assert config.noesis_anchor_reuse_min_margin == 0.03
+    assert config.noesis_anchor_max_active == 3
+    assert config.noesis_anchor_max_overflow == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "match"),
+    [
+        ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "-0.1", "reuse_max_distance"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "2.1", "reuse_max_distance"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN", "-0.1", "reuse_min_margin"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "0", "max_active"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "2", "max_overflow"),
+    ],
+)
+def test_noesis_anchor_policy_config_rejects_invalid_values(monkeypatch, name, value, match):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=match):
+        HindsightConfig.from_env()
 
 
 def test_old_hyper_norm_config_removed():

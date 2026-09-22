@@ -45,6 +45,7 @@ from ...utils import mask_network_location
 from .noesis_anchor import (
     AnchorFrameError,
     AnchorRouteError,
+    AnchorRoutingPolicy,
     plan_anchor_routing,
     prepare_context_vectors,
     route_anchors,
@@ -117,6 +118,7 @@ class TimeResolution:
 # Pure helpers: canonical JSON, keys, envelopes
 # ---------------------------------------------------------------------------
 
+
 def validate_schema_identifier(schema: str) -> bool:
     """Only plain SQL identifiers are accepted for the application schema."""
     return bool(isinstance(schema, str) and _IDENTIFIER_RE.fullmatch(schema))
@@ -148,9 +150,7 @@ def _content_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def compute_alert_dedupe_key(
-    *, item: NoesisInputItem, stage: str, alert_code: str, component_index: int | None
-) -> str:
+def compute_alert_dedupe_key(*, item: NoesisInputItem, stage: str, alert_code: str, component_index: int | None) -> str:
     """One open alert per retried input problem — requirement 02 §13.1."""
     payload = {
         "bank_id": item.bank_id,
@@ -207,6 +207,7 @@ def _render_extraction_text(content: str) -> str:
 # ---------------------------------------------------------------------------
 # event_time resolution (requirement 02 §9.2)
 # ---------------------------------------------------------------------------
+
 
 def resolve_event_time(*, observed_at: datetime, atoms: Any, analyzer: Any, timezone_name: str) -> TimeResolution:
     """Frozen algorithm: observed_at + modifier atoms, analyzer injected, no LLM."""
@@ -314,6 +315,7 @@ def _as_utc(value: datetime, business_tz: ZoneInfo) -> datetime:
 # Batch normalization (requirement 02 §6)
 # ---------------------------------------------------------------------------
 
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -370,6 +372,7 @@ async def normalize_items(
 # Extraction client (requirement 02 §7)
 # ---------------------------------------------------------------------------
 
+
 def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
     config = llm_config
     members = getattr(llm_config, "members", None)
@@ -410,6 +413,7 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
 _pool: Any | None = None
 _pool_lock = asyncio.Lock()
 
+
 async def _resolve_observed_at(
     *,
     operation_id: str | None,
@@ -426,7 +430,6 @@ async def _resolve_observed_at(
     if explicit is not None:
         return _parse_observed_at(explicit)
     return (clock or _utc_now)()
-
 
 
 async def _open_pool(config: Any) -> Any:
@@ -501,20 +504,14 @@ def _identity_spec_from_config(config: Any) -> IdentitySpec:
 
     return IdentitySpec(
         base_url=(
-            getattr(config, "noesis_embedding_base_url", None)
-            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_BASE_URL
+            getattr(config, "noesis_embedding_base_url", None) or hindsight_config.DEFAULT_NOESIS_EMBEDDING_BASE_URL
         ),
-        model=(
-            getattr(config, "noesis_embedding_model", None)
-            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_MODEL
-        ),
+        model=(getattr(config, "noesis_embedding_model", None) or hindsight_config.DEFAULT_NOESIS_EMBEDDING_MODEL),
         revision=(
-            getattr(config, "noesis_embedding_revision", None)
-            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_REVISION
+            getattr(config, "noesis_embedding_revision", None) or hindsight_config.DEFAULT_NOESIS_EMBEDDING_REVISION
         ),
         dimension=int(
-            getattr(config, "noesis_embedding_dimension", None)
-            or hindsight_config.DEFAULT_NOESIS_EMBEDDING_DIMENSION
+            getattr(config, "noesis_embedding_dimension", None) or hindsight_config.DEFAULT_NOESIS_EMBEDDING_DIMENSION
         ),
     )
 
@@ -574,6 +571,7 @@ async def _acquire_embedding_client(config: Any, spec: IdentitySpec, factory: An
 # Everything here is read-only or a tiny independent claim transaction; bge
 # HTTP happens outside any business transaction.
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class _ProfileGate:
@@ -791,9 +789,7 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
     """
     async with pool.acquire() as conn:
         for extension in _PREFLIGHT_EXTENSIONS:
-            installed = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1)", extension
-            )
+            installed = await conn.fetchval("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = $1)", extension)
             if not installed:
                 raise SchemaPreflightError(f"required extension '{extension}' is not installed")
 
@@ -805,8 +801,7 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
 
         for table in _PREFLIGHT_TABLES:
             exists = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = $1 AND table_name = $2)",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)",
                 schema,
                 table,
             )
@@ -941,9 +936,7 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
             f"{schema}.anchors",
         )
         if not event_atoms_anchor_fk:
-            raise SchemaPreflightError(
-                f"foreign key from '{schema}.event_atoms' to '{schema}.anchors' is missing"
-            )
+            raise SchemaPreflightError(f"foreign key from '{schema}.event_atoms' to '{schema}.anchors' is missing")
 
         # idx_anchors_atom or any equivalent btree index leading with atom_id:
         # the router's WHERE atom_id = ... probe depends on it.
@@ -1013,9 +1006,7 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
         )
         role_values = re.findall(r"'([A-Z])'::\"char\"", role_check or "")
         if sorted(role_values) != ["N", "O", "S"]:
-            raise SchemaPreflightError(
-                f"'{schema}.neighbor_bitmaps.role_type' CHECK (S/O/N) is missing or incomplete"
-            )
+            raise SchemaPreflightError(f"'{schema}.neighbor_bitmaps.role_type' CHECK (S/O/N) is missing or incomplete")
 
         for table in ("cooccurrence_bitmaps", "neighbor_bitmaps"):
             anchor_default = await conn.fetchval(
@@ -1041,13 +1032,10 @@ async def _run_schema_preflight(pool: Any, schema: str, expected_dimension: int 
         # rb64_build/rb64_or; the catalog probe names a missing function, the
         # live call probe proves the installed signature is callable.
         functions_present = await conn.fetchval(
-            "SELECT count(DISTINCT proname) = 2 FROM pg_proc "
-            "WHERE proname IN ('rb64_build', 'rb64_or')"
+            "SELECT count(DISTINCT proname) = 2 FROM pg_proc WHERE proname IN ('rb64_build', 'rb64_or')"
         )
         if functions_present is not True:
-            raise SchemaPreflightError(
-                "required roaringbitmap functions rb64_build/rb64_or are not installed"
-            )
+            raise SchemaPreflightError("required roaringbitmap functions rb64_build/rb64_or are not installed")
         try:
             rb64_callable = await conn.fetchval(
                 "SELECT rb64_or(rb64_build(ARRAY[1::bigint]), rb64_build(ARRAY[2::bigint])) IS NOT NULL"
@@ -1084,6 +1072,7 @@ async def _ensure_schema_ready(pool: Any, schema: str, expected_dimension: int =
 # Store layer: the only SQL this module runs
 # ---------------------------------------------------------------------------
 
+
 def _sql(schema: str, statement: str) -> str:
     return statement.format(s=schema)
 
@@ -1095,7 +1084,7 @@ def _sql(schema: str, statement: str) -> str:
 # one-byte "char" columns (asyncpg only accepts bytes for a direct bind).
 _EVENT_INSERT = (
     "INSERT INTO {s}.events (event_time, data, source, category) "
-    "VALUES ($1, $2::jsonb, $3::text::\"char\", $4::text::\"char\") "
+    'VALUES ($1, $2::jsonb, $3::text::"char", $4::text::"char") '
     "RETURNING event_id"
 )
 # Requirement 03 §8.3 + 04A: new rows carry the freshly computed vector (or
@@ -1120,8 +1109,7 @@ _ATOM_STATE_SELECT = (
 )
 # Requirement 03 §10.3: the single-row identity model-generation gate.
 _PROFILE_SELECT = (
-    "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles "
-    "WHERE embedding_kind = $1"
+    "SELECT model_name, model_revision, dimension, status FROM {s}.embedding_profiles WHERE embedding_kind = $1"
 )
 # Requirement 05A §5.5: the unconditional in-transaction generation fence.
 _PROFILE_FENCE = (
@@ -1143,7 +1131,7 @@ _ANCHOR_COUNT = "SELECT count(*) FROM {s}.anchors"
 # a NULL anchor on the success path is impossible by construction.
 _EVENT_ATOM_INSERT = (
     "INSERT INTO {s}.event_atoms (event_id, occurrence_id, atom_id, role_type, target_occ, anchor_id) "
-    "VALUES ($1, $2, $3, $4::text::\"char\", $5, $6)"
+    'VALUES ($1, $2, $3, $4::text::"char", $5, $6)'
 )
 _ALERT_INSERT = (
     "INSERT INTO {s}.ingestion_alerts (dedupe_key, event_id, stage, alert_code, severity, message, details, status) "
@@ -1226,6 +1214,7 @@ async def _ingest_fact(
     resolution: TimeResolution,
     embedding_client: Any,
     identity_spec: IdentitySpec,
+    anchor_policy: AnchorRoutingPolicy,
 ) -> tuple[int, dict[str, Any] | None]:
     """One fact, one short transaction.
 
@@ -1248,9 +1237,7 @@ async def _ingest_fact(
     # network or database work.
     plan = plan_anchor_routing(component.atoms)
     if embedding_client is None:
-        raise EmbeddingServiceUnavailable(
-            "noesis embedding client unavailable; context vectors cannot be prepared"
-        )
+        raise EmbeddingServiceUnavailable("noesis embedding client unavailable; context vectors cannot be prepared")
     # 2. Requirement 05A §5.1 step 2: the /health probe precedes the gate.
     await embedding_client.ensure_ready()
     # 3. Requirement 05A §5.1 step 3: the shared embedding-space profile gate
@@ -1371,7 +1358,12 @@ async def _ingest_fact(
             # this same short transaction, before the event_atoms rows below
             # carry the routed anchor_id (one route per (atom_id, frame), §5.6).
             anchor_routes = await route_anchors(
-                conn, schema, atom_ids=atom_ids, plan=plan, context_vectors=context_vectors
+                conn,
+                schema,
+                atom_ids=atom_ids,
+                plan=plan,
+                context_vectors=context_vectors,
+                policy=anchor_policy,
             )
             occurrence_frame = {occ.pos: occ.frame_pos for occ in plan.occurrences}
             for atom in component.atoms:
@@ -1403,6 +1395,7 @@ async def _ingest_fact(
 # ---------------------------------------------------------------------------
 # Routing (requirement 02 §8)
 # ---------------------------------------------------------------------------
+
 
 async def _anchor_component_alert(
     pool: Any,
@@ -1452,6 +1445,7 @@ async def _route_component(
     attempts: int,
     embedding_client: Any,
     identity_spec: IdentitySpec,
+    anchor_policy: AnchorRoutingPolicy,
 ) -> None:
     component_json = component.model_dump(mode="json")
     data = _build_event_data(
@@ -1468,6 +1462,7 @@ async def _route_component(
             resolution=resolution,
             embedding_client=embedding_client,
             identity_spec=identity_spec,
+            anchor_policy=anchor_policy,
         )
     except EmbeddingProfileUnavailable as error:
         # Requirement 05A §5.3: the fixed sanitized component-drop alert. The
@@ -1613,10 +1608,17 @@ async def _ingest_item(
         except Exception as error:
             logger.error("noesis extraction crashed for item %s: %s", item.item_index, type(error).__name__)
             await _item_alert_safe(
-                schema, item, config, pool_factory,
-                stage="hyper_extract", alert_code="extraction_failed", severity="error",
-                message=f"noesis extraction crashed: {type(error).__name__}", component_index=None,
-                event_id=None, details=build_source_envelope(item=item, attempts=0),
+                schema,
+                item,
+                config,
+                pool_factory,
+                stage="hyper_extract",
+                alert_code="extraction_failed",
+                severity="error",
+                message=f"noesis extraction crashed: {type(error).__name__}",
+                component_index=None,
+                event_id=None,
+                details=build_source_envelope(item=item, attempts=0),
             )
             return
 
@@ -1630,20 +1632,32 @@ async def _ingest_item(
         for alert in outcome.alerts:
             alert_details = alert.details or {}
             await _write_alert_safe(
-                pool, schema, item, stage=alert.stage, alert_code=alert.alert_code, severity=alert.severity,
-                message=alert.message, component_index=alert_details.get("component_index"), event_id=None,
+                pool,
+                schema,
+                item,
+                stage=alert.stage,
+                alert_code=alert.alert_code,
+                severity=alert.severity,
+                message=alert.message,
+                component_index=alert_details.get("component_index"),
+                event_id=None,
                 details={**envelope, **alert_details},
             )
         for component_index, component in enumerate(outcome.components):
             if component.utterance_type == "hypothesis":
                 await _write_alert_safe(
-                    pool, schema, item, stage="hypothesis_routing", alert_code="hypothesis_classification_pending",
+                    pool,
+                    schema,
+                    item,
+                    stage="hypothesis_routing",
+                    alert_code="hypothesis_classification_pending",
                     severity="info",
                     message=(
                         "hypothesis recorded as observability signal; classification interface "
                         "not yet available; component is not persisted as a rule or event"
                     ),
-                    component_index=component_index, event_id=None,
+                    component_index=component_index,
+                    event_id=None,
                     details={**envelope, "component": component.model_dump(mode="json")},
                 )
                 continue
@@ -1654,19 +1668,38 @@ async def _ingest_item(
                 timezone_name=timezone_name,
             )
             await _route_component(
-                pool=pool, schema=schema, item=item, component_index=component_index,
-                component=component, resolution=resolution, attempts=outcome.attempts,
-                embedding_client=embedding_client, identity_spec=identity_spec,
+                pool=pool,
+                schema=schema,
+                item=item,
+                component_index=component_index,
+                component=component,
+                resolution=resolution,
+                attempts=outcome.attempts,
+                embedding_client=embedding_client,
+                identity_spec=identity_spec,
+                anchor_policy=AnchorRoutingPolicy(
+                    reuse_max_distance=config.noesis_anchor_reuse_max_distance,
+                    reuse_min_margin=config.noesis_anchor_reuse_min_margin,
+                    max_active=config.noesis_anchor_max_active,
+                    max_overflow=config.noesis_anchor_max_overflow,
+                ),
             )
     except asyncio.CancelledError:
         raise  # never swallow cancellation semantics
     except Exception as error:
         logger.error("noesis item %s failed: %s", item.item_index, type(error).__name__)
         await _item_alert_safe(
-            schema, item, config, pool_factory,
-            stage="event_ingest", alert_code="event_ingest_failed", severity="error",
-            message=f"noesis item processing failed: {type(error).__name__}", component_index=None,
-            event_id=None, details=build_source_envelope(item=item, attempts=0),
+            schema,
+            item,
+            config,
+            pool_factory,
+            stage="event_ingest",
+            alert_code="event_ingest_failed",
+            severity="error",
+            message=f"noesis item processing failed: {type(error).__name__}",
+            component_index=None,
+            event_id=None,
+            details=build_source_envelope(item=item, attempts=0),
         )
 
 
@@ -1684,7 +1717,9 @@ async def _item_alert_safe(
     except Exception as error:
         logger.error(
             "noesis item alert could not be written (%s/%s): %s",
-            kwargs.get("stage"), kwargs.get("alert_code"), type(error).__name__,
+            kwargs.get("stage"),
+            kwargs.get("alert_code"),
+            type(error).__name__,
         )
 
 

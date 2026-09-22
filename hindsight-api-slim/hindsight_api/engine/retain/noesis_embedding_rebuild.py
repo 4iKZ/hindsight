@@ -4,7 +4,7 @@ One explicit, fail-closed, low-frequency operator path that rebuilds the whole
 E/P shared embedding space toward the configured generation:
 
 * ``atoms.embedding``          — Identity Vector per active E/P atom;
-* ``anchors.centroid_vector``  — predicate-frame Context EMA replay;
+* ``anchors.centroid_vector``  — predicate-frame Context cumulative-mean replay;
 * ``anchors.total_count``      — the rebuilt sample count;
 * the frozen IVFFlat ANN index over ``atoms.embedding`` (``REINDEX INDEX``);
 * ``embedding_profiles.identity`` — flipped to the target triple + ``ready``.
@@ -54,7 +54,13 @@ from typing import Any
 
 import asyncpg
 
-from .noesis_anchor import AnchorFrameError, ema_centroid, parse_centroid_text, plan_anchor_routing, vector_literal
+from .noesis_anchor import (
+    AnchorFrameError,
+    incremental_centroid,
+    parse_centroid_text,
+    plan_anchor_routing,
+    vector_literal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -635,12 +641,12 @@ async def _embed_contexts(conn, client, event_id: int, plan) -> bool:
 
 
 async def _replay_anchor_centroids(conn, spec) -> int:
-    """Replay the frozen EMA in bounded keyset pages.
+    """Replay the cumulative mean in bounded keyset pages.
 
     Only the current Anchor centroid/count and one 256-row database page are
     retained in memory.  The cursor key and accumulator deliberately survive
     page boundaries so an Anchor with more than one page of samples gets the
-    exact same deterministic EMA as an unpaged ordered stream.
+    exact same deterministic cumulative mean as an unpaged ordered stream.
     """
     current_anchor: int | None = None
     centroid: list[float] | None = None
@@ -662,7 +668,7 @@ async def _replay_anchor_centroids(conn, spec) -> int:
                 centroid = list(context)
                 count = 1
             else:
-                centroid = ema_centroid(centroid, context)
+                centroid = incremental_centroid(centroid, context, total_count=count)
                 count += 1
             last_key = (anchor_id, event_id, predicate_pos)
     if current_anchor is not None and centroid is not None:
