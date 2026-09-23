@@ -186,6 +186,8 @@ def noesis_config(**overrides: Any) -> SimpleNamespace:
         noesis_command_timeout=10,
         noesis_anchor_reuse_max_distance=0.25,
         noesis_anchor_reuse_min_margin=0.02,
+        noesis_anchor_predicate_reuse_max_distance=0.28,
+        noesis_anchor_predicate_reuse_min_margin=0.0,
         noesis_anchor_max_active=5,
         noesis_anchor_max_overflow=1,
         # Requirement 03 embedding fields: deliberately NOT the production

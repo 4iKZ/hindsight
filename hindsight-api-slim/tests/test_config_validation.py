@@ -1036,6 +1036,8 @@ def test_noesis_config_defaults():
     assert config.noesis_command_timeout == 10
     assert config.noesis_anchor_reuse_max_distance == 0.25
     assert config.noesis_anchor_reuse_min_margin == 0.02
+    assert config.noesis_anchor_predicate_reuse_max_distance == 0.28
+    assert config.noesis_anchor_predicate_reuse_min_margin == 0.0
     assert config.noesis_anchor_max_active == 5
     assert config.noesis_anchor_max_overflow == 1
 
@@ -1052,6 +1054,8 @@ def test_noesis_config_env_overrides(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "30")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "0.2")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN", "0.03")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MAX_DISTANCE", "0.35")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MIN_MARGIN", "0.01")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "3")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "1")
 
@@ -1064,6 +1068,8 @@ def test_noesis_config_env_overrides(monkeypatch):
     assert config.noesis_command_timeout == 30
     assert config.noesis_anchor_reuse_max_distance == 0.2
     assert config.noesis_anchor_reuse_min_margin == 0.03
+    assert config.noesis_anchor_predicate_reuse_max_distance == 0.35
+    assert config.noesis_anchor_predicate_reuse_min_margin == 0.01
     assert config.noesis_anchor_max_active == 3
     assert config.noesis_anchor_max_overflow == 1
 
@@ -1074,6 +1080,16 @@ def test_noesis_config_env_overrides(monkeypatch):
         ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "-0.1", "reuse_max_distance"),
         ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "2.1", "reuse_max_distance"),
         ("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN", "-0.1", "reuse_min_margin"),
+        (
+            "HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MAX_DISTANCE",
+            "2.1",
+            "predicate_reuse_max_distance",
+        ),
+        (
+            "HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MIN_MARGIN",
+            "-0.1",
+            "predicate_reuse_min_margin",
+        ),
         ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "0", "max_active"),
         ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "2", "max_overflow"),
     ],
