@@ -175,6 +175,7 @@ def outcome(components=(), alerts=(), attempts: int = 1) -> ExtractionOutcome:
 # Config / LLM config fakes
 # ---------------------------------------------------------------------------
 
+
 def noesis_config(**overrides: Any) -> SimpleNamespace:
     cfg = SimpleNamespace(
         noesis_enabled=True,
@@ -186,6 +187,8 @@ def noesis_config(**overrides: Any) -> SimpleNamespace:
         noesis_command_timeout=10,
         noesis_anchor_reuse_max_distance=0.25,
         noesis_anchor_reuse_min_margin=0.02,
+        noesis_anchor_predicate_reuse_max_distance=0.28,
+        noesis_anchor_predicate_reuse_min_margin=0.0,
         noesis_anchor_max_active=5,
         noesis_anchor_max_overflow=1,
         # Requirement 03 embedding fields: deliberately NOT the production
@@ -210,6 +213,7 @@ def llm_config(provider: str = "openai", model: str = "test-model") -> SimpleNam
 # ---------------------------------------------------------------------------
 # Fake asyncpg pool / connection / store
 # ---------------------------------------------------------------------------
+
 
 class FakeStore:
     """In-memory emulation of the noesis_core statements the ingest runs."""
@@ -371,7 +375,7 @@ class FakeStore:
         if "noesis_embedding_anchor_sample_stage" in sql and "JOIN" in sql:
             rows = []
             last_key = tuple(int(value) for value in args)
-            for (anchor_id, event_id, predicate_pos) in sorted(self.embedding_anchor_sample_stage):
+            for anchor_id, event_id, predicate_pos in sorted(self.embedding_anchor_sample_stage):
                 if (anchor_id, event_id, predicate_pos) <= last_key:
                     continue
                 context = self.embedding_context_stage.get((event_id, predicate_pos))
@@ -750,9 +754,7 @@ class FakeStore:
         """Committed neighbor atom IDs of one (atom_id, anchor_id, role_type) row."""
         return set(self.neighbor_bitmaps.get((atom_id, anchor_id, role_type), set()))
 
-    def seed_anchor(
-        self, atom_id: int, centroid: tuple[float, ...], *, status: str = "A", total_count: int = 0
-    ) -> int:
+    def seed_anchor(self, atom_id: int, centroid: tuple[float, ...], *, status: str = "A", total_count: int = 0) -> int:
         """Insert a pre-existing anchor row and return its anchor_id."""
         self._ids["anchor"] += 1
         anchor_id = self._ids["anchor"]
@@ -928,14 +930,16 @@ def pool_factory_for(store: FakeStore):
 # Extraction seams
 # ---------------------------------------------------------------------------
 
+
 class FakeExtractOnceFactory:
     """``extract_once_factory`` seam: records the llm_config, serves raw payloads."""
 
-    def __init__(self, raw_payloads: list | None = None, error: Exception | None = None) -> None:
+    def __init__(self, raw_payloads: list | None = None, error: Exception | None = None, summarize_once=None) -> None:
         self.requested_llm_configs: list = []
         self.texts: list[str] = []
         self._raw_payloads = list(raw_payloads or [])
         self._error = error
+        self._summarize_once = summarize_once or (lambda text: text)
 
     def __call__(self, llm_config):
         self.requested_llm_configs.append(llm_config)
@@ -948,12 +952,14 @@ class FakeExtractOnceFactory:
                 return self._raw_payloads.pop(0)
             return []
 
+        extract_once._noesis_summarize_once = self._summarize_once
         return extract_once
 
 
 # ---------------------------------------------------------------------------
 # Embedding seams (requirements 03 + 05, unified client)
 # ---------------------------------------------------------------------------
+
 
 def fake_identity_vector(text: str, atom_type: str, dimension: int = 1024) -> tuple[float, ...]:
     """Deterministic stand-in for BGE(literal): sha256-seeded floats in [-1, 1)."""
@@ -1030,6 +1036,7 @@ def embedding_factory_for(client: FakeEmbeddingClient):
 # ---------------------------------------------------------------------------
 # Fake time analyzer
 # ---------------------------------------------------------------------------
+
 
 class FakeAnalyzer:
     """Maps modifier text -> TemporalConstraint | None, or raises."""

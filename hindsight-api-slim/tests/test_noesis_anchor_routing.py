@@ -121,10 +121,12 @@ def member_tuples(plan):
     ]
 
 
-async def route(store, *, atom_ids, plan, context_vectors, policy=None):
+async def route(store, *, atom_ids, plan, context_vectors, policy=None, predicate_policy=None):
     kwargs = {}
     if policy is not None:
         kwargs["policy"] = policy
+    if predicate_policy is not None:
+        kwargs["predicate_policy"] = predicate_policy
     return await route_anchors(
         FakeConn(store), SCHEMA, atom_ids=atom_ids, plan=plan, context_vectors=context_vectors, **kwargs
     )
@@ -570,6 +572,31 @@ async def test_distance_slightly_above_threshold_creates_new():
     assert routes[(atom_id, 4)] != existing
     assert len(store.anchors_rows()) == 2
     assert store.anchors[existing]["total_count"] == 5
+
+
+async def test_entity_and_predicate_use_separate_reuse_policies():
+    store = FakeStore()
+    entity_id = seed_atom(store, "日志", "E")
+    predicate_id = seed_atom(store, "打", "P")
+    entity_anchor = store.seed_anchor(entity_id, basis(0), total_count=3)
+    predicate_anchor = store.seed_anchor(predicate_id, basis(0), total_count=3)
+    context = [0.73, (1.0 - 0.73**2) ** 0.5] + [0.0] * (DIMENSION - 2)
+    plan = make_plan(
+        {4: "程序 打 日志"},
+        [(4, "打", "P", 4), (5, "日志", "E", 4)],
+    )
+
+    routes = await route(
+        store,
+        atom_ids={("日志", "E"): entity_id, ("打", "P"): predicate_id},
+        plan=plan,
+        context_vectors={"程序 打 日志": context},
+        policy=AnchorRoutingPolicy(reuse_max_distance=0.25, reuse_min_margin=0.02),
+        predicate_policy=AnchorRoutingPolicy(reuse_max_distance=0.30, reuse_min_margin=0.0),
+    )
+
+    assert routes[(predicate_id, 4)] == predicate_anchor
+    assert routes[(entity_id, 4)] != entity_anchor
 
 
 async def test_multiple_anchors_nearest_active_wins():

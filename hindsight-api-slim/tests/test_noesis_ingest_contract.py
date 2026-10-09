@@ -7,6 +7,7 @@ database access goes through the in-memory FakePool. No network, no real DB.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 
@@ -58,6 +59,131 @@ def content_item(content=CONTENT, event_date=OBSERVED_AT, document_id=None, **ex
     return item
 
 
+async def test_summary_is_the_actual_he_input_and_raw_source_is_preserved(monkeypatch):
+    raw = "User: 母亲昨天从超市买来苹果。\nAssistant: 建议下次买香蕉。"
+    summary = "昨天妈妈在超市买了苹果。"
+    factory = FakeExtractOnceFactory(
+        raw_payloads=[[golden_fact_time().model_dump(mode="json")]],
+        summarize_once=lambda text: summary,
+    )
+    store = FakeStore()
+    await run_ingest(store, [content_item(raw)], monkeypatch, extract_once_factory=factory)
+    assert factory.texts == [summary]
+    assert len(store.events) == 1
+    data = next(iter(store.events.values()))["data"]
+    assert data["source_text"] == raw
+    assert data["extraction_text"] == summary
+
+
+async def test_empty_summary_skips_he_and_all_writes(monkeypatch):
+    factory = FakeExtractOnceFactory(summarize_once=lambda text: "")
+    store = FakeStore()
+    await run_ingest(store, [content_item("建议重启")], monkeypatch, extract_once_factory=factory)
+    assert factory.texts == []
+    assert store.events == {}
+    assert store.atoms == {}
+    assert store.alerts == []
+
+
+async def test_summary_failure_is_fail_closed_and_sanitized(monkeypatch):
+    calls = []
+
+    def summarize(text):
+        calls.append(text)
+        raise RuntimeError("do-not-log-this-secret")
+
+    factory = FakeExtractOnceFactory(summarize_once=summarize)
+    store = FakeStore()
+    await run_ingest(store, [content_item()], monkeypatch, extract_once_factory=factory)
+    assert len(calls) == 2
+    assert factory.texts == []
+    assert store.events == {}
+    alerts = store.alerts_by_code("summary_failed")
+    assert len(alerts) == 1
+    assert alerts[0]["stage"] == "source_summary"
+    assert "do-not-log-this-secret" not in json.dumps(alerts)
+
+
+async def test_summary_failure_does_not_stop_the_next_item(monkeypatch):
+    summary = "昨天妈妈在超市买了苹果。"
+
+    def summarize(text):
+        if text == "第一条失败":
+            raise RuntimeError("summary unavailable")
+        return summary
+
+    factory = FakeExtractOnceFactory(
+        raw_payloads=[[golden_fact_time().model_dump(mode="json")]], summarize_once=summarize
+    )
+    store = FakeStore()
+    await run_ingest(
+        store,
+        [content_item("第一条失败"), content_item("第二条原文")],
+        monkeypatch,
+        extract_once_factory=factory,
+    )
+    assert factory.texts == [summary]
+    assert len(store.alerts_by_code("summary_failed")) == 1
+    assert len(store.events) == 1
+    data = next(iter(store.events.values()))["data"]
+    assert data["source_text"] == "第二条原文"
+    assert data["item_index"] == 1
+
+
+async def test_summary_cancellation_propagates(monkeypatch):
+    def summarize(text):
+        raise asyncio.CancelledError()
+
+    factory = FakeExtractOnceFactory(summarize_once=summarize)
+    store = FakeStore()
+    with pytest.raises(asyncio.CancelledError):
+        await run_ingest(store, [content_item()], monkeypatch, extract_once_factory=factory)
+    assert factory.texts == []
+    assert store.events == {}
+    assert store.alerts == []
+
+
+async def test_missing_summary_hook_never_falls_back_to_raw_extraction(monkeypatch):
+    store = FakeStore()
+    await run_ingest(store, [content_item()], monkeypatch, extract_once_factory=lambda config: lambda text: [])
+    assert store.events == {}
+    alert = store.alerts_by_code("summary_failed")[0]
+    assert alert["details"]["summary_attempts"] == 0
+
+
+@pytest.mark.parametrize(
+    "base_url,json_mode",
+    [
+        ("https://api.deepseek.com", True),
+        ("https://api.deepseek.com/v1", True),
+        ("http://localhost:3000/v1", False),
+    ],
+)
+def test_production_factory_wires_both_stages_to_the_same_client(monkeypatch, base_url, json_mode):
+    import hyperextract
+    import hyperextract.noesis as he_noesis
+
+    client = object()
+    stages = []
+
+    def create_extract(*, llm_client, json_mode=False):
+        stages.append(("he", llm_client, json_mode))
+        return lambda text: []
+
+    def create_summary(*, llm_client):
+        stages.append(("summary", llm_client))
+        return lambda text: "整理文本"
+
+    monkeypatch.setattr(hyperextract, "create_llm", lambda *args, **kwargs: client)
+    monkeypatch.setattr(he_noesis, "create_noesis_extractor", create_extract)
+    monkeypatch.setattr(he_noesis, "create_noesis_summarizer", create_summary)
+    config = llm_config()
+    config.base_url = base_url
+    extract = noesis_ingest._production_extract_once_factory(config)
+    assert stages == [("he", client, json_mode), ("summary", client)]
+    assert extract._noesis_summarize_once("原文") == "整理文本"
+
+
 async def run_ingest(store, contents, monkeypatch, *, config=None, llm_config_value=None, **kwargs):
     """Default seam set: fake extract_once factory + FakePool.
 
@@ -81,6 +207,7 @@ async def run_ingest(store, contents, monkeypatch, *, config=None, llm_config_va
 # ---------------------------------------------------------------------------
 # §17.1 batch handling
 # ---------------------------------------------------------------------------
+
 
 async def test_empty_batch_skips_extraction_and_pool(monkeypatch):
     calls = patch_outcomes(monkeypatch, [])
@@ -200,18 +327,24 @@ async def test_item_envelope_preserves_original_batch_index(monkeypatch):
 
 async def test_alert_identity_includes_observed_at():
     first = noesis_ingest.NoesisInputItem(
-        bank_id="bank", content="same", observed_at=datetime(2026, 9, 5, 1, tzinfo=UTC),
-        operation_id=None, document_id=None, item_index=0
+        bank_id="bank",
+        content="same",
+        observed_at=datetime(2026, 9, 5, 1, tzinfo=UTC),
+        operation_id=None,
+        document_id=None,
+        item_index=0,
     )
     second = noesis_ingest.NoesisInputItem(
-        bank_id="bank", content="same", observed_at=datetime(2026, 9, 5, 2, tzinfo=UTC),
-        operation_id=None, document_id=None, item_index=0
+        bank_id="bank",
+        content="same",
+        observed_at=datetime(2026, 9, 5, 2, tzinfo=UTC),
+        operation_id=None,
+        document_id=None,
+        item_index=0,
     )
     assert noesis_ingest.compute_alert_dedupe_key(
         item=first, stage="extract", alert_code="bad", component_index=None
-    ) != noesis_ingest.compute_alert_dedupe_key(
-        item=second, stage="extract", alert_code="bad", component_index=None
-    )
+    ) != noesis_ingest.compute_alert_dedupe_key(item=second, stage="extract", alert_code="bad", component_index=None)
 
 
 async def test_missing_timestamp_captured_once_at_batch_boundary(monkeypatch):
@@ -230,7 +363,9 @@ async def test_missing_timestamp_captured_once_at_batch_boundary(monkeypatch):
 
     monkeypatch.setattr(noesis_ingest, "_ingest_fact", spy_ingest_fact)
 
-    await run_ingest(store, [content_item(event_date=None), content_item(event_date=None)], monkeypatch, clock=lambda: fixed)
+    await run_ingest(
+        store, [content_item(event_date=None), content_item(event_date=None)], monkeypatch, clock=lambda: fixed
+    )
     assert len(ingested) == 2
     assert all(item.observed_at == fixed for item in ingested)
 
@@ -245,8 +380,12 @@ async def test_noesis_disabled_is_noop(monkeypatch):
     store = FakeStore()
     cfg = noesis_config(noesis_enabled=False)
     await ingest_noesis_batch(
-        [content_item()], "bank-1", cfg, llm_config=llm_config(),
-        extract_once_factory=_Boom(), pool_factory=pool_factory_for(store),
+        [content_item()],
+        "bank-1",
+        cfg,
+        llm_config=llm_config(),
+        extract_once_factory=_Boom(),
+        pool_factory=pool_factory_for(store),
     )
     assert calls == []
     assert store.calls == []
@@ -255,6 +394,7 @@ async def test_noesis_disabled_is_noop(monkeypatch):
 # ---------------------------------------------------------------------------
 # §17.2 output routing
 # ---------------------------------------------------------------------------
+
 
 async def test_empty_components_no_events_no_alerts(monkeypatch):
     calls = patch_outcomes(monkeypatch, [outcome()])
@@ -399,7 +539,9 @@ async def test_unsupported_provider_writes_config_alert(monkeypatch):
     calls = patch_outcomes(monkeypatch, [])
     store = FakeStore()
     await run_ingest(
-        store, [content_item()], monkeypatch,
+        store,
+        [content_item()],
+        monkeypatch,
         llm_config_value=llm_config(provider="gemini", model="gemini-2"),
         extract_once_factory=None,
     )
@@ -472,8 +614,11 @@ async def test_item_document_id_beats_batch_document_id(monkeypatch):
 
     contents = [content_item(document_id="item-doc"), content_item()]
     await ingest_noesis_batch(
-        contents, "bank-1", noesis_config(),
-        llm_config=llm_config(), document_id="batch-doc",
+        contents,
+        "bank-1",
+        noesis_config(),
+        llm_config=llm_config(),
+        document_id="batch-doc",
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=pool_factory_for(store),
         embedding_client_factory=embedding_factory_for(FakeEmbeddingClient()),
@@ -484,6 +629,7 @@ async def test_item_document_id_beats_batch_document_id(monkeypatch):
 # ---------------------------------------------------------------------------
 # §14.3 / §17.7 pool lifecycle
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 async def _reset_pool_singleton():
@@ -535,7 +681,9 @@ async def test_disabled_never_opens_pool(monkeypatch):
     monkeypatch.setattr(noesis_ingest, "_open_pool", boom)
     calls = patch_outcomes(monkeypatch, [])
     await ingest_noesis_batch(
-        [content_item()], "bank-1", noesis_config(noesis_enabled=False),
+        [content_item()],
+        "bank-1",
+        noesis_config(noesis_enabled=False),
         llm_config=llm_config(),
         extract_once_factory=FakeExtractOnceFactory(),
         pool_factory=None,  # production pool path, must never be reached

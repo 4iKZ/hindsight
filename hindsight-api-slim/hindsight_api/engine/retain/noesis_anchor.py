@@ -480,6 +480,7 @@ async def route_anchors(
     plan: AnchorPlan,
     context_vectors: dict[str, list[float]],
     policy: AnchorRoutingPolicy | None = None,
+    predicate_policy: AnchorRoutingPolicy | None = None,
 ) -> dict[tuple[int, int], int]:
     """Route every ``(atom_id, frame_pos)`` of the plan inside the fact transaction.
 
@@ -501,13 +502,18 @@ async def route_anchors(
     """
     routes: dict[tuple[int, int], int] = {}
     effective_policy = policy or AnchorRoutingPolicy()
+    effective_predicate_policy = predicate_policy or effective_policy
     try:
-        entries: dict[tuple[int, int], str] = {}
+        entries: dict[tuple[int, int], tuple[str, str]] = {}
         for occurrence in plan.occurrences:
             key = (atom_ids[occurrence.literal], occurrence.frame_pos)
             if key not in entries:
-                entries[key] = plan.frames[occurrence.frame_pos].context_text
-        for (atom_id, frame_pos), context_text in sorted(entries.items()):
+                entries[key] = (
+                    plan.frames[occurrence.frame_pos].context_text,
+                    occurrence.literal[1],
+                )
+        for (atom_id, frame_pos), (context_text, atom_type) in sorted(entries.items()):
+            route_policy = effective_predicate_policy if atom_type == "P" else effective_policy
             context = context_vectors[context_text]
             _ensure_finite_vector(context, what=f"context vector for atom {atom_id} frame {frame_pos}")
             literal = vector_literal(context)
@@ -518,13 +524,13 @@ async def route_anchors(
             nearest = rows[0] if rows else None
             second_distance = float(rows[1]["distance"]) if len(rows) > 1 else None
             reuse = nearest is not None and should_reuse(
-                float(nearest["distance"]), second_distance=second_distance, policy=effective_policy
+                float(nearest["distance"]), second_distance=second_distance, policy=route_policy
             )
             active_count = int(nearest["active_count"]) if nearest is not None else 0
             forced = (
                 nearest is not None
                 and not reuse
-                and active_count >= (effective_policy.max_active + effective_policy.max_overflow)
+                and active_count >= (route_policy.max_active + route_policy.max_overflow)
             )
             if reuse or forced:
                 anchor_id = int(nearest["anchor_id"])
