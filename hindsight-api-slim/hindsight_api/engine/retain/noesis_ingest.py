@@ -4,7 +4,8 @@ Replaces the old hyper_extract directed-graph side path on the Hindsight
 production retain main chain. For every non-empty content item this module:
 
 1. builds a ``NoesisInputItem`` envelope (content + observed_at + identity);
-2. awaits the authoritative ``hyperextract.noesis`` extraction off the event
+2. summarizes content with the approved prompt, then awaits the authoritative
+   ``hyperextract.noesis`` extraction against that text off the event
    loop (``asyncio.to_thread`` — no daemon threads, no fire-and-forget);
 3. routes the outcome: ``[]`` is a silent success, hyper-extract alerts and
    hypotheses are recorded in ``noesis_core.ingestion_alerts``, and every fact
@@ -34,9 +35,10 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -62,9 +64,10 @@ from .noesis_embedding import (
 )
 
 try:  # hyperextract is an optional dependency; the public API is imported, never copied
-    from hyperextract.noesis import extract_noesis_components
+    from hyperextract.noesis import extract_noesis_components, summarize_noesis_text
 except ImportError:  # pragma: no cover - surfaced as a noesis_llm_config_invalid alert
     extract_noesis_components = None
+    summarize_noesis_text = None
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,7 @@ class NoesisInputItem:
     document_id: str | None
     item_index: int
     source: str = "hindsight_retain"
+    extraction_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -395,7 +399,7 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
         raise NoesisConfigError(f"retain LLM provider '{provider}' cannot be created by the Hyper-Extract client")
     try:
         from hyperextract import create_llm as he_create_llm
-        from hyperextract.noesis import create_noesis_extractor
+        from hyperextract.noesis import create_noesis_extractor, create_noesis_summarizer
     except ImportError as error:
         raise NoesisConfigError(f"hyperextract.noesis is unavailable: {error}") from error
     client = he_create_llm(
@@ -403,7 +407,12 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
         api_key=api_key,
         temperature=0,
     )
-    return create_noesis_extractor(llm_client=client)
+    extract_once = create_noesis_extractor(
+        llm_client=client,
+        json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
+    )
+    extract_once._noesis_summarize_once = create_noesis_summarizer(llm_client=client)
+    return extract_once
 
 
 # ---------------------------------------------------------------------------
@@ -1144,7 +1153,7 @@ def _build_event_data(
     *, item: NoesisInputItem, component_index: int, component_json: dict, time_metadata: dict
 ) -> dict:
     """Canonical envelope — requirement 02 §10.4."""
-    return {
+    data = {
         "contract_version": CONTRACT_VERSION,
         "bank_id": item.bank_id,
         "operation_id": item.operation_id,
@@ -1156,6 +1165,9 @@ def _build_event_data(
         "time_resolution": time_metadata,
         "component": component_json,
     }
+    if item.extraction_text is not None:
+        data["extraction_text"] = item.extraction_text
+    return data
 
 
 async def _write_alert(
@@ -1603,7 +1615,37 @@ async def _ingest_item(
     failures are isolated — cancellation propagates. (R02-04)"""
     try:
         try:
-            extraction_text = _render_extraction_text(item.content)
+            summarize_once = getattr(extract_once, "_noesis_summarize_once", None)
+            if not callable(summarize_once):
+                raise NoesisConfigError("Noesis extraction client has no summary stage")
+            extraction_text = await asyncio.to_thread(
+                summarize_noesis_text,
+                _render_extraction_text(item.content),
+                summarize_once=summarize_once,
+            )
+        except Exception as error:
+            logger.error("noesis summary failed for item %s: %s", item.item_index, type(error).__name__)
+            await _item_alert_safe(
+                schema,
+                item,
+                config,
+                pool_factory,
+                stage="source_summary",
+                alert_code="summary_failed",
+                severity="error",
+                message=f"noesis summary failed: {type(error).__name__}",
+                component_index=None,
+                event_id=None,
+                details={
+                    **build_source_envelope(item=item, attempts=0),
+                    "summary_attempts": 0 if isinstance(error, NoesisConfigError) else 2,
+                },
+            )
+            return
+        if not extraction_text:
+            return
+        item = replace(item, extraction_text=extraction_text)
+        try:
             outcome = await asyncio.to_thread(
                 extract_noesis_components,
                 extraction_text,
