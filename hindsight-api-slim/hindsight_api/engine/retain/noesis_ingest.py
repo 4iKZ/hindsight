@@ -1215,6 +1215,7 @@ async def _ingest_fact(
     embedding_client: Any,
     identity_spec: IdentitySpec,
     anchor_policy: AnchorRoutingPolicy,
+    predicate_anchor_policy: AnchorRoutingPolicy,
 ) -> tuple[int, dict[str, Any] | None]:
     """One fact, one short transaction.
 
@@ -1364,6 +1365,7 @@ async def _ingest_fact(
                 plan=plan,
                 context_vectors=context_vectors,
                 policy=anchor_policy,
+                predicate_policy=predicate_anchor_policy,
             )
             occurrence_frame = {occ.pos: occ.frame_pos for occ in plan.occurrences}
             for atom in component.atoms:
@@ -1446,6 +1448,7 @@ async def _route_component(
     embedding_client: Any,
     identity_spec: IdentitySpec,
     anchor_policy: AnchorRoutingPolicy,
+    predicate_anchor_policy: AnchorRoutingPolicy,
 ) -> None:
     component_json = component.model_dump(mode="json")
     data = _build_event_data(
@@ -1463,6 +1466,7 @@ async def _route_component(
             embedding_client=embedding_client,
             identity_spec=identity_spec,
             anchor_policy=anchor_policy,
+            predicate_anchor_policy=predicate_anchor_policy,
         )
     except EmbeddingProfileUnavailable as error:
         # Requirement 05A §5.3: the fixed sanitized component-drop alert. The
@@ -1680,6 +1684,12 @@ async def _ingest_item(
                 anchor_policy=AnchorRoutingPolicy(
                     reuse_max_distance=config.noesis_anchor_reuse_max_distance,
                     reuse_min_margin=config.noesis_anchor_reuse_min_margin,
+                    max_active=config.noesis_anchor_max_active,
+                    max_overflow=config.noesis_anchor_max_overflow,
+                ),
+                predicate_anchor_policy=AnchorRoutingPolicy(
+                    reuse_max_distance=config.noesis_anchor_predicate_reuse_max_distance,
+                    reuse_min_margin=config.noesis_anchor_predicate_reuse_min_margin,
                     max_active=config.noesis_anchor_max_active,
                     max_overflow=config.noesis_anchor_max_overflow,
                 ),
