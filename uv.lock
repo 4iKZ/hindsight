@@ -1945,7 +1945,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "huggingface-hub", marker = "extra == 'local-llm'", specifier = ">=0.20.0" },
     { name = "huggingface-hub", marker = "extra == 'local-onnx'", specifier = ">=0.20.0" },
-    { name = "hyperextract", marker = "extra == 'hypergraph'", git = "https://github.com/4iKZ/Hyper-Extract.git?rev=42ebf1192d5b3576415ad272ecfb36d53986737e" },
+    { name = "hyperextract", marker = "extra == 'hypergraph'", git = "https://github.com/4iKZ/Hyper-Extract.git?rev=05e6e1c74396de692b1e80bc3cbf8e549577ef1e" },
     { name = "json-repair", specifier = ">=0.63.2" },
     { name = "langchain-core", specifier = ">=1.2.22" },
     { name = "langchain-text-splitters", specifier = ">=0.3.0" },
@@ -2240,7 +2240,7 @@ wheels = [
 [[package]]
 name = "hyperextract"
 version = "0.4.0"
-source = { git = "https://github.com/4iKZ/Hyper-Extract.git?rev=42ebf1192d5b3576415ad272ecfb36d53986737e#42ebf1192d5b3576415ad272ecfb36d53986737e" }
+source = { git = "https://github.com/4iKZ/Hyper-Extract.git?rev=05e6e1c74396de692b1e80bc3cbf8e549577ef1e#05e6e1c74396de692b1e80bc3cbf8e549577ef1e" }
 dependencies = [
     { name = "faiss-cpu" },
     { name = "langchain" },
