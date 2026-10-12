@@ -1638,6 +1638,29 @@ class ListMemoryUnitsResponse(BaseModel):
     offset: int
 
 
+class NoesisQueryAtomsRequest(BaseModel):
+    """One user utterance (question, statement, command, log, chit-chat) to turn into main atoms."""
+
+    query: str = Field(max_length=2000, description="The user's utterance.")
+
+    @field_validator("query")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be blank")
+        return value
+
+
+class NoesisQueryAtom(BaseModel):
+    text: str
+    type: str = Field(description="E (entity) or P (predicate).")
+    role: str = Field(description="agent, predicate, patient or modifier.")
+
+
+class NoesisQueryAtomsResponse(BaseModel):
+    atoms: list[NoesisQueryAtom] = Field(description="Empty when the utterance has nothing to extract.")
+
+
 class DryRunExtractRequest(BaseModel):
     """Request to run fact extraction ONLY (no resolution/links/embeddings/persistence).
 
@@ -4528,6 +4551,41 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/memories/list: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/noesis/query-atoms",
+        response_model=NoesisQueryAtomsResponse,
+        summary="Extract the main Noesis atoms from a user utterance (read-only)",
+        description=(
+            "Extracts the main Noesis atoms (text, type, role) from one user utterance in a single LLM call. "
+            "Uses the bank's retain LLM and Memory Defense redaction; reads and writes nothing. Returns "
+            "`atoms: []` when there is nothing to extract; 502 with an error code when extraction fails."
+        ),
+        operation_id="noesis_query_atoms",
+        tags=["Memory"],
+    )
+    async def api_noesis_query_atoms(
+        bank_id: str,
+        body: NoesisQueryAtomsRequest,
+        request_context: RequestContext = Depends(get_request_context),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
+    ):
+        from hindsight_api.engine.retain.noesis_query import NoesisQueryError
+
+        try:
+            atoms = await app.state.memory.extract_noesis_query_atoms(
+                bank_id, body.query, request_context=request_context
+            )
+            return NoesisQueryAtomsResponse(atoms=[NoesisQueryAtom(**atom) for atom in atoms])
+        except NoesisQueryError as e:
+            raise HTTPException(status_code=502, detail={"error": e.code})
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in /v1/default/banks/{bank_id}/noesis/query-atoms: {type(e).__name__}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def _require_dry_run_enabled() -> None:

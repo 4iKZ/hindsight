@@ -390,8 +390,12 @@ def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
     )
 
 
-def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]:
-    """Reuse the resolved retain LLM through Hyper-Extract's public API only."""
+def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = False) -> Callable[[str], object]:
+    """Reuse the resolved retain LLM through Hyper-Extract's public API only.
+
+    ``query_atoms`` (read-only query path) additionally attaches the query-atoms
+    extractor; it is opt-in so ingestion keeps working against Hyper-Extract pins without it.
+    """
     provider, model, base_url, api_key = _resolve_llm_spec(llm_config)
     if not provider or not model:
         raise NoesisConfigError("noesis extraction requires a resolved retain LLM provider and model")
@@ -412,6 +416,15 @@ def _production_extract_once_factory(llm_config: Any) -> Callable[[str], object]
         json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
     )
     extract_once._noesis_summarize_once = create_noesis_summarizer(llm_client=client)
+    if query_atoms:
+        try:
+            from hyperextract.noesis import create_noesis_query_extractor
+        except ImportError as error:
+            raise NoesisConfigError(f"hyperextract.noesis query atoms unavailable: {error}") from error
+        extract_once._noesis_query_once = create_noesis_query_extractor(
+            llm_client=client,
+            json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
+        )
     return extract_once
 
 

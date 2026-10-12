@@ -10157,6 +10157,17 @@ class MemoryEngine(MemoryEngineInterface):
         ]
         return DryRunExtractionResult(facts=extracted, usage=usage)
 
+    async def extract_noesis_query_atoms(
+        self, bank_id: str, query: str, *, request_context: "RequestContext"
+    ) -> list[dict[str, str]]:
+        """Read-only Noesis query path: utterance -> main atoms, using the bank's retain LLM."""
+        from .retain.noesis_query import extract_query_atoms
+
+        await self._authenticate_tenant(request_context)
+        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
+        return await extract_query_atoms(query, llm_config=retain_llm, config=resolved_config)
+
     async def list_memory_units(
         self,
         bank_id: str,
