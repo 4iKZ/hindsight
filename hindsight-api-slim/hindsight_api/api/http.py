@@ -4558,10 +4558,9 @@ def _register_routes(app: FastAPI):
         response_model=NoesisQueryAtomsResponse,
         summary="Extract the main Noesis atoms from a user utterance (read-only)",
         description=(
-            "Rewrites one user utterance into plain statements, runs the Noesis event-closure extraction "
-            "and returns the flat atom list (text, type, role). Uses the bank's retain LLM and Memory "
-            "Defense redaction; reads and writes nothing. Returns `atoms: []` when there is nothing to "
-            "extract; 502 with an error code when rewrite/extraction fails."
+            "Extracts the main Noesis atoms (text, type, role) from one user utterance in a single LLM call. "
+            "Uses the bank's retain LLM and Memory Defense redaction; reads and writes nothing. Returns "
+            "`atoms: []` when there is nothing to extract; 502 with an error code when extraction fails."
         ),
         operation_id="noesis_query_atoms",
         tags=["Memory"],
