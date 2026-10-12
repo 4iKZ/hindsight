@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import Any
 
-from .noesis_ingest import NoesisConfigError, _production_extract_once_factory
+from .noesis_ingest import NoesisConfigError, _production_extract_once_factory, resolve_noesis_llm
 from .orchestrator import redact_document_body
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ async def extract_query_atoms(query: str, *, llm_config: Any, config: Any) -> li
     except ImportError as error:
         raise NoesisQueryError("noesis_llm_config_invalid") from error
     try:
-        extract_once = _production_extract_once_factory(llm_config, query_atoms=True)
+        extract_once = _production_extract_once_factory(resolve_noesis_llm(llm_config, config), query_atoms=True)
     except NoesisConfigError as error:
         logger.error("noesis query config invalid: %s", error)
         raise NoesisQueryError("noesis_llm_config_invalid") from error

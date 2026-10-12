@@ -37,6 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Callable
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -377,6 +378,22 @@ async def normalize_items(
 # ---------------------------------------------------------------------------
 
 
+def resolve_noesis_llm(llm_config: Any, config: Any) -> Any:
+    """The dedicated Noesis LLM when HINDSIGHT_API_NOESIS_LLM_* is set, else the retain LLM unchanged."""
+    provider = getattr(config, "noesis_llm_provider", "") or ""
+    model = getattr(config, "noesis_llm_model", "") or ""
+    if not provider and not model:
+        return llm_config
+    if not provider or not model:
+        raise NoesisConfigError("HINDSIGHT_API_NOESIS_LLM_PROVIDER and _MODEL must be set together")
+    return SimpleNamespace(
+        provider=provider,
+        model=model,
+        base_url=getattr(config, "noesis_llm_base_url", "") or "",
+        api_key=getattr(config, "noesis_llm_api_key", "") or "",
+    )
+
+
 def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
     config = llm_config
     members = getattr(llm_config, "members", None)
@@ -406,11 +423,14 @@ def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = Fal
         from hyperextract.noesis import create_noesis_extractor, create_noesis_summarizer
     except ImportError as error:
         raise NoesisConfigError(f"hyperextract.noesis is unavailable: {error}") from error
-    client = he_create_llm(
-        {"provider": provider, "model": model, "base_url": base_url},
-        api_key=api_key,
-        temperature=0,
-    )
+    spec: dict[str, Any] = {"provider": provider, "model": model, "base_url": base_url}
+    if provider.lower() == "deepseek":
+        # Hyper-Extract's deepseek preset disables thinking by default; ingestion and the
+        # query path run with thinking on (the DeepSeek default, as on every other
+        # provider), otherwise multi-clause closures lose a component. Only the official
+        # "deepseek" provider takes this branch; "openai"-spelled gateways are untouched.
+        spec["extra_body"] = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    client = he_create_llm(spec, api_key=api_key, temperature=0)
     extract_once = create_noesis_extractor(
         llm_client=client,
         json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
@@ -1837,7 +1857,9 @@ async def ingest_noesis_batch(
         return
 
     try:
-        extract_once = (extract_once_factory or _production_extract_once_factory)(llm_config)
+        extract_once = (extract_once_factory or _production_extract_once_factory)(
+            resolve_noesis_llm(llm_config, config)
+        )
     except Exception as error:
         logger.error("noesis extraction client unavailable: %s", type(error).__name__)
         try:

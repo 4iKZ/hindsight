@@ -124,3 +124,83 @@ def test_factory_attaches_query_extractor_only_on_request(monkeypatch):
     with_query = noesis_ingest._production_extract_once_factory(llm_config(), query_atoms=True)
     assert with_query._noesis_query_once("x") == {"atoms": []}
     assert seen == [(client, False)]
+
+
+def _capture_factory(monkeypatch, provider, base_url):
+    import hyperextract
+    import hyperextract.noesis as he_noesis
+
+    seen = SimpleNamespace(spec=None, summarizer_kwargs=None)
+
+    def create_llm(spec, **kwargs):
+        seen.spec = spec
+        return object()
+
+    def create_summarizer(*, llm_client, **kwargs):
+        seen.summarizer_kwargs = kwargs
+        return lambda text: "s"
+
+    monkeypatch.setattr(hyperextract, "create_llm", create_llm)
+    monkeypatch.setattr(he_noesis, "create_noesis_extractor", lambda *, llm_client, json_mode=False: lambda text: [])
+    monkeypatch.setattr(he_noesis, "create_noesis_summarizer", create_summarizer)
+    config = llm_config(provider=provider)
+    config.base_url = base_url
+    noesis_ingest._production_extract_once_factory(config)
+    return seen
+
+
+def test_official_deepseek_provider_runs_with_thinking_at_high_effort(monkeypatch):
+    seen = _capture_factory(monkeypatch, "deepseek", "https://api.deepseek.com")
+    assert seen.spec["extra_body"] == {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    assert seen.summarizer_kwargs == {}
+
+
+@pytest.mark.parametrize(
+    "provider,base_url",
+    [("openai", "https://aixapex.example/v1"), ("openai", "https://api.deepseek.com"), ("anthropic", "")],
+)
+def test_other_providers_keep_the_exact_previous_client_spec(monkeypatch, provider, base_url):
+    seen = _capture_factory(monkeypatch, provider, base_url)
+    assert seen.spec == {"provider": provider, "model": "test-model", "base_url": base_url}
+    assert seen.summarizer_kwargs == {}
+
+
+def test_dedicated_noesis_llm_overrides_the_retain_llm_only_when_configured():
+    retain = llm_config(provider="openai")
+    unset = noesis_config()
+    assert noesis_ingest.resolve_noesis_llm(retain, unset) is retain
+
+    cfg = noesis_config(
+        noesis_llm_provider="deepseek",
+        noesis_llm_model="deepseek-flash",
+        noesis_llm_base_url="https://api.deepseek.com",
+        noesis_llm_api_key="sk-test",
+    )
+    resolved = noesis_ingest.resolve_noesis_llm(retain, cfg)
+    assert noesis_ingest._resolve_llm_spec(resolved) == (
+        "deepseek",
+        "deepseek-flash",
+        "https://api.deepseek.com",
+        "sk-test",
+    )
+
+
+def test_dedicated_noesis_llm_needs_provider_and_model_together():
+    with pytest.raises(noesis_ingest.NoesisConfigError):
+        noesis_ingest.resolve_noesis_llm(llm_config(), noesis_config(noesis_llm_provider="deepseek"))
+    with pytest.raises(noesis_ingest.NoesisConfigError):
+        noesis_ingest.resolve_noesis_llm(llm_config(), noesis_config(noesis_llm_model="deepseek-flash"))
+
+
+async def test_query_path_uses_the_dedicated_noesis_llm(pipeline, monkeypatch):
+    seen = []
+    real_factory = noesis_query._production_extract_once_factory
+
+    def spy(llm, *, query_atoms=False):
+        seen.append(noesis_ingest._resolve_llm_spec(llm)[:2])
+        return real_factory(llm, query_atoms=query_atoms)
+
+    monkeypatch.setattr(noesis_query, "_production_extract_once_factory", spy)
+    cfg = noesis_config(noesis_llm_provider="deepseek", noesis_llm_model="deepseek-flash")
+    await extract_query_atoms("q", llm_config=llm_config(provider="openai"), config=cfg)
+    assert seen == [("deepseek", "deepseek-flash")]
