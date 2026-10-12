@@ -424,6 +424,9 @@ def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = Fal
     except ImportError as error:
         raise NoesisConfigError(f"hyperextract.noesis is unavailable: {error}") from error
     spec: dict[str, Any] = {"provider": provider, "model": model, "base_url": base_url}
+    glm_json_mode = urlsplit(base_url).hostname == "open.bigmodel.cn"
+    if glm_json_mode:
+        spec["extra_body"] = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
     if provider.lower() == "deepseek":
         # Hyper-Extract's deepseek preset disables thinking by default; ingestion and the
         # query path run with thinking on (the DeepSeek default, as on every other
@@ -433,7 +436,7 @@ def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = Fal
     client = he_create_llm(spec, api_key=api_key, temperature=0)
     extract_once = create_noesis_extractor(
         llm_client=client,
-        json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
+        json_mode=glm_json_mode or urlsplit(base_url).hostname == "api.deepseek.com",
     )
     extract_once._noesis_summarize_once = create_noesis_summarizer(llm_client=client)
     if query_atoms:
@@ -443,7 +446,7 @@ def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = Fal
             raise NoesisConfigError(f"hyperextract.noesis query atoms unavailable: {error}") from error
         extract_once._noesis_query_once = create_noesis_query_extractor(
             llm_client=client,
-            json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
+            json_mode=glm_json_mode or urlsplit(base_url).hostname == "api.deepseek.com",
         )
     return extract_once
 
