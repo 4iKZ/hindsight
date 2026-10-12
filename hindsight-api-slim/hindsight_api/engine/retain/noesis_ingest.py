@@ -406,11 +406,14 @@ def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = Fal
         from hyperextract.noesis import create_noesis_extractor, create_noesis_summarizer
     except ImportError as error:
         raise NoesisConfigError(f"hyperextract.noesis is unavailable: {error}") from error
-    client = he_create_llm(
-        {"provider": provider, "model": model, "base_url": base_url},
-        api_key=api_key,
-        temperature=0,
-    )
+    spec: dict[str, Any] = {"provider": provider, "model": model, "base_url": base_url}
+    if provider.lower() == "deepseek":
+        # Hyper-Extract's deepseek preset disables thinking by default; ingestion and the
+        # query path run with thinking on (the DeepSeek default, as on every other
+        # provider), otherwise multi-clause closures lose a component. Only the official
+        # "deepseek" provider takes this branch; "openai"-spelled gateways are untouched.
+        spec["extra_body"] = {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    client = he_create_llm(spec, api_key=api_key, temperature=0)
     extract_once = create_noesis_extractor(
         llm_client=client,
         json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
