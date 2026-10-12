@@ -37,6 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, Callable
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
@@ -375,6 +376,22 @@ async def normalize_items(
 # ---------------------------------------------------------------------------
 # Extraction client (requirement 02 §7)
 # ---------------------------------------------------------------------------
+
+
+def resolve_noesis_llm(llm_config: Any, config: Any) -> Any:
+    """The dedicated Noesis LLM when HINDSIGHT_API_NOESIS_LLM_* is set, else the retain LLM unchanged."""
+    provider = getattr(config, "noesis_llm_provider", "") or ""
+    model = getattr(config, "noesis_llm_model", "") or ""
+    if not provider and not model:
+        return llm_config
+    if not provider or not model:
+        raise NoesisConfigError("HINDSIGHT_API_NOESIS_LLM_PROVIDER and _MODEL must be set together")
+    return SimpleNamespace(
+        provider=provider,
+        model=model,
+        base_url=getattr(config, "noesis_llm_base_url", "") or "",
+        api_key=getattr(config, "noesis_llm_api_key", "") or "",
+    )
 
 
 def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
@@ -1840,7 +1857,9 @@ async def ingest_noesis_batch(
         return
 
     try:
-        extract_once = (extract_once_factory or _production_extract_once_factory)(llm_config)
+        extract_once = (extract_once_factory or _production_extract_once_factory)(
+            resolve_noesis_llm(llm_config, config)
+        )
     except Exception as error:
         logger.error("noesis extraction client unavailable: %s", type(error).__name__)
         try:

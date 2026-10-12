@@ -920,6 +920,12 @@ ENV_NOESIS_EMBEDDING_DIMENSION = "HINDSIGHT_API_NOESIS_EMBEDDING_DIMENSION"
 ENV_NOESIS_EMBEDDING_TIMEOUT_SECONDS = "HINDSIGHT_API_NOESIS_EMBEDDING_TIMEOUT_SECONDS"
 ENV_NOESIS_EMBEDDING_MAX_RETRIES = "HINDSIGHT_API_NOESIS_EMBEDDING_MAX_RETRIES"
 ENV_NOESIS_EMBEDDING_API_KEY = "HINDSIGHT_API_NOESIS_EMBEDDING_API_KEY"
+# Optional dedicated LLM for the Noesis stage (summary + extraction + query-atoms).
+# Empty provider = reuse the resolved retain LLM (previous behavior).
+ENV_NOESIS_LLM_PROVIDER = "HINDSIGHT_API_NOESIS_LLM_PROVIDER"
+ENV_NOESIS_LLM_MODEL = "HINDSIGHT_API_NOESIS_LLM_MODEL"
+ENV_NOESIS_LLM_BASE_URL = "HINDSIGHT_API_NOESIS_LLM_BASE_URL"
+ENV_NOESIS_LLM_API_KEY = "HINDSIGHT_API_NOESIS_LLM_API_KEY"
 
 # Default values
 DEFAULT_DATABASE_BACKEND = "postgresql"
@@ -1643,6 +1649,10 @@ DEFAULT_NOESIS_EMBEDDING_DIMENSION = 1024
 DEFAULT_NOESIS_EMBEDDING_TIMEOUT_SECONDS = 2.0
 DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES = 1
 DEFAULT_NOESIS_EMBEDDING_API_KEY = ""
+DEFAULT_NOESIS_LLM_PROVIDER = ""
+DEFAULT_NOESIS_LLM_MODEL = ""
+DEFAULT_NOESIS_LLM_BASE_URL = ""
+DEFAULT_NOESIS_LLM_API_KEY = ""
 
 
 class JsonFormatter(logging.Formatter):
@@ -2911,6 +2921,10 @@ class HindsightConfig:
     noesis_embedding_timeout_seconds: float = DEFAULT_NOESIS_EMBEDDING_TIMEOUT_SECONDS
     noesis_embedding_max_retries: int = DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES
     noesis_embedding_api_key: str = DEFAULT_NOESIS_EMBEDDING_API_KEY
+    noesis_llm_provider: str = DEFAULT_NOESIS_LLM_PROVIDER
+    noesis_llm_model: str = DEFAULT_NOESIS_LLM_MODEL
+    noesis_llm_base_url: str = DEFAULT_NOESIS_LLM_BASE_URL
+    noesis_llm_api_key: str = DEFAULT_NOESIS_LLM_API_KEY
 
     # Class-level sets for configuration categorization
 
@@ -2925,6 +2939,8 @@ class HindsightConfig:
         "noesis_database_url",
         # Noesis identity embedding service bearer token (requirement 03)
         "noesis_embedding_api_key",
+        # Noesis dedicated LLM key
+        "noesis_llm_api_key",
         # LiteLLM Router chains — entries embed api_keys and base_urls
         "llm_litellmrouter_config",
         "retain_llm_litellmrouter_config",
@@ -4410,6 +4426,10 @@ class HindsightConfig:
                 os.getenv(ENV_NOESIS_EMBEDDING_MAX_RETRIES, str(DEFAULT_NOESIS_EMBEDDING_MAX_RETRIES))
             ),
             noesis_embedding_api_key=os.getenv(ENV_NOESIS_EMBEDDING_API_KEY, DEFAULT_NOESIS_EMBEDDING_API_KEY),
+            noesis_llm_provider=os.getenv(ENV_NOESIS_LLM_PROVIDER, DEFAULT_NOESIS_LLM_PROVIDER).strip(),
+            noesis_llm_model=os.getenv(ENV_NOESIS_LLM_MODEL, DEFAULT_NOESIS_LLM_MODEL).strip(),
+            noesis_llm_base_url=os.getenv(ENV_NOESIS_LLM_BASE_URL, DEFAULT_NOESIS_LLM_BASE_URL).strip(),
+            noesis_llm_api_key=os.getenv(ENV_NOESIS_LLM_API_KEY, DEFAULT_NOESIS_LLM_API_KEY),
         )
         config.validate()
         return config
