@@ -133,6 +133,15 @@ async def test_extraction_crash_is_coded(pipeline):
     assert error.value.code == "extraction_failed"
 
 
+async def test_failed_extraction_outcome_is_error_not_empty(pipeline):
+    pipeline.rewrite = lambda t: "连接池被打满"
+    failed = SimpleNamespace(alert_code="extraction_failed")
+    pipeline.extract = lambda t: outcome([], [failed])
+    with pytest.raises(NoesisQueryError) as error:
+        await run()
+    assert error.value.code == "extraction_failed"
+
+
 async def test_all_components_dropped_is_invalid_not_empty(pipeline):
     pipeline.rewrite = lambda t: "连接池被打满"
     dropped = SimpleNamespace(alert_code="invalid_component_dropped")

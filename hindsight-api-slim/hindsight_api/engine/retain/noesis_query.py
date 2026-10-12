@@ -71,6 +71,11 @@ async def extract_query_atoms(query: str, *, llm_config: Any, config: Any) -> li
     except Exception as error:
         logger.error("noesis query extraction failed: %s", type(error).__name__)
         raise NoesisQueryError("extraction_failed") from error
-    if not outcome.components and any(a.alert_code == "invalid_component_dropped" for a in outcome.alerts):
-        raise NoesisQueryError("extraction_invalid")
+    if not outcome.components:
+        codes = {a.alert_code for a in outcome.alerts}
+        # HE reports a failed extraction as an empty outcome plus an alert, not as an exception.
+        if "extraction_failed" in codes:
+            raise NoesisQueryError("extraction_failed")
+        if "invalid_component_dropped" in codes:
+            raise NoesisQueryError("extraction_invalid")
     return collect_atoms(outcome.components)
