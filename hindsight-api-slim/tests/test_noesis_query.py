@@ -1,4 +1,4 @@
-"""Read-only Noesis query path: utterance -> rewrite -> extraction -> flat atoms."""
+"""Read-only Noesis query path: utterance -> single HE call -> filtered flat atoms."""
 
 from types import SimpleNamespace
 
@@ -10,70 +10,56 @@ from tests.noesis_fakes import llm_config, noesis_config
 
 
 def atom(text, type_="E", role="modifier"):
-    return SimpleNamespace(text=text, type=type_, role=role)
-
-
-def component(*atoms):
-    return SimpleNamespace(atoms=list(atoms))
-
-
-def outcome(components, alerts=()):
-    return SimpleNamespace(components=list(components), alerts=list(alerts), attempts=1)
+    return {"text": text, "type": type_, "role": role}
 
 
 def test_collect_atoms_filters_filler_modifiers_and_dedupes_by_role():
     atoms = collect_atoms(
         [
-            component(
-                atom("订单服务", role="agent"),
-                atom("重启", "P", "predicate"),
-                atom("后"),
-                atom("很"),
-                atom("经常"),
-                atom("没"),
-                atom("G1", "G", "agent"),
-            ),
-            component(atom("订单服务", role="agent"), atom("连接池", role="patient"), atom("订单服务", role="patient")),
+            atom("订单服务", role="agent"),
+            atom("重启", "P", "predicate"),
+            atom("后"),
+            atom("很"),
+            atom("经常"),
+            atom("没"),
+            atom("订单服务", role="agent"),
+            atom("订单服务", role="patient"),
         ]
     )
     assert atoms == [
-        {"text": "订单服务", "type": "E", "role": "agent"},
-        {"text": "重启", "type": "P", "role": "predicate"},
-        {"text": "经常", "type": "E", "role": "modifier"},
-        {"text": "没", "type": "E", "role": "modifier"},
-        {"text": "连接池", "type": "E", "role": "patient"},
-        {"text": "订单服务", "type": "E", "role": "patient"},
+        atom("订单服务", role="agent"),
+        atom("重启", "P", "predicate"),
+        atom("经常"),
+        atom("没"),
+        atom("订单服务", role="patient"),
     ]
 
 
 def test_collect_atoms_keeps_filler_text_when_not_modifier():
-    assert collect_atoms([component(atom("后", role="agent"))]) == [{"text": "后", "type": "E", "role": "agent"}]
+    assert collect_atoms([atom("后", role="agent")]) == [atom("后", role="agent")]
 
 
 @pytest.fixture
 def pipeline(monkeypatch):
-    """Seams: factory returns an object carrying the rewrite stage; extraction is scripted."""
+    """Seams: the factory carries the query extractor; Hyper-Extract's validator is scripted."""
     import hyperextract.noesis as he_noesis
 
-    state = SimpleNamespace(rewrite_inputs=[], extract_inputs=[], rewrite=lambda t: t, extract=lambda t: outcome([]))
+    state = SimpleNamespace(inputs=[], result=lambda text: [])
 
-    def rewrite_once(text):
-        state.rewrite_inputs.append(text)
-        return state.rewrite(text)
-
-    def factory(config, *, query_rewriter=False):
-        assert query_rewriter is True
+    def factory(config, *, query_atoms=False):
+        assert query_atoms is True
         extract_once = lambda text: []  # noqa: E731
-        extract_once._noesis_rewrite_once = rewrite_once
+        extract_once._noesis_query_once = "query-once"
         return extract_once
 
-    def fake_extract(text, *, extract_once, critic_once=None):
-        state.extract_inputs.append(text)
-        return state.extract(text)
+    def fake_extract(text, *, extract_once):
+        assert extract_once == "query-once"
+        state.inputs.append(text)
+        return state.result(text)
 
     monkeypatch.setattr(noesis_query, "_production_extract_once_factory", factory)
     monkeypatch.setattr(noesis_query, "redact_document_body", lambda body, config: body)
-    monkeypatch.setattr(he_noesis, "extract_noesis_components", fake_extract)
+    monkeypatch.setattr(he_noesis, "extract_noesis_query_atoms", fake_extract)
     return state
 
 
@@ -81,85 +67,34 @@ async def run(query="为啥连接池被打满？"):
     return await extract_query_atoms(query, llm_config=llm_config(), config=noesis_config())
 
 
-async def test_returns_atoms_from_rewritten_text(pipeline):
-    pipeline.rewrite = lambda t: "连接池被打满"
-    pipeline.extract = lambda t: outcome([component(atom("连接池", role="agent"), atom("打满", "P", "predicate"))])
-    assert await run() == [
-        {"text": "连接池", "type": "E", "role": "agent"},
-        {"text": "打满", "type": "P", "role": "predicate"},
-    ]
-    assert pipeline.rewrite_inputs == ["为啥连接池被打满？"]
-    assert pipeline.extract_inputs == ["连接池被打满"]
+async def test_returns_filtered_atoms(pipeline):
+    pipeline.result = lambda t: [atom("连接池", role="patient"), atom("打满", "P", "predicate"), atom("很")]
+    assert await run() == [atom("连接池", role="patient"), atom("打满", "P", "predicate")]
+    assert pipeline.inputs == ["为啥连接池被打满？"]
 
 
-async def test_redaction_runs_before_rewrite(pipeline, monkeypatch):
+async def test_redaction_runs_before_extraction(pipeline, monkeypatch):
     monkeypatch.setattr(noesis_query, "redact_document_body", lambda body, config: body.replace("secret", "***"))
-    pipeline.rewrite = lambda t: ""
     await run("password secret")
-    assert pipeline.rewrite_inputs == ["password ***"]
+    assert pipeline.inputs == ["password ***"]
 
 
-async def test_empty_rewrite_returns_empty_without_extraction(pipeline):
-    pipeline.rewrite = lambda t: ""
+async def test_empty_result_is_empty_not_error(pipeline):
     assert await run("你好，在吗？") == []
-    assert pipeline.extract_inputs == []
 
 
-async def test_empty_extraction_is_empty_not_error(pipeline):
-    pipeline.rewrite = lambda t: "今天天气"
-    assert await run() == []
-
-
-async def test_rewrite_failure_is_coded_after_one_retry(pipeline):
+async def test_extraction_failure_is_coded(pipeline):
     def boom(text):
         raise RuntimeError("down")
 
-    pipeline.rewrite = boom
-    with pytest.raises(NoesisQueryError) as error:
-        await run()
-    assert error.value.code == "rewrite_failed"
-    assert len(pipeline.rewrite_inputs) == 2
-
-
-async def test_extraction_crash_is_coded(pipeline):
-    pipeline.rewrite = lambda t: "连接池被打满"
-
-    def boom(text):
-        raise RuntimeError("down")
-
-    pipeline.extract = boom
+    pipeline.result = boom
     with pytest.raises(NoesisQueryError) as error:
         await run()
     assert error.value.code == "extraction_failed"
-
-
-async def test_failed_extraction_outcome_is_error_not_empty(pipeline):
-    pipeline.rewrite = lambda t: "连接池被打满"
-    failed = SimpleNamespace(alert_code="extraction_failed")
-    pipeline.extract = lambda t: outcome([], [failed])
-    with pytest.raises(NoesisQueryError) as error:
-        await run()
-    assert error.value.code == "extraction_failed"
-
-
-async def test_all_components_dropped_is_invalid_not_empty(pipeline):
-    pipeline.rewrite = lambda t: "连接池被打满"
-    dropped = SimpleNamespace(alert_code="invalid_component_dropped")
-    pipeline.extract = lambda t: outcome([], [dropped])
-    with pytest.raises(NoesisQueryError) as error:
-        await run()
-    assert error.value.code == "extraction_invalid"
-
-
-async def test_partial_drop_returns_remaining_atoms(pipeline):
-    pipeline.rewrite = lambda t: "连接池被打满"
-    dropped = SimpleNamespace(alert_code="invalid_component_dropped")
-    pipeline.extract = lambda t: outcome([component(atom("连接池", role="agent"))], [dropped])
-    assert await run() == [{"text": "连接池", "type": "E", "role": "agent"}]
 
 
 async def test_invalid_llm_config_is_coded(monkeypatch):
-    def factory(config, *, query_rewriter=False):
+    def factory(config, *, query_atoms=False):
         raise noesis_ingest.NoesisConfigError("bad")
 
     monkeypatch.setattr(noesis_query, "_production_extract_once_factory", factory)
@@ -168,17 +103,24 @@ async def test_invalid_llm_config_is_coded(monkeypatch):
     assert error.value.code == "noesis_llm_config_invalid"
 
 
-def test_factory_attaches_rewriter_only_on_request(monkeypatch):
+def test_factory_attaches_query_extractor_only_on_request(monkeypatch):
     import hyperextract
     import hyperextract.noesis as he_noesis
 
     client = object()
+    seen = []
     monkeypatch.setattr(hyperextract, "create_llm", lambda *args, **kwargs: client)
     monkeypatch.setattr(he_noesis, "create_noesis_extractor", lambda *, llm_client, json_mode=False: lambda text: [])
     monkeypatch.setattr(he_noesis, "create_noesis_summarizer", lambda *, llm_client: lambda text: "s")
-    monkeypatch.setattr(he_noesis, "create_noesis_query_rewriter", lambda *, llm_client: lambda text: f"q:{text}")
+
+    def create_query(*, llm_client, json_mode=False):
+        seen.append((llm_client, json_mode))
+        return lambda text: {"atoms": []}
+
+    monkeypatch.setattr(he_noesis, "create_noesis_query_extractor", create_query)
 
     plain = noesis_ingest._production_extract_once_factory(llm_config())
-    assert not hasattr(plain, "_noesis_rewrite_once")
-    with_rewriter = noesis_ingest._production_extract_once_factory(llm_config(), query_rewriter=True)
-    assert with_rewriter._noesis_rewrite_once("x") == "q:x"
+    assert not hasattr(plain, "_noesis_query_once")
+    with_query = noesis_ingest._production_extract_once_factory(llm_config(), query_atoms=True)
+    assert with_query._noesis_query_once("x") == {"atoms": []}
+    assert seen == [(client, False)]

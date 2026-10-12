@@ -390,11 +390,11 @@ def _resolve_llm_spec(llm_config: Any) -> tuple[str, str, str, str]:
     )
 
 
-def _production_extract_once_factory(llm_config: Any, *, query_rewriter: bool = False) -> Callable[[str], object]:
+def _production_extract_once_factory(llm_config: Any, *, query_atoms: bool = False) -> Callable[[str], object]:
     """Reuse the resolved retain LLM through Hyper-Extract's public API only.
 
-    ``query_rewriter`` (read-only query path) additionally attaches the query-rewrite
-    stage; it is opt-in so ingestion keeps working against Hyper-Extract pins without it.
+    ``query_atoms`` (read-only query path) additionally attaches the query-atoms
+    extractor; it is opt-in so ingestion keeps working against Hyper-Extract pins without it.
     """
     provider, model, base_url, api_key = _resolve_llm_spec(llm_config)
     if not provider or not model:
@@ -416,12 +416,15 @@ def _production_extract_once_factory(llm_config: Any, *, query_rewriter: bool = 
         json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
     )
     extract_once._noesis_summarize_once = create_noesis_summarizer(llm_client=client)
-    if query_rewriter:
+    if query_atoms:
         try:
-            from hyperextract.noesis import create_noesis_query_rewriter
+            from hyperextract.noesis import create_noesis_query_extractor
         except ImportError as error:
-            raise NoesisConfigError(f"hyperextract.noesis query rewrite unavailable: {error}") from error
-        extract_once._noesis_rewrite_once = create_noesis_query_rewriter(llm_client=client)
+            raise NoesisConfigError(f"hyperextract.noesis query atoms unavailable: {error}") from error
+        extract_once._noesis_query_once = create_noesis_query_extractor(
+            llm_client=client,
+            json_mode=urlsplit(base_url).hostname == "api.deepseek.com",
+        )
     return extract_once
 
 
