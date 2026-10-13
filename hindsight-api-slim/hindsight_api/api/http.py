@@ -189,6 +189,7 @@ from hindsight_api.engine.response_models import (
     TemporalWindow,
     TokenUsage,
 )
+from hindsight_api.engine.retain.noesis_recall import RecallRule
 from hindsight_api.engine.retain.types import RetainContentDict
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
 from hindsight_api.engine.structured_output import validate_response_schema
@@ -1685,6 +1686,26 @@ class NoesisRetainResponse(BaseModel):
     bank_id: str = Field(description="Requested memory bank identifier.")
     items_count: int = Field(description="Number of items submitted, including blocked items.")
     results: list[NoesisRetainResult] = Field(description="One outcome per original request item, in request order.")
+
+
+class NoesisRecallRequest(BaseModel):
+    query: str = Field(max_length=2000, description="One utterance to recall matching Noesis rules for.")
+    top_n: int = Field(default=3, ge=1, le=10, description="How many best-matching rules to return.")
+    restore_limit: int = Field(default=5, ge=0, le=20, description="Positive example events restored per rule.")
+
+    @field_validator("query")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be blank")
+        return value
+
+
+class NoesisRecallResponse(BaseModel):
+    query: str = Field(description="The request query, echoed.")
+    count: int = Field(description="Number of rules returned.")
+    atom_ids: list[int] = Field(description="Stored atoms the query was resolved to; empty means nothing matched.")
+    rules: list[RecallRule] = Field(description="Best-matching rules first.")
 
 
 class DryRunExtractRequest(BaseModel):
@@ -4614,6 +4635,54 @@ def _register_routes(app: FastAPI):
             raise
         except Exception as e:
             logger.error(f"Error in /v1/default/banks/{bank_id}/noesis/query-atoms: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/noesis/recall",
+        response_model=NoesisRecallResponse,
+        summary="Recall the Noesis rules that match an utterance (read-only)",
+        description=(
+            "Resolves the utterance to stored atoms (one LLM call, as in query-atoms), runs the abduction "
+            "engine to find the best-matching rules and their positive example events, and polishes one "
+            "sentence per rule with the Noesis LLM. Nothing is written. No match is `rules: []`, not an error. "
+            "Typically 10-20 seconds; allow client timeouts of 60 seconds or more."
+        ),
+        operation_id="noesis_recall",
+        tags=["Memory"],
+    )
+    async def api_noesis_recall(
+        bank_id: str,
+        body: NoesisRecallRequest,
+        request_context: RequestContext = Depends(get_request_context),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
+    ) -> NoesisRecallResponse:
+        from hindsight_api.engine.memory_engine import NoesisDisabledError
+        from hindsight_api.engine.retain.noesis_query import NoesisQueryError
+        from hindsight_api.engine.retain.noesis_recall import NoesisRecallError, NoesisRecallUnavailableError
+
+        try:
+            result = await app.state.memory.recall_noesis(
+                bank_id,
+                body.query,
+                top_n=body.top_n,
+                restore_limit=body.restore_limit,
+                request_context=request_context,
+            )
+            return NoesisRecallResponse(
+                query=body.query, count=len(result.rules), atom_ids=result.atom_ids, rules=result.rules
+            )
+        except NoesisDisabledError as e:
+            raise HTTPException(status_code=503, detail={"error": e.code})
+        except NoesisRecallUnavailableError as e:
+            raise HTTPException(status_code=503, detail={"error": e.code})
+        except (NoesisQueryError, NoesisRecallError) as e:
+            raise HTTPException(status_code=502, detail={"error": e.code})
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            logger.error(f"Error in /v1/default/banks/{bank_id}/noesis/recall: {type(e).__name__}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.post(

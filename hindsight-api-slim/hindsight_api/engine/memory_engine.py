@@ -503,6 +503,7 @@ if TYPE_CHECKING:
 
     from .audit import AuditLogListResponse, AuditLogStatsResponse
     from .memories import MemoryScopeWatermark
+    from .retain.noesis_recall import NoesisRecallResult
     from .transfer import BankImportResult, ImportResult
     from .vector_index_health import CoverageTrigger
 
@@ -10192,6 +10193,30 @@ class MemoryEngine(MemoryEngineInterface):
         resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
         retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
         return await query_atom_ids(query, llm_config=retain_llm, config=resolved_config)
+
+    async def recall_noesis(
+        self, bank_id: str, query: str, *, top_n: int, restore_limit: int, request_context: "RequestContext"
+    ) -> "NoesisRecallResult":
+        """Read-only Noesis recall: utterance -> atoms -> matching rules (abduction engine) -> polished sentences."""
+        from .retain.noesis_query import query_atom_ids
+        from .retain.noesis_recall import NoesisRecallUnavailableError, recall_rules
+
+        await self._authenticate_tenant(request_context)
+        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        if not resolved_config.noesis_enabled:
+            raise NoesisDisabledError()
+        if not resolved_config.noesis_recall_engine_dir:
+            raise NoesisRecallUnavailableError("noesis_recall_unavailable")
+        retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
+        atom_ids = await query_atom_ids(query, llm_config=retain_llm, config=resolved_config)
+        return await recall_rules(
+            atom_ids,
+            query,
+            top_n=top_n,
+            restore_limit=restore_limit,
+            llm_config=retain_llm,
+            config=resolved_config,
+        )
 
     async def retain_noesis_batch(
         self,
