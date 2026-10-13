@@ -236,18 +236,20 @@ def glm_llm():
     )
 
 
-def test_polish_client_disables_thinking_on_glm(monkeypatch):
+def test_polish_client_uses_low_effort_on_glm(monkeypatch):
+    # glm-5.3-flash always thinks: "thinking: disabled" is a 400 (code 1210), so only the effort is lowered.
     captured = install_fake_hyperextract(monkeypatch)
     assert noesis_recall._build_polish_client(glm_llm(), noesis_config()) is not None
-    assert captured["spec"]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "extra_body" not in captured["spec"]
     assert captured["kwargs"] == {"api_key": "k", "temperature": 0}
-    assert captured["bind"]["max_tokens"] == 256
+    assert captured["bind"] == {"max_tokens": 2048, "timeout": 20, "reasoning_effort": "low"}
 
 
 def test_polish_client_leaves_other_providers_alone(monkeypatch):
     captured = install_fake_hyperextract(monkeypatch)
     assert noesis_recall._build_polish_client(llm_config(), noesis_config()) is not None
     assert "extra_body" not in captured["spec"]
+    assert "reasoning_effort" not in captured["bind"]
 
 
 @pytest.mark.parametrize("llm", [llm_config(provider="gemini"), llm_config(model="")])

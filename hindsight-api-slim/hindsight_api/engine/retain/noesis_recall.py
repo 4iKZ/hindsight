@@ -161,9 +161,12 @@ def _build_polish_client(llm_config: Any, config: Any) -> Any | None:
     from hyperextract import create_llm
 
     spec: dict[str, Any] = {"provider": provider, "model": model, "base_url": base_url}
+    # max_tokens covers the reasoning tokens too, so keep it generous.
+    options: dict[str, Any] = {"max_tokens": 2048, "timeout": _POLISH_TIMEOUT_SECONDS}
     if urlsplit(base_url).hostname == "open.bigmodel.cn":
-        spec["extra_body"] = {"thinking": {"type": "disabled"}}  # one short sentence: no reasoning pass
-    return create_llm(spec, api_key=api_key, temperature=0).bind(max_tokens=256, timeout=_POLISH_TIMEOUT_SECONDS)
+        # glm-5.3-flash always thinks and rejects "thinking: disabled" (400, code 1210); low effort ~2s vs ~8s default.
+        options["reasoning_effort"] = "low"
+    return create_llm(spec, api_key=api_key, temperature=0).bind(**options)
 
 
 async def _polish_sentence(client: Any | None, keywords: list[str]) -> str | None:
