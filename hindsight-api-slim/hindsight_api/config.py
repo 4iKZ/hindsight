@@ -899,6 +899,8 @@ ENV_NOESIS_TIMEZONE = "HINDSIGHT_API_NOESIS_TIMEZONE"
 ENV_NOESIS_POOL_MIN_SIZE = "HINDSIGHT_API_NOESIS_POOL_MIN_SIZE"
 ENV_NOESIS_POOL_MAX_SIZE = "HINDSIGHT_API_NOESIS_POOL_MAX_SIZE"
 ENV_NOESIS_COMMAND_TIMEOUT = "HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT"
+ENV_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS = "HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS"
+ENV_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS = "HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS"
 ENV_NOESIS_ANCHOR_REUSE_MAX_DISTANCE = "HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE"
 ENV_NOESIS_ANCHOR_REUSE_MIN_MARGIN = "HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN"
 ENV_NOESIS_ANCHOR_PREDICATE_REUSE_MAX_DISTANCE = (
@@ -1631,6 +1633,9 @@ DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
 DEFAULT_NOESIS_POOL_MIN_SIZE = 1
 DEFAULT_NOESIS_POOL_MAX_SIZE = 5
 DEFAULT_NOESIS_COMMAND_TIMEOUT = 10
+# In-process Anchor compaction (maintenance loop). Interval 0 disables it.
+DEFAULT_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS = 60
+DEFAULT_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS = 20
 DEFAULT_NOESIS_ANCHOR_REUSE_MAX_DISTANCE = 0.25
 DEFAULT_NOESIS_ANCHOR_REUSE_MIN_MARGIN = 0.02
 DEFAULT_NOESIS_ANCHOR_PREDICATE_REUSE_MAX_DISTANCE = 0.28
@@ -2902,6 +2907,8 @@ class HindsightConfig:
     noesis_pool_min_size: int = DEFAULT_NOESIS_POOL_MIN_SIZE
     noesis_pool_max_size: int = DEFAULT_NOESIS_POOL_MAX_SIZE
     noesis_command_timeout: int = DEFAULT_NOESIS_COMMAND_TIMEOUT
+    noesis_anchor_compaction_interval_seconds: int = DEFAULT_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS
+    noesis_anchor_compaction_max_atoms: int = DEFAULT_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS
     noesis_anchor_reuse_max_distance: float = DEFAULT_NOESIS_ANCHOR_REUSE_MAX_DISTANCE
     noesis_anchor_reuse_min_margin: float = DEFAULT_NOESIS_ANCHOR_REUSE_MIN_MARGIN
     noesis_anchor_predicate_reuse_max_distance: float = (
@@ -3365,6 +3372,15 @@ class HindsightConfig:
         if self.noesis_command_timeout <= 0:
             raise ValueError(
                 f"noesis_command_timeout must be > 0, got {self.noesis_command_timeout}"
+            )
+        if self.noesis_anchor_compaction_interval_seconds < 0:
+            raise ValueError(
+                "noesis_anchor_compaction_interval_seconds must be >= 0, got "
+                f"{self.noesis_anchor_compaction_interval_seconds}"
+            )
+        if self.noesis_anchor_compaction_max_atoms < 1:
+            raise ValueError(
+                f"noesis_anchor_compaction_max_atoms must be >= 1, got {self.noesis_anchor_compaction_max_atoms}"
             )
         if not 0.0 <= self.noesis_anchor_reuse_max_distance <= 2.0:
             raise ValueError(
@@ -4382,6 +4398,15 @@ class HindsightConfig:
             noesis_pool_min_size=int(os.getenv(ENV_NOESIS_POOL_MIN_SIZE, str(DEFAULT_NOESIS_POOL_MIN_SIZE))),
             noesis_pool_max_size=int(os.getenv(ENV_NOESIS_POOL_MAX_SIZE, str(DEFAULT_NOESIS_POOL_MAX_SIZE))),
             noesis_command_timeout=int(os.getenv(ENV_NOESIS_COMMAND_TIMEOUT, str(DEFAULT_NOESIS_COMMAND_TIMEOUT))),
+            noesis_anchor_compaction_interval_seconds=int(
+                os.getenv(
+                    ENV_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS,
+                    str(DEFAULT_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS),
+                )
+            ),
+            noesis_anchor_compaction_max_atoms=int(
+                os.getenv(ENV_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS, str(DEFAULT_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS))
+            ),
             noesis_anchor_reuse_max_distance=float(
                 os.getenv(
                     ENV_NOESIS_ANCHOR_REUSE_MAX_DISTANCE,

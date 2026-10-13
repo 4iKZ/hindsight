@@ -18,6 +18,9 @@ from one place, so we don't spawn a separate ``asyncio`` task per concern:
   a scheduled tick never burns an LLM call to regenerate identical content. The
   per-model schedule lives in the cron expression; this loop only decides when to
   *check*.
+- **Noesis anchor compaction** (only with ``noesis_enabled``, default every minute): merges atoms
+  that exceed the active-anchor cap back to it in ``noesis_schema``. It used to be an external
+  systemd timer per schema, which was easy to forget for a new schema.
 
 The loop wakes on a short fixed tick and runs each job when its own
 ``last_run + interval`` is due (run-at-start, then on interval), so adding jobs
@@ -169,8 +172,10 @@ class MaintenanceLoop:
         llm_on = sweep_on and cfg.llm_trace_enabled and cfg.llm_trace_retention_days > 0
         mm_refresh_on = cfg.mental_model_refresh_tick_seconds > 0
         op_cleanup_on = cfg.operation_cleanup_interval_seconds > 0 and cfg.operation_retention_days > 0
+        noesis_compaction_on = cfg.noesis_enabled and cfg.noesis_anchor_compaction_interval_seconds > 0
         return (
-            reconcile_on
+            noesis_compaction_on
+            or reconcile_on
             or audit_on
             or llm_on
             or mm_refresh_on
@@ -256,6 +261,13 @@ class MaintenanceLoop:
             and self._is_due("operation_cleanup", cleanup_interval)
         ):
             await self._run_timed("operation cleanup", self._run_operation_cleanup(cfg))
+        compaction_interval = cfg.noesis_anchor_compaction_interval_seconds
+        if (
+            cfg.noesis_enabled
+            and compaction_interval > 0
+            and self._is_due("noesis_anchor_compaction", compaction_interval)
+        ):
+            await self._run_timed("noesis anchor compaction", self._run_noesis_anchor_compaction(cfg))
         if self._cross_store_recovery_enabled() and self._is_due("txn_recovery", _TXN_RECOVERY_INTERVAL_SECONDS):
             await self._run_timed("cross-store txn recovery", self._run_txn_recovery())
 
@@ -270,6 +282,29 @@ class MaintenanceLoop:
             await coro
         finally:
             logger.info(f"Maintenance: {name} took {time.monotonic() - start:.3f}s")
+
+    # ── noesis anchor compaction ───────────────────────────────────────────
+
+    async def _run_noesis_anchor_compaction(self, cfg: HindsightConfig) -> None:
+        """Merge atoms back to the active-anchor cap in ``noesis_schema`` (one bounded batch).
+
+        Runs wherever Noesis ingestion runs, so it needs no separate timer per schema. Safe next to
+        ingest and other sweepers: each atom's merge locks the atom and revalidates its anchor snapshot.
+        """
+        from .retain.noesis_anchor_compaction import compact_schema_once
+
+        try:
+            result = await compact_schema_once(
+                cfg.noesis_database_url,
+                schema=cfg.noesis_schema,
+                max_active=cfg.noesis_anchor_max_active,
+                max_atoms=cfg.noesis_anchor_compaction_max_atoms,
+            )
+        except Exception as e:
+            logger.warning(f"Noesis anchor compaction failed: {type(e).__name__}: {e}")
+            return
+        if result["merged_pairs"]:
+            logger.info(f"Noesis anchor compaction {cfg.noesis_schema}: {result}")
 
     # ── retention ──────────────────────────────────────────────────────────
 

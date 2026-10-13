@@ -728,6 +728,21 @@ async def run_compaction(
         raise
 
 
+async def compact_schema_once(
+    database_url: str, *, schema: str, max_active: int, max_atoms: int
+) -> dict[str, int | str]:
+    """One bounded apply run on a short-lived pool (the in-process scheduler's entry point).
+
+    A dedicated pool without ``command_timeout`` mirrors the CLI: compaction statements can
+    outlast the ingest pool's short command timeout.
+    """
+    pool = await asyncpg.create_pool(to_libpq_url(database_url), min_size=1, max_size=2)
+    try:
+        return await run_compaction(pool, schema=schema, max_active=max_active, max_atoms=max_atoms, dotted_scorer=None)
+    finally:
+        await pool.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="noesis-anchor-compaction")
     parser.add_argument("--schema", default="noesis_core")
