@@ -1651,16 +1651,6 @@ class NoesisQueryAtomsRequest(BaseModel):
         return value
 
 
-class NoesisQueryAtom(BaseModel):
-    text: str
-    type: str = Field(description="E (entity) or P (predicate).")
-    role: str = Field(description="agent, predicate, patient or modifier.")
-
-
-class NoesisQueryAtomsResponse(BaseModel):
-    atoms: list[NoesisQueryAtom] = Field(description="Empty when the utterance has nothing to extract.")
-
-
 class DryRunExtractRequest(BaseModel):
     """Request to run fact extraction ONLY (no resolution/links/embeddings/persistence).
 
@@ -4555,12 +4545,14 @@ def _register_routes(app: FastAPI):
 
     @app.post(
         "/v1/default/banks/{bank_id}/noesis/query-atoms",
-        response_model=NoesisQueryAtomsResponse,
-        summary="Extract the main Noesis atoms from a user utterance (read-only)",
+        response_model=list[int],
+        summary="Look up the stored Noesis atoms of a user utterance (read-only)",
         description=(
-            "Extracts the main Noesis atoms (text, type, role) from one user utterance in a single LLM call. "
-            "Uses the bank's retain LLM and Memory Defense redaction; reads and writes nothing. Returns "
-            "`atoms: []` when there is nothing to extract; 502 with an error code when extraction fails."
+            "Extracts the main Noesis atoms from one user utterance in a single LLM call (Noesis LLM, "
+            "falling back to the bank's retain LLM; Memory Defense redaction first), then returns the ids "
+            "of the stored atoms whose (text, type) match exactly, deduplicated, in utterance order, e.g. "
+            "`[3316, 123, 2270]`. Atoms the store has not seen are omitted. Nothing is written. Returns `[]` "
+            "when nothing matches; 502 with an error code when extraction or the Noesis store fails."
         ),
         operation_id="noesis_query_atoms",
         tags=["Memory"],
@@ -4574,10 +4566,10 @@ def _register_routes(app: FastAPI):
         from hindsight_api.engine.retain.noesis_query import NoesisQueryError
 
         try:
-            atoms = await app.state.memory.extract_noesis_query_atoms(
+            atom_ids = await app.state.memory.extract_noesis_query_atoms(
                 bank_id, body.query, request_context=request_context
             )
-            return NoesisQueryAtomsResponse(atoms=[NoesisQueryAtom(**atom) for atom in atoms])
+            return atom_ids
         except NoesisQueryError as e:
             raise HTTPException(status_code=502, detail={"error": e.code})
         except OperationValidationError as e:
