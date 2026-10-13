@@ -1,8 +1,9 @@
-"""Read-only Noesis query path: one user utterance -> flat list of main atoms.
+"""Read-only Noesis query path: one user utterance -> ids of the matching stored atoms.
 
 query -> Memory Defense redaction -> one Hyper-Extract query-atoms call -> filter/dedupe
-(no DB, no vectors, nothing is written). The LLM is the bank's resolved retain LLM,
-exactly as in ingestion.
+-> exact (text, atom_type) lookup in ``<schema>.atoms``. Nothing is written and bge is
+never called; an atom the store has not seen yet simply yields no id. The LLM is the
+Noesis stage's resolved LLM, exactly as in ingestion.
 """
 
 from __future__ import annotations
@@ -11,7 +12,13 @@ import asyncio
 import logging
 from typing import Any
 
-from .noesis_ingest import NoesisConfigError, _production_extract_once_factory, resolve_noesis_llm
+from .noesis_ingest import (
+    NoesisConfigError,
+    _get_pool,
+    _production_extract_once_factory,
+    resolve_noesis_llm,
+    validate_schema_identifier,
+)
 from .orchestrator import redact_document_body
 
 logger = logging.getLogger(__name__)
@@ -63,3 +70,43 @@ async def extract_query_atoms(query: str, *, llm_config: Any, config: Any) -> li
         logger.error("noesis query extraction failed: %s", type(error).__name__)
         raise NoesisQueryError("extraction_failed") from error
     return collect_atoms(atoms)
+
+
+# Exact identity lookup (UNIQUE (text, atom_type)); deprecated atoms are never returned.
+_ATOM_IDS_SQL = """
+SELECT a.atom_id, a.text, a.atom_type::text AS atom_type
+FROM {s}.atoms AS a
+JOIN unnest($1::text[], $2::text[]) AS q(text, atom_type)
+  ON a.text = q.text AND a.atom_type = q.atom_type::"char"
+WHERE a.status = 'A'
+"""
+
+
+async def resolve_atom_ids(atoms: list[dict[str, str]], *, schema: str, pool: Any) -> list[int]:
+    """Exact (text, type) -> atom_id, deduped, in the order the atoms were extracted."""
+    if not validate_schema_identifier(schema):
+        raise NoesisQueryError("noesis_schema_unavailable")
+    keys = list(dict.fromkeys((atom["text"], atom["type"]) for atom in atoms))
+    if not keys:
+        return []
+    try:
+        rows = await pool.fetch(_ATOM_IDS_SQL.format(s=schema), [k[0] for k in keys], [k[1] for k in keys])
+    except Exception as error:
+        logger.error("noesis atom id lookup failed: %s", type(error).__name__)
+        raise NoesisQueryError("noesis_schema_unavailable") from error
+    found = {(row["text"], row["atom_type"]): int(row["atom_id"]) for row in rows}
+    return list(dict.fromkeys(found[k] for k in keys if k in found))
+
+
+async def query_atom_ids(query: str, *, llm_config: Any, config: Any) -> list[int]:
+    atoms = await extract_query_atoms(query, llm_config=llm_config, config=config)
+    if not atoms:
+        return []
+    if not getattr(config, "noesis_enabled", False):
+        raise NoesisQueryError("noesis_schema_unavailable")
+    try:
+        pool = await _get_pool(config)
+    except Exception as error:
+        logger.error("noesis pool unavailable: %s", type(error).__name__)
+        raise NoesisQueryError("noesis_schema_unavailable") from error
+    return await resolve_atom_ids(atoms, schema=config.noesis_schema, pool=pool)

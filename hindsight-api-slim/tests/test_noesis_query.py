@@ -1,11 +1,17 @@
-"""Read-only Noesis query path: utterance -> single HE call -> filtered flat atoms."""
+"""Read-only Noesis query path: utterance -> single HE call -> filtered atoms -> stored atom ids."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from hindsight_api.engine.retain import noesis_ingest, noesis_query
-from hindsight_api.engine.retain.noesis_query import NoesisQueryError, collect_atoms, extract_query_atoms
+from hindsight_api.engine.retain.noesis_query import (
+    NoesisQueryError,
+    collect_atoms,
+    extract_query_atoms,
+    query_atom_ids,
+    resolve_atom_ids,
+)
 from tests.noesis_fakes import llm_config, noesis_config
 
 
@@ -240,3 +246,94 @@ async def test_query_path_uses_the_dedicated_noesis_llm(pipeline, monkeypatch):
     cfg = noesis_config(noesis_llm_provider="deepseek", noesis_llm_model="deepseek-flash")
     await extract_query_atoms("q", llm_config=llm_config(provider="openai"), config=cfg)
     assert seen == [("deepseek", "deepseek-flash")]
+
+
+class FakePool:
+    """Stands in for the asyncpg pool: ``rows`` are the stored active atoms as (atom_id, text, type)."""
+
+    def __init__(self, rows, fail=False):
+        self.rows, self.fail, self.calls = rows, fail, []
+
+    async def fetch(self, sql, texts, types):
+        self.calls.append((sql, texts, types))
+        if self.fail:
+            raise RuntimeError("db down")
+        wanted = set(zip(texts, types, strict=True))
+        return [{"atom_id": i, "text": t, "atom_type": ty} for i, t, ty in self.rows if (t, ty) in wanted]
+
+
+STORE = [(3316, "连接池", "E"), (123, "打满", "P"), (2270, "连接池", "P")]
+
+
+async def test_resolve_atom_ids_is_exact_deduped_and_in_utterance_order():
+    pool = FakePool(STORE)
+    atoms = [atom("打满", "P"), atom("连接池", role="patient"), atom("没见过"), atom("连接池", role="agent")]
+    assert await resolve_atom_ids(atoms, schema="noesis_core", pool=pool) == [123, 3316]
+    sql, texts, types = pool.calls[0]
+    assert "noesis_core.atoms" in sql and "status = 'A'" in sql
+    assert (texts, types) == (["打满", "连接池", "没见过"], ["P", "E", "E"])
+
+
+async def test_resolve_atom_ids_keeps_same_text_of_other_type_apart():
+    assert await resolve_atom_ids([atom("连接池", "P")], schema="noesis_core", pool=FakePool(STORE)) == [2270]
+
+
+async def test_resolve_atom_ids_without_atoms_never_touches_the_store():
+    pool = FakePool(STORE)
+    assert await resolve_atom_ids([], schema="noesis_core", pool=pool) == []
+    assert pool.calls == []
+
+
+async def test_resolve_atom_ids_errors_are_coded():
+    with pytest.raises(NoesisQueryError) as bad_schema:
+        await resolve_atom_ids([atom("a")], schema="bad; drop", pool=FakePool([]))
+    assert bad_schema.value.code == "noesis_schema_unavailable"
+    with pytest.raises(NoesisQueryError) as down:
+        await resolve_atom_ids([atom("a")], schema="noesis_core", pool=FakePool([], fail=True))
+    assert down.value.code == "noesis_schema_unavailable"
+
+
+@pytest.fixture
+def pool(monkeypatch):
+    fake = FakePool(STORE)
+
+    async def get_pool(config):
+        return fake
+
+    monkeypatch.setattr(noesis_query, "_get_pool", get_pool)
+    return fake
+
+
+async def test_query_atom_ids_returns_the_stored_ids(pipeline, pool):
+    pipeline.result = lambda t: [atom("连接池", role="patient"), atom("打满", "P", "predicate"), atom("很")]
+    ids = await query_atom_ids("为啥连接池被打满？", llm_config=llm_config(), config=noesis_config())
+    assert ids == [3316, 123]
+
+
+async def test_query_atom_ids_empty_extraction_skips_the_store(pipeline, pool):
+    assert await query_atom_ids("你好", llm_config=llm_config(), config=noesis_config()) == []
+    assert pool.calls == []
+
+
+async def test_query_atom_ids_nothing_stored_is_empty_not_error(pipeline, pool):
+    pipeline.result = lambda t: [atom("从没见过")]
+    assert await query_atom_ids("q", llm_config=llm_config(), config=noesis_config()) == []
+
+
+async def test_query_atom_ids_needs_noesis_enabled(pipeline, pool):
+    pipeline.result = lambda t: [atom("连接池")]
+    with pytest.raises(NoesisQueryError) as error:
+        await query_atom_ids("q", llm_config=llm_config(), config=noesis_config(noesis_enabled=False))
+    assert error.value.code == "noesis_schema_unavailable"
+
+
+async def test_query_atom_ids_pool_failure_is_coded(pipeline, monkeypatch):
+    pipeline.result = lambda t: [atom("连接池")]
+
+    async def get_pool(config):
+        raise OSError("refused")
+
+    monkeypatch.setattr(noesis_query, "_get_pool", get_pool)
+    with pytest.raises(NoesisQueryError) as error:
+        await query_atom_ids("q", llm_config=llm_config(), config=noesis_config())
+    assert error.value.code == "noesis_schema_unavailable"
