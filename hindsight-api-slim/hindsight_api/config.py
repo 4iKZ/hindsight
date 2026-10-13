@@ -3383,9 +3383,7 @@ class HindsightConfig:
                 f"noesis_command_timeout must be > 0, got {self.noesis_command_timeout}"
             )
         if self.noesis_recall_timeout_seconds <= 0:
-            raise ValueError(
-                f"noesis_recall_timeout_seconds must be > 0, got {self.noesis_recall_timeout_seconds}"
-            )
+            raise ValueError(f"noesis_recall_timeout_seconds must be > 0, got {self.noesis_recall_timeout_seconds}")
         if self.noesis_anchor_compaction_interval_seconds < 0:
             raise ValueError(
                 "noesis_anchor_compaction_interval_seconds must be >= 0, got "
