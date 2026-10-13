@@ -1028,6 +1028,7 @@ def test_noesis_config_defaults():
 
     config = HindsightConfig.from_env()
     assert config.noesis_enabled is False
+    assert config.noesis_native_hook_enabled is False
     assert config.noesis_database_url == "postgresql://postgres@localhost:5432/noesis"
     assert config.noesis_schema == "noesis_core"
     assert config.noesis_timezone == "Asia/Shanghai"
@@ -1046,6 +1047,7 @@ def test_noesis_config_env_overrides(monkeypatch):
     from hindsight_api.config import HindsightConfig
 
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ENABLED", "true")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_NATIVE_HOOK_ENABLED", "true")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_DATABASE_URL", "postgresql://u@h:5432/noesis")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_SCHEMA", "noesis_core")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_TIMEZONE", "UTC")
@@ -1065,6 +1067,7 @@ def test_noesis_config_env_overrides(monkeypatch):
     assert config.noesis_anchor_compaction_interval_seconds == 120
     assert config.noesis_anchor_compaction_max_atoms == 8
     assert config.noesis_enabled is True
+    assert config.noesis_native_hook_enabled is True
     assert config.noesis_database_url == "postgresql://u@h:5432/noesis"
     assert config.noesis_timezone == "UTC"
     assert config.noesis_pool_min_size == 2

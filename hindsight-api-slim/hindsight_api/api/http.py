@@ -189,6 +189,7 @@ from hindsight_api.engine.response_models import (
     TemporalWindow,
     TokenUsage,
 )
+from hindsight_api.engine.retain.types import RetainContentDict
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
 from hindsight_api.engine.structured_output import validate_response_schema
 from hindsight_api.extensions import HttpExtension, OperationValidationError, load_extension
@@ -1649,6 +1650,41 @@ class NoesisQueryAtomsRequest(BaseModel):
         if not value.strip():
             raise ValueError("query must not be blank")
         return value
+
+
+class NoesisRetainItem(BaseModel):
+    content: str = Field(description="Operational text to ingest as Noesis events.")
+    timestamp: datetime | None = Field(default=None, description="Observation time; null uses the ingestion clock.")
+    document_id: str | None = Field(default=None, description="Provenance only; no native document is created.")
+    tags: list[str] | None = Field(default=None, description="Item tags used only for Memory Defense screening.")
+
+    @field_validator("content")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+
+class NoesisRetainRequest(BaseModel):
+    items: list[NoesisRetainItem] = Field(min_length=1, max_length=100, description="One to 100 Noesis inputs.")
+    document_tags: list[str] | None = Field(default=None, description="Batch tags merged for Memory Defense only.")
+
+
+class NoesisRetainResult(BaseModel):
+    index: int = Field(description="Original position in the request items, including blocked items.")
+    status: Literal["ingested", "no_events", "hypothesis_only", "empty_summary", "failed", "blocked"] = Field(
+        description="Per-item ingestion outcome."
+    )
+    event_ids: list[int] = Field(description="Committed Noesis event IDs.")
+    alert_codes: list[str] = Field(description="Codes of alerts successfully written for this item.")
+
+
+class NoesisRetainResponse(BaseModel):
+    success: bool = Field(description="The synchronous request completed; individual items may have failed.")
+    bank_id: str = Field(description="Requested memory bank identifier.")
+    items_count: int = Field(description="Number of items submitted, including blocked items.")
+    results: list[NoesisRetainResult] = Field(description="One outcome per original request item, in request order.")
 
 
 class DryRunExtractRequest(BaseModel):
@@ -4578,6 +4614,66 @@ def _register_routes(app: FastAPI):
             raise
         except Exception as e:
             logger.error(f"Error in /v1/default/banks/{bank_id}/noesis/query-atoms: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/noesis/retain",
+        response_model=NoesisRetainResponse,
+        summary="Synchronously ingest Noesis events without native memory writes",
+        description=(
+            "Screens each item with Memory Defense, then runs Noesis summary, extraction and event ingestion. "
+            "Returns per-item outcomes. Duplicate inputs produce new events; callers should allow minute-scale timeouts."
+        ),
+        operation_id="noesis_retain",
+        tags=["Memory"],
+    )
+    @audited("noesis_retain")
+    async def api_noesis_retain(
+        bank_id: str,
+        request: NoesisRetainRequest,
+        request_context: RequestContext = Depends(get_request_context),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
+    ) -> NoesisRetainResponse:
+        from dataclasses import asdict
+
+        from hindsight_api.engine.memory_engine import NoesisDisabledError
+        from hindsight_api.engine.retain.orchestrator import MemoryDefenseAllBlockedError
+
+        try:
+            contents: list[RetainContentDict] = []
+            for item in request.items:
+                content: RetainContentDict = {"content": item.content, "event_date": item.timestamp}
+                if item.document_id is not None:
+                    content["document_id"] = item.document_id
+                if item.tags is not None:
+                    content["tags"] = item.tags
+                contents.append(content)
+            results = await app.state.memory.retain_noesis_batch(
+                bank_id, contents, request_context=request_context, document_tags=request.document_tags
+            )
+            return NoesisRetainResponse(
+                success=True,
+                bank_id=bank_id,
+                items_count=len(request.items),
+                results=[
+                    NoesisRetainResult(
+                        index=item.index, status=item.status, event_ids=item.event_ids, alert_codes=item.alert_codes
+                    )
+                    for item in results
+                ],
+            )
+        except NoesisDisabledError as e:
+            raise HTTPException(status_code=503, detail={"error": e.code})
+        except MemoryDefenseAllBlockedError as e:
+            raise HTTPException(status_code=422, detail={"violations": [asdict(v) for v in e.violations]})
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"Error in /v1/default/banks/{bank_id}/noesis/retain: {type(e).__name__}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     async def _require_dry_run_enabled() -> None:

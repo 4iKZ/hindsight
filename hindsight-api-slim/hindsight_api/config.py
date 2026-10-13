@@ -893,6 +893,7 @@ ENV_DISPOSITION_EMPATHY = "HINDSIGHT_API_DISPOSITION_EMPATHY"
 # noesis_core storage; disabled by default so plain Hindsight installs see a
 # strict no-op. The extraction LLM reuses the retain LLM configuration.
 ENV_NOESIS_ENABLED = "HINDSIGHT_API_NOESIS_ENABLED"
+ENV_NOESIS_NATIVE_HOOK_ENABLED = "HINDSIGHT_API_NOESIS_NATIVE_HOOK_ENABLED"
 ENV_NOESIS_DATABASE_URL = "HINDSIGHT_API_NOESIS_DATABASE_URL"
 ENV_NOESIS_SCHEMA = "HINDSIGHT_API_NOESIS_SCHEMA"
 ENV_NOESIS_TIMEZONE = "HINDSIGHT_API_NOESIS_TIMEZONE"
@@ -1627,6 +1628,7 @@ DEFAULT_WEBHOOK_EXPOSE_RESPONSE_BODY = False  # Don't return raw upstream bodies
 # Noesis event ingestion defaults (requirement 02 §14). URL carries no
 # password by default; deployments inject credentials through the environment.
 DEFAULT_NOESIS_ENABLED = False
+DEFAULT_NOESIS_NATIVE_HOOK_ENABLED = False
 DEFAULT_NOESIS_DATABASE_URL = "postgresql://postgres@localhost:5432/noesis"
 DEFAULT_NOESIS_SCHEMA = "noesis_core"
 DEFAULT_NOESIS_TIMEZONE = "Asia/Shanghai"
@@ -2901,6 +2903,7 @@ class HindsightConfig:
     # event-closure ingestion in engine/retain/noesis_ingest.py. Disabled is a
     # strict no-op on the retain path — it never falls back to old chains.
     noesis_enabled: bool = DEFAULT_NOESIS_ENABLED
+    noesis_native_hook_enabled: bool = DEFAULT_NOESIS_NATIVE_HOOK_ENABLED
     noesis_database_url: str = DEFAULT_NOESIS_DATABASE_URL
     noesis_schema: str = DEFAULT_NOESIS_SCHEMA
     noesis_timezone: str = DEFAULT_NOESIS_TIMEZONE
@@ -4392,6 +4395,7 @@ class HindsightConfig:
             ],
             # Noesis event ingestion
             noesis_enabled=_parse_boolean_env(ENV_NOESIS_ENABLED, DEFAULT_NOESIS_ENABLED),
+            noesis_native_hook_enabled=_parse_boolean_env(ENV_NOESIS_NATIVE_HOOK_ENABLED, DEFAULT_NOESIS_NATIVE_HOOK_ENABLED),
             noesis_database_url=os.getenv(ENV_NOESIS_DATABASE_URL, DEFAULT_NOESIS_DATABASE_URL),
             noesis_schema=os.getenv(ENV_NOESIS_SCHEMA, DEFAULT_NOESIS_SCHEMA),
             noesis_timezone=os.getenv(ENV_NOESIS_TIMEZONE, DEFAULT_NOESIS_TIMEZONE),
