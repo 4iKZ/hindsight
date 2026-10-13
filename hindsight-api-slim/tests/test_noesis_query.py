@@ -155,6 +155,42 @@ def test_official_deepseek_provider_runs_with_thinking_at_high_effort(monkeypatc
     assert seen.summarizer_kwargs == {}
 
 
+BIGMODEL_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+
+def test_bigmodel_glm_runs_with_thinking_at_high_effort(monkeypatch):
+    seen = _capture_factory(monkeypatch, "openai", BIGMODEL_URL)
+    assert seen.spec["extra_body"] == {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}
+    assert seen.summarizer_kwargs == {}
+
+
+@pytest.mark.parametrize(
+    "base_url,json_mode",
+    [(BIGMODEL_URL, True), ("https://api.deepseek.com", True), ("https://aixapex.example/v1", False)],
+)
+def test_json_mode_follows_the_endpoint_for_extraction_and_query(monkeypatch, base_url, json_mode):
+    import hyperextract
+    import hyperextract.noesis as he_noesis
+
+    seen = []
+    monkeypatch.setattr(hyperextract, "create_llm", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        he_noesis,
+        "create_noesis_extractor",
+        lambda *, llm_client, json_mode=False: seen.append(json_mode) or (lambda t: []),
+    )
+    monkeypatch.setattr(he_noesis, "create_noesis_summarizer", lambda *, llm_client: lambda text: "s")
+    monkeypatch.setattr(
+        he_noesis,
+        "create_noesis_query_extractor",
+        lambda *, llm_client, json_mode=False: seen.append(json_mode) or (lambda t: {"atoms": []}),
+    )
+    config = llm_config(provider="openai")
+    config.base_url = base_url
+    noesis_ingest._production_extract_once_factory(config, query_atoms=True)
+    assert seen == [json_mode, json_mode]
+
+
 @pytest.mark.parametrize(
     "provider,base_url",
     [("openai", "https://aixapex.example/v1"), ("openai", "https://api.deepseek.com"), ("anthropic", "")],
