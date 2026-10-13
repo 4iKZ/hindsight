@@ -1058,8 +1058,12 @@ def test_noesis_config_env_overrides(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MIN_MARGIN", "0.01")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "3")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "1")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS", "120")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS", "8")
 
     config = HindsightConfig.from_env()
+    assert config.noesis_anchor_compaction_interval_seconds == 120
+    assert config.noesis_anchor_compaction_max_atoms == 8
     assert config.noesis_enabled is True
     assert config.noesis_database_url == "postgresql://u@h:5432/noesis"
     assert config.noesis_timezone == "UTC"
@@ -1092,6 +1096,8 @@ def test_noesis_config_env_overrides(monkeypatch):
         ),
         ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_ACTIVE", "0", "max_active"),
         ("HINDSIGHT_API_NOESIS_ANCHOR_MAX_OVERFLOW", "2", "max_overflow"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_INTERVAL_SECONDS", "-1", "compaction_interval_seconds"),
+        ("HINDSIGHT_API_NOESIS_ANCHOR_COMPACTION_MAX_ATOMS", "0", "compaction_max_atoms"),
     ],
 )
 def test_noesis_anchor_policy_config_rejects_invalid_values(monkeypatch, name, value, match):

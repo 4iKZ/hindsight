@@ -36,6 +36,12 @@ def _tick_cfg(**overrides):
         "operation_cleanup_interval_seconds": 900,
         "operation_cleanup_batch_size": 1000,
         "maintenance_start_jitter_seconds": 0,
+        "noesis_enabled": False,
+        "noesis_anchor_compaction_interval_seconds": 60,
+        "noesis_anchor_compaction_max_atoms": 20,
+        "noesis_anchor_max_active": 5,
+        "noesis_database_url": "postgresql://u@h:5432/noesis",
+        "noesis_schema": "noesis_x",
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -71,6 +77,66 @@ async def test_retention_sweep_cadence_is_configurable(monkeypatch):
     cfg.retention_sweep_interval_seconds = 3600
     await loop._tick()
     loop._run_retention.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_noesis_anchor_compaction_runs_only_when_noesis_enabled(monkeypatch):
+    """Compaction rides the maintenance loop: on with Noesis, off without it or at interval 0."""
+    from unittest.mock import AsyncMock
+
+    import hindsight_api.engine.maintenance as maintenance_mod
+
+    cfg = _tick_cfg(noesis_enabled=False)
+    monkeypatch.setattr(maintenance_mod, "get_config", lambda: cfg)
+    loop = MaintenanceLoop(engine=None)
+    loop._run_noesis_anchor_compaction = AsyncMock()
+
+    await loop._tick()
+    loop._run_noesis_anchor_compaction.assert_not_awaited()
+
+    cfg.noesis_enabled = True
+    cfg.noesis_anchor_compaction_interval_seconds = 0
+    await loop._tick()
+    loop._run_noesis_anchor_compaction.assert_not_awaited()
+
+    cfg.noesis_anchor_compaction_interval_seconds = 60
+    await loop._tick()
+    loop._run_noesis_anchor_compaction.assert_awaited_once_with(cfg)
+
+
+def test_any_job_enabled_counts_noesis_anchor_compaction(monkeypatch):
+    import hindsight_api.engine.maintenance as maintenance_mod
+
+    cfg = _tick_cfg(retention_sweep_interval_seconds=0, operation_cleanup_interval_seconds=0, noesis_enabled=True)
+    monkeypatch.setattr(maintenance_mod, "get_config", lambda: cfg)
+    monkeypatch.setattr(MaintenanceLoop, "_cross_store_recovery_enabled", staticmethod(lambda: False))
+    assert MaintenanceLoop._any_job_enabled() is True
+
+    cfg.noesis_enabled = False
+    assert MaintenanceLoop._any_job_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_run_noesis_anchor_compaction_passes_config_and_swallows_errors(monkeypatch):
+    import hindsight_api.engine.retain.noesis_anchor_compaction as compaction_mod
+
+    cfg = _tick_cfg(noesis_enabled=True, noesis_anchor_max_active=4, noesis_anchor_compaction_max_atoms=7)
+    calls = []
+
+    async def fake_compact(database_url, **kwargs):
+        calls.append((database_url, kwargs))
+        return {"candidate_atoms": 1, "merged_pairs": 1, "run_id": 1, "status": "completed"}
+
+    monkeypatch.setattr(compaction_mod, "compact_schema_once", fake_compact)
+    loop = MaintenanceLoop(engine=None)
+    await loop._run_noesis_anchor_compaction(cfg)
+    assert calls == [("postgresql://u@h:5432/noesis", {"schema": "noesis_x", "max_active": 4, "max_atoms": 7})]
+
+    async def boom(database_url, **kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(compaction_mod, "compact_schema_once", boom)
+    await loop._run_noesis_anchor_compaction(cfg)  # a failed run must not break the tick
 
 
 class TestStartJitter:
