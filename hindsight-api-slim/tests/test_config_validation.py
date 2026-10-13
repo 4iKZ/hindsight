@@ -1035,6 +1035,8 @@ def test_noesis_config_defaults():
     assert config.noesis_pool_min_size == 1
     assert config.noesis_pool_max_size == 5
     assert config.noesis_command_timeout == 10
+    assert config.noesis_recall_engine_dir == ""
+    assert config.noesis_recall_timeout_seconds == 120
     assert config.noesis_anchor_reuse_max_distance == 0.25
     assert config.noesis_anchor_reuse_min_margin == 0.02
     assert config.noesis_anchor_predicate_reuse_max_distance == 0.28
@@ -1054,6 +1056,8 @@ def test_noesis_config_env_overrides(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MIN_SIZE", "2")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_POOL_MAX_SIZE", "9")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_COMMAND_TIMEOUT", "30")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_RECALL_ENGINE_DIR", " /opt/abduction ")
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_RECALL_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MAX_DISTANCE", "0.2")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_REUSE_MIN_MARGIN", "0.03")
     monkeypatch.setenv("HINDSIGHT_API_NOESIS_ANCHOR_PREDICATE_REUSE_MAX_DISTANCE", "0.35")
@@ -1073,6 +1077,8 @@ def test_noesis_config_env_overrides(monkeypatch):
     assert config.noesis_pool_min_size == 2
     assert config.noesis_pool_max_size == 9
     assert config.noesis_command_timeout == 30
+    assert config.noesis_recall_engine_dir == "/opt/abduction"
+    assert config.noesis_recall_timeout_seconds == 45
     assert config.noesis_anchor_reuse_max_distance == 0.2
     assert config.noesis_anchor_reuse_min_margin == 0.03
     assert config.noesis_anchor_predicate_reuse_max_distance == 0.35
