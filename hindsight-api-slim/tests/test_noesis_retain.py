@@ -15,8 +15,8 @@ from hindsight_api.engine.memory_engine import MemoryEngine, NoesisDisabledError
 from hindsight_api.engine.retain import noesis_ingest, orchestrator
 from hindsight_api.engine.retain.noesis_ingest import NoesisItemResult
 from hindsight_api.engine.retain.types import RetainContentDict
-from hindsight_api.extensions.memory_defense import DefenseAction, DefenseDecision
 from hindsight_api.extensions import AuthenticationError, OperationValidationError, ValidationResult
+from hindsight_api.extensions.memory_defense import DefenseAction, DefenseDecision
 from hindsight_api.models import RequestContext
 from tests.noesis_fakes import (
     CONTENT,
@@ -271,6 +271,20 @@ async def test_engine_uses_validator_rewritten_contents(monkeypatch):
     await engine.retain_noesis_batch("bank", [{"content": CONTENT}], request_context=RequestContext())
     assert ingest.call_args.args[0][0]["content"] == "rewritten"
     engine._operation_validator.validate_retain.assert_awaited_once()
+
+
+async def test_engine_rejects_validator_changing_item_count(monkeypatch):
+    engine = make_engine()
+    engine._operation_validator = SimpleNamespace(
+        validate_retain=AsyncMock(
+            return_value=ValidationResult.accept_with(contents=[{"content": "a"}, {"content": "b"}])
+        )
+    )
+    ingest = AsyncMock()
+    monkeypatch.setattr(noesis_ingest, "ingest_noesis_batch", ingest)
+    with pytest.raises(RuntimeError, match="number of retain items"):
+        await engine.retain_noesis_batch("bank", [{"content": CONTENT}], request_context=RequestContext())
+    ingest.assert_not_awaited()
 
 
 async def test_engine_isolates_unexpected_ingest_exception(monkeypatch):

@@ -4395,7 +4395,9 @@ class HindsightConfig:
             ],
             # Noesis event ingestion
             noesis_enabled=_parse_boolean_env(ENV_NOESIS_ENABLED, DEFAULT_NOESIS_ENABLED),
-            noesis_native_hook_enabled=_parse_boolean_env(ENV_NOESIS_NATIVE_HOOK_ENABLED, DEFAULT_NOESIS_NATIVE_HOOK_ENABLED),
+            noesis_native_hook_enabled=_parse_boolean_env(
+                ENV_NOESIS_NATIVE_HOOK_ENABLED, DEFAULT_NOESIS_NATIVE_HOOK_ENABLED
+            ),
             noesis_database_url=os.getenv(ENV_NOESIS_DATABASE_URL, DEFAULT_NOESIS_DATABASE_URL),
             noesis_schema=os.getenv(ENV_NOESIS_SCHEMA, DEFAULT_NOESIS_SCHEMA),
             noesis_timezone=os.getenv(ENV_NOESIS_TIMEZONE, DEFAULT_NOESIS_TIMEZONE),

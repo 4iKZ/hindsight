@@ -10221,6 +10221,9 @@ class MemoryEngine(MemoryEngineInterface):
             result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
             if result and result.contents is not None:
                 contents_copy = cast(list[_NoesisRetainContentDict], [dict(content) for content in result.contents])
+                # Results are keyed by request position; refuse before any write rather than misreport.
+                if len(contents_copy) != item_count:
+                    raise RuntimeError("operation validator changed the number of retain items")
 
         for index, content in enumerate(contents_copy):
             content.setdefault("_noesis_item_index", index)
