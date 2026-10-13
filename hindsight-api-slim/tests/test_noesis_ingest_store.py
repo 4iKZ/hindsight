@@ -67,13 +67,13 @@ def atom_upsert_args(store):
     projected away here — its exact value is asserted by
     test_noesis_embedding.py; these requirement-02 assertions only pin
     which typed literals were upserted. The requirement-05 atom row lock
-    (``SELECT ... FROM {s}.atoms ... FOR UPDATE``) also matches ``".atoms"``
+    (``SELECT ... FROM {s}.atoms ... FOR NO KEY UPDATE``) also matches ``".atoms"``
     but is not an upsert, so it is excluded here.
     """
     return [
         (args[0], args[1])
         for kind, sql, args in store.calls
-        if kind == "fetchrow" and ".atoms" in sql and "FOR UPDATE" not in sql
+        if kind == "fetchrow" and ".atoms" in sql and "FOR NO KEY UPDATE" not in sql
     ]
 
 
@@ -562,7 +562,7 @@ async def test_context_embed_calls_precede_every_fact_transaction_begin(monkeypa
 
 
 async def test_anchor_sql_runs_only_inside_transaction(monkeypatch):
-    """§13.5 #5: every anchors read/write and every FOR UPDATE atom lock is
+    """§13.5 #5: every anchors read/write and every FOR NO KEY UPDATE atom lock is
     dispatched while the fact transaction is open (_tx_depth > 0)."""
     store = FakeStore()
     anchor_sql_depths: list[int] = []
@@ -571,17 +571,17 @@ async def test_anchor_sql_runs_only_inside_transaction(monkeypatch):
     original_execute = store.execute
 
     async def spy_fetchrow(sql, *args):
-        if ".anchors" in sql or "FOR UPDATE" in sql:
+        if ".anchors" in sql or "FOR NO KEY UPDATE" in sql:
             anchor_sql_depths.append(store._tx_depth)
         return await original_fetchrow(sql, *args)
 
     async def spy_execute(sql, *args):
-        if ".anchors" in sql or "FOR UPDATE" in sql:
+        if ".anchors" in sql or "FOR NO KEY UPDATE" in sql:
             anchor_sql_depths.append(store._tx_depth)
         return await original_execute(sql, *args)
 
     async def spy_fetch(sql, *args):
-        if ".anchors" in sql or "FOR UPDATE" in sql:
+        if ".anchors" in sql or "FOR NO KEY UPDATE" in sql:
             anchor_sql_depths.append(store._tx_depth)
         return await original_fetch(sql, *args)
 

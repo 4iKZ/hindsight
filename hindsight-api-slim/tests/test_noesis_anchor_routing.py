@@ -779,6 +779,20 @@ async def test_e_and_p_literals_share_one_route_call():
     assert store.locked_atoms == sorted(store.locked_atoms)  # ascending atom_id lock order
 
 
+async def test_atom_row_lock_is_no_key_update():
+    # FOR UPDATE would also conflict with the FOR KEY SHARE an FK check takes on the atoms row when the
+    # classify worker inserts a class_membership row, stalling ingest on that atom.
+    store = FakeStore()
+    apple = seed_atom(store, "苹果", "E")
+    plan = make_plan({4: "妈妈 买 苹果"}, [(5, "苹果", "E", 4)])
+
+    await route(store, atom_ids={("苹果", "E"): apple}, plan=plan, context_vectors={"妈妈 买 苹果": list(basis(0))})
+
+    lock_sqls = [sql for kind, sql, _ in store.calls if kind == "fetchrow" and sql.rstrip().endswith("UPDATE")]
+    assert lock_sqls
+    assert all(sql.rstrip().endswith("FOR NO KEY UPDATE") for sql in lock_sqls)
+
+
 async def test_same_atom_same_frame_sampled_once():
     store = FakeStore()
     apple = seed_atom(store, "苹果", "E")

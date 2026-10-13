@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 # placeholder filled by the local ``_sql`` helper; the statement shapes are
 # frozen by the docstrings below and by the fake-store dispatch in
 # ``tests/noesis_fakes.py``.
-_ATOM_LOCK_SQL = "SELECT atom_id FROM {s}.atoms WHERE atom_id = $1 FOR UPDATE"
+# NO KEY UPDATE, not UPDATE: it still excludes every other router/compactor on the
+# same atom, but does not conflict with the FOR KEY SHARE that an FK check takes when
+# another writer (the classify worker) inserts a class_membership row for the atom.
+_ATOM_LOCK_SQL = "SELECT atom_id FROM {s}.atoms WHERE atom_id = $1 FOR NO KEY UPDATE"
 _NEAREST_ANCHORS_SQL = (
     "SELECT anchor_id, centroid_vector::text AS centroid_text, total_count, "
     "count(*) OVER () AS active_count, "
@@ -487,7 +490,7 @@ async def route_anchors(
     The deduplicated set of ``(atom_ids[literal], frame_pos)`` pairs from
     ``plan.occurrences`` is processed in ascending ``atom_id`` (the lock
     order). Per entry, under the atom row lock
-    (``SELECT atom_id FROM {schema}.atoms WHERE atom_id = $1 FOR UPDATE``):
+    (``SELECT atom_id FROM {schema}.atoms WHERE atom_id = $1 FOR NO KEY UPDATE``):
     query the nearest active anchor
     (``centroid_vector <=> $2::vector``, ties broken by ``anchor_id ASC``);
     when :func:`should_reuse` accepts the distance, update it with the cumulative mean
@@ -519,7 +522,7 @@ async def route_anchors(
             literal = vector_literal(context)
             locked = await conn.fetchrow(_sql(schema, _ATOM_LOCK_SQL), atom_id)
             if locked is None:
-                raise AnchorRouteError(f"atom {atom_id} row missing under FOR UPDATE lock")
+                raise AnchorRouteError(f"atom {atom_id} row missing under FOR NO KEY UPDATE lock")
             rows = list(await conn.fetch(_sql(schema, _NEAREST_ANCHORS_SQL), atom_id, literal))
             nearest = rows[0] if rows else None
             second_distance = float(rows[1]["distance"]) if len(rows) > 1 else None
