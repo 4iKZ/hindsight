@@ -29,6 +29,16 @@ from tests.noesis_fakes import (
 )
 
 
+@pytest.fixture(autouse=True)
+def enable_native_hook(monkeypatch):
+    from hindsight_api.config import clear_config_cache
+
+    monkeypatch.setenv("HINDSIGHT_API_NOESIS_NATIVE_HOOK_ENABLED", "true")
+    clear_config_cache()
+    yield
+    clear_config_cache()
+
+
 @pytest.fixture()
 def noesis_recorder(monkeypatch):
     """Replace orchestrator.ingest_noesis_batch with a recording no-op."""
@@ -51,6 +61,20 @@ def noesis_recorder(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "ingest_noesis_batch", recorder)
     return calls
+
+
+async def test_default_native_hook_does_not_ingest(memory, request_context, noesis_recorder):
+    from dataclasses import replace
+
+    # The module's old-hook regression cases explicitly opt in; this case
+    # restores the deployment default on the already constructed resolver.
+    memory._config_resolver._global_config = replace(
+        memory._config_resolver._global_config, noesis_native_hook_enabled=False
+    )
+    await memory.retain_batch_async(
+        bank_id=_unique_bank(), contents=[{"content": "Alice works at Initech."}], request_context=request_context
+    )
+    assert noesis_recorder == []
 
 
 def _unique_bank() -> str:
@@ -127,6 +151,7 @@ async def test_retain_batch_passes_operation_and_document_ids(memory, request_co
 # ---------------------------------------------------------------------------
 # §17.9 / R02-07 Hermes → Hindsight → Noesis real-boundary contract
 # ---------------------------------------------------------------------------
+
 
 def _hermes_kwargs_payload(occurred_at: str) -> dict:
     """Invoke Hermes's real payload builder in its own project environment."""

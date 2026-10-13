@@ -1486,79 +1486,23 @@ async def retain_batch(
                 total_processed_tokens = _merge_processed_content_tokens(total_processed_tokens, group_processed)
             return result_unit_ids, total_usage, total_processed_tokens
 
-    # --- Memory Defense pre-extraction screening ---
-    # Delegate to the loaded extension. `config` is a resolved HindsightConfig
-    # object at this point (see _retain_batch_async_internal). On a non-allow
-    # decision we redact in place or drop the item, and fire a
-    # memory_defense.triggered webhook when one is configured.
-    _policy = parse_policy(config.memory_defense)
-    _blocked_violations: list[BlockedViolation] = []
-
-    if memory_defense_extension is not None and _policy.enabled:
-        async with acquire_with_retry(pool) as _defense_conn:
-            for _idx, _content in enumerate(contents):
-                # Prefer the per-item document_id over the batch-level value so
-                # the decision and webhook carry the document the caller
-                # submitted, not whichever doc_id the batch happens to share.
-                _item_doc_id = contents_dicts[_idx].get("document_id") or document_id
-
-                _decision = await memory_defense_extension.screen(
-                    policy=_policy,
-                    bank_id=bank_id,
-                    document_id=_item_doc_id,
-                    content=_content.content,
-                    tags=_content.tags,
-                )
-
-                if _decision.action is DefenseAction.ALLOW:
-                    continue
-
-                if _decision.action is DefenseAction.REDACT:
-                    _redacted = _decision.redacted_content or _content.content
-                    _content.content = _redacted
-                    # Mirror the redaction into the raw dict so the document
-                    # body persisted further down the pipeline also stores the
-                    # redacted text, not the verbatim secret.
-                    contents_dicts[_idx]["content"] = _redacted
-                elif _decision.action is DefenseAction.BLOCK:
-                    _blocked_violations.append(
-                        BlockedViolation(
-                            index=_idx,
-                            detector=_decision.detector,
-                            message=_decision.message,
-                        )
-                    )
-
-                await _fire_memory_defense_webhook(
-                    webhook_manager,
-                    conn=_defense_conn,
-                    schema=schema,
-                    bank_id=bank_id,
-                    operation_id=operation_id,
-                    document_id=_item_doc_id,
-                    decision=_decision,
-                )
-                await _audit_memory_defense(
-                    audit_logger,
-                    bank_id=bank_id,
-                    document_id=_item_doc_id,
-                    decision=_decision,
-                )
-
-    if _blocked_violations:
-        # All items blocked → raise so the HTTP layer can return 422.
-        if len(_blocked_violations) == len(contents):
-            raise MemoryDefenseAllBlockedError(_blocked_violations)
-
-        # Remove blocked items from the pipeline.
-        _skip_indices = {v.index for v in _blocked_violations}
-        if _skip_indices:
-            _surviving = [i for i in range(len(contents)) if i not in _skip_indices]
-            contents = [contents[i] for i in _surviving]
-            contents_dicts = [contents_dicts[i] for i in _surviving]
-            # If nothing survives, return empty results immediately.
-            if not contents:
-                return [[] for _ in contents_dicts], TokenUsage(), 0
+    screened = await screen_contents_with_memory_defense(
+        contents,
+        contents_dicts,
+        pool=pool,
+        schema=schema,
+        bank_id=bank_id,
+        config=config,
+        document_id=document_id,
+        operation_id=operation_id,
+        memory_defense_extension=memory_defense_extension,
+        webhook_manager=webhook_manager,
+        audit_logger=audit_logger,
+    )
+    contents = screened.contents
+    contents_dicts = screened.contents_dicts
+    if screened.blocked_violations and not contents:
+        return [[] for _ in contents_dicts], TokenUsage(), 0
 
     # Noesis event ingestion (requirement 02, R02-D1). Runs AFTER Memory Defense
     # screening/redaction so Noesis and the native retain consume the same
@@ -1567,38 +1511,39 @@ async def retain_batch(
     # group therefore reaches this point exactly once with its own items. Noesis
     # failures are alerts inside ingest_noesis_batch — they never break the
     # native retain path.
-    try:
-        # Consume the Memory-Defense-approved RetainContent objects (their
-        # .content was redacted in place above; contents_dicts may be
-        # stripped of "content" by later pipeline steps). This guarantees
-        # Noesis and the native retain share the exact approved text.
-        noesis_items = [
-            {
-                "content": rc.content,
-                "event_date": rc.event_date,
-                "document_id": (
-                    contents_dicts[idx].get("document_id")
-                    if idx < len(contents_dicts) and isinstance(contents_dicts[idx], dict)
-                    else document_id
-                )
-                or document_id,
-                "_noesis_item_index": contents_dicts[idx].get("_noesis_item_index", idx),
-                "_noesis_observed_at": contents_dicts[idx].get("_noesis_observed_at"),
-            }
-            for idx, rc in enumerate(contents)
-        ]
-        await ingest_noesis_batch(
-            noesis_items,
-            bank_id,
-            config,
-            llm_config=llm_config,
-            operation_id=operation_id,
-            document_id=document_id,
-        )
-    except Exception as error:
-        # ingest_noesis_batch is designed to never raise; this guard keeps
-        # an unexpected regression there from failing the native retain.
-        logger.error("noesis ingestion crashed without isolation: %s", type(error).__name__)
+    if config.noesis_native_hook_enabled:
+        try:
+            # Consume the Memory-Defense-approved RetainContent objects (their
+            # .content was redacted in place above; contents_dicts may be
+            # stripped of "content" by later pipeline steps). This guarantees
+            # Noesis and the native retain share the exact approved text.
+            noesis_items = [
+                {
+                    "content": rc.content,
+                    "event_date": rc.event_date,
+                    "document_id": (
+                        contents_dicts[idx].get("document_id")
+                        if idx < len(contents_dicts) and isinstance(contents_dicts[idx], dict)
+                        else document_id
+                    )
+                    or document_id,
+                    "_noesis_item_index": contents_dicts[idx].get("_noesis_item_index", idx),
+                    "_noesis_observed_at": contents_dicts[idx].get("_noesis_observed_at"),
+                }
+                for idx, rc in enumerate(contents)
+            ]
+            await ingest_noesis_batch(
+                noesis_items,
+                bank_id,
+                config,
+                llm_config=llm_config,
+                operation_id=operation_id,
+                document_id=document_id,
+            )
+        except Exception as error:
+            # ingest_noesis_batch is designed to never raise; this guard keeps
+            # an unexpected regression there from failing the native retain.
+            logger.error("noesis ingestion crashed without isolation: %s", type(error).__name__)
 
     # Resolve effective document_id early so both delta and streaming paths
     # can find existing chunks from a prior attempt. On retry, a generated
@@ -3938,6 +3883,103 @@ async def _delta_metadata_only(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class MemoryDefenseScreeningResult:
+    """Approved contents and blocked positions in the input batch."""
+
+    contents: list[RetainContent]
+    contents_dicts: list[RetainContentDict]
+    blocked_violations: list[BlockedViolation]
+
+
+async def screen_contents_with_memory_defense(
+    contents: list[RetainContent],
+    contents_dicts: list[RetainContentDict],
+    *,
+    pool: Any,
+    schema: str | None,
+    bank_id: str,
+    config: Any,
+    document_id: str | None = None,
+    operation_id: str | None = None,
+    memory_defense_extension: MemoryDefenseExtension | None = None,
+    webhook_manager: Any = None,
+    audit_logger: Any = None,
+) -> MemoryDefenseScreeningResult:
+    """Screen before extraction, preserving native retain redaction and notifications."""
+    # --- Memory Defense pre-extraction screening ---
+    # Delegate to the loaded extension. `config` is a resolved HindsightConfig
+    # object at this point (see _retain_batch_async_internal). On a non-allow
+    # decision we redact in place or drop the item, and fire a
+    # memory_defense.triggered webhook when one is configured.
+    _policy = parse_policy(config.memory_defense)
+    _blocked_violations: list[BlockedViolation] = []
+
+    if memory_defense_extension is not None and _policy.enabled:
+        async with acquire_with_retry(pool) as _defense_conn:
+            for _idx, _content in enumerate(contents):
+                # Prefer the per-item document_id over the batch-level value so
+                # the decision and webhook carry the document the caller
+                # submitted, not whichever doc_id the batch happens to share.
+                _item_doc_id = contents_dicts[_idx].get("document_id") or document_id
+
+                _decision = await memory_defense_extension.screen(
+                    policy=_policy,
+                    bank_id=bank_id,
+                    document_id=_item_doc_id,
+                    content=_content.content,
+                    tags=_content.tags,
+                )
+
+                if _decision.action is DefenseAction.ALLOW:
+                    continue
+
+                if _decision.action is DefenseAction.REDACT:
+                    _redacted = _decision.redacted_content or _content.content
+                    _content.content = _redacted
+                    # Mirror the redaction into the raw dict so the document
+                    # body persisted further down the pipeline also stores the
+                    # redacted text, not the verbatim secret.
+                    contents_dicts[_idx]["content"] = _redacted
+                elif _decision.action is DefenseAction.BLOCK:
+                    _blocked_violations.append(
+                        BlockedViolation(
+                            index=_idx,
+                            detector=_decision.detector,
+                            message=_decision.message,
+                        )
+                    )
+
+                await _fire_memory_defense_webhook(
+                    webhook_manager,
+                    conn=_defense_conn,
+                    schema=schema,
+                    bank_id=bank_id,
+                    operation_id=operation_id,
+                    document_id=_item_doc_id,
+                    decision=_decision,
+                )
+                await _audit_memory_defense(
+                    audit_logger,
+                    bank_id=bank_id,
+                    document_id=_item_doc_id,
+                    decision=_decision,
+                )
+
+    if _blocked_violations:
+        # All items blocked → raise so the HTTP layer can return 422.
+        if len(_blocked_violations) == len(contents):
+            raise MemoryDefenseAllBlockedError(_blocked_violations)
+
+        # Remove blocked items from the pipeline.
+        _skip_indices = {v.index for v in _blocked_violations}
+        if _skip_indices:
+            _surviving = [i for i in range(len(contents)) if i not in _skip_indices]
+            contents = [contents[i] for i in _surviving]
+            contents_dicts = [contents_dicts[i] for i in _surviving]
+    return MemoryDefenseScreeningResult(contents, contents_dicts, _blocked_violations)
 
 
 def _build_contents(contents_dicts: list[RetainContentDict], document_tags: list[str] | None) -> list[RetainContent]:

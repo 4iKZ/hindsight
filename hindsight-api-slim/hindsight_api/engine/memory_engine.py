@@ -1706,6 +1706,31 @@ class KnowledgeBaseExport:
     pages: list[KnowledgeBaseExportPage]
 
 
+class NoesisDisabledError(Exception):
+    """Noesis ingestion is disabled by the deployment switch."""
+
+    code: str = "noesis_disabled"
+
+
+NoesisRetainStatus = Literal["ingested", "no_events", "hypothesis_only", "empty_summary", "failed", "blocked"]
+
+
+@dataclass(frozen=True)
+class NoesisRetainItemResult:
+    """Request-level result, including items blocked before Noesis ingestion."""
+
+    index: int
+    status: NoesisRetainStatus
+    event_ids: list[int]
+    alert_codes: list[str]
+
+
+class _NoesisRetainContentDict(RetainContentDict, total=False):
+    """Native content adapter carrying the original request position."""
+
+    _noesis_item_index: int
+
+
 class MemoryEngine(MemoryEngineInterface):
     """
     Advanced memory system using temporal and semantic linking with PostgreSQL.
@@ -10167,6 +10192,82 @@ class MemoryEngine(MemoryEngineInterface):
         resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
         retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
         return await query_atom_ids(query, llm_config=retain_llm, config=resolved_config)
+
+    async def retain_noesis_batch(
+        self,
+        bank_id: str,
+        contents: list[RetainContentDict],
+        *,
+        request_context: "RequestContext",
+        document_tags: list[str] | None = None,
+    ) -> list[NoesisRetainItemResult]:
+        """Synchronously ingest approved Noesis events without native memory writes."""
+        from .retain.noesis_ingest import ingest_noesis_batch
+        from .retain.orchestrator import _build_contents, screen_contents_with_memory_defense
+
+        await self._authenticate_tenant(request_context)
+        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        if not resolved_config.noesis_enabled:
+            raise NoesisDisabledError()
+
+        item_count = len(contents)
+        contents_copy = [cast(_NoesisRetainContentDict, dict(content)) for content in contents]
+        for index, content in enumerate(contents_copy):
+            content["_noesis_item_index"] = index
+        if self._operation_validator:
+            from hindsight_api.extensions import RetainContext
+
+            ctx = RetainContext(bank_id=bank_id, contents=contents_copy, request_context=request_context)
+            result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
+            if result and result.contents is not None:
+                contents_copy = cast(list[_NoesisRetainContentDict], [dict(content) for content in result.contents])
+
+        for index, content in enumerate(contents_copy):
+            content.setdefault("_noesis_item_index", index)
+
+        retain_llm = self._retain_llm_config.with_config(resolved_config, bank_id=bank_id, operation="retain")
+        # Keep request positions across defense filtering; the native content
+        # adapter preserves the same tag merge and timestamp normalization.
+        original_indices = [content.get("_noesis_item_index", index) for index, content in enumerate(contents_copy)]
+        approved = await screen_contents_with_memory_defense(
+            _build_contents(cast(list[RetainContentDict], contents_copy), document_tags),
+            cast(list[RetainContentDict], contents_copy),
+            pool=await self._get_backend(),
+            schema=_current_schema.get(),
+            bank_id=bank_id,
+            config=resolved_config,
+            memory_defense_extension=self._memory_defense,
+            webhook_manager=self._webhook_manager,
+            audit_logger=self._audit_logger,
+        )
+        noesis_items: list[_NoesisRetainContentDict] = []
+        for index, content in enumerate(approved.contents):
+            source = cast(_NoesisRetainContentDict, approved.contents_dicts[index])
+            noesis_item: _NoesisRetainContentDict = {
+                "content": content.content,
+                "event_date": content.event_date,
+                "_noesis_item_index": source.get("_noesis_item_index", index),
+            }
+            if source.get("document_id") is not None:
+                noesis_item["document_id"] = source["document_id"]
+            noesis_items.append(noesis_item)
+
+        try:
+            ingested = await ingest_noesis_batch(
+                noesis_items, bank_id, resolved_config, llm_config=retain_llm, operation_id=None, document_id=None
+            )
+        except Exception as error:
+            # Match native retain's final isolation guard if the batch entry
+            # unexpectedly raises; missing results remain explicit failures.
+            logger.error("noesis ingestion crashed without isolation: %s", type(error).__name__)
+            ingested = []
+        results = [NoesisRetainItemResult(index, "failed", [], []) for index in range(item_count)]
+        for item in ingested:
+            results[item.index] = NoesisRetainItemResult(item.index, item.status, item.event_ids, item.alert_codes)
+        for violation in approved.blocked_violations:
+            index = original_indices[violation.index]
+            results[index] = NoesisRetainItemResult(index, "blocked", [], [])
+        return results
 
     async def list_memory_units(
         self,

@@ -38,7 +38,7 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -108,6 +108,27 @@ class NoesisInputItem:
     item_index: int
     source: str = "hindsight_retain"
     extraction_text: str | None = None
+
+
+NoesisItemStatus = Literal["ingested", "no_events", "hypothesis_only", "empty_summary", "failed"]
+
+
+@dataclass(frozen=True)
+class NoesisItemResult:
+    """Outcome of one approved input; blocked inputs are handled by the engine."""
+
+    index: int
+    status: NoesisItemStatus
+    event_ids: list[int]
+    alert_codes: list[str]
+
+
+@dataclass(frozen=True)
+class NoesisComponentResult:
+    """Committed event and successfully written alerts for a component."""
+
+    event_id: int | None
+    alert_codes: list[str]
 
 
 @dataclass(frozen=True)
@@ -1230,7 +1251,7 @@ async def _write_alert(
     )
 
 
-async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwargs: Any) -> None:
+async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwargs: Any) -> bool:
     """Independent-connection alert write; failure is logged, never raised."""
     dedupe_key = compute_alert_dedupe_key(
         item=item,
@@ -1242,6 +1263,7 @@ async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwa
     try:
         async with pool.acquire() as conn:
             await _write_alert(conn, schema, dedupe_key=dedupe_key, details=details, **kwargs)
+        return True
     except Exception as error:
         logger.error(
             "noesis alert write failed (%s/%s): %s",
@@ -1249,6 +1271,8 @@ async def _write_alert_safe(pool: Any, schema: str, item: NoesisInputItem, **kwa
             kwargs.get("alert_code"),
             type(error).__name__,
         )
+
+    return False
 
 
 async def _ingest_fact(
@@ -1458,7 +1482,7 @@ async def _anchor_component_alert(
     message: str,
     error: Exception,
     **extra_details: Any,
-) -> None:
+) -> bool:
     """anchor_context / anchor_route failure alert (requirement 05 §9.2/§9.3).
 
     Fixed sanitized wording plus a details whitelist — component_index,
@@ -1470,7 +1494,7 @@ async def _anchor_component_alert(
         "exception_type": type(error).__name__,
         **extra_details,
     }
-    await _write_alert_safe(
+    return await _write_alert_safe(
         pool,
         schema,
         item,
@@ -1497,7 +1521,11 @@ async def _route_component(
     identity_spec: IdentitySpec,
     anchor_policy: AnchorRoutingPolicy,
     predicate_anchor_policy: AnchorRoutingPolicy,
-) -> None:
+) -> NoesisComponentResult:
+    alert_codes: list[str] = []
+    event_id: int | None = None
+    alert_code: str | None = None
+    written = False
     component_json = component.model_dump(mode="json")
     data = _build_event_data(
         item=item, component_index=component_index, component_json=component_json, time_metadata=resolution.metadata
@@ -1531,7 +1559,8 @@ async def _route_component(
         }
         if error.db_profile is not None:
             details["db_profile"] = error.db_profile
-        await _write_alert_safe(
+        alert_code = "embedding_profile_unavailable"
+        written = await _write_alert_safe(
             pool,
             schema,
             item,
@@ -1544,7 +1573,8 @@ async def _route_component(
             details=details,
         )
     except AnchorFrameError as error:
-        await _anchor_component_alert(
+        alert_code = "anchor_frame_invalid"
+        written = await _anchor_component_alert(
             pool,
             schema,
             item,
@@ -1556,7 +1586,8 @@ async def _route_component(
             predicate_pos=error.predicate_pos,
         )
     except EmbeddingConfigInvalid as error:
-        await _anchor_component_alert(
+        alert_code = "anchor_context_config_invalid"
+        written = await _anchor_component_alert(
             pool,
             schema,
             item,
@@ -1567,7 +1598,8 @@ async def _route_component(
             error=error,
         )
     except EmbeddingServiceUnavailable as error:
-        await _anchor_component_alert(
+        alert_code = "anchor_context_service_unavailable"
+        written = await _anchor_component_alert(
             pool,
             schema,
             item,
@@ -1578,7 +1610,12 @@ async def _route_component(
             error=error,
         )
     except EmbeddingError as error:
-        await _anchor_component_alert(
+        alert_code = (
+            "anchor_context_service_unavailable"
+            if is_transport_kind(error.error_kind)
+            else "anchor_context_vector_failed"
+        )
+        written = await _anchor_component_alert(
             pool,
             schema,
             item,
@@ -1594,7 +1631,8 @@ async def _route_component(
             error_kind=error.error_kind,
         )
     except AnchorRouteError as error:
-        await _anchor_component_alert(
+        alert_code = "anchor_route_failed"
+        written = await _anchor_component_alert(
             pool,
             schema,
             item,
@@ -1605,7 +1643,8 @@ async def _route_component(
             error=error,
         )
     except Exception as error:
-        await _write_alert_safe(
+        alert_code = "event_ingest_failed"
+        written = await _write_alert_safe(
             pool,
             schema,
             item,
@@ -1618,10 +1657,12 @@ async def _route_component(
             details=build_source_envelope(item=item, attempts=attempts),
         )
     else:
+        alert_codes.extend(warning["alert_code"] for warning in resolution.warnings)
         # 7. Post-commit aggregate identity-vector alert (§8.1). The fact is
         # already committed; this alert's own failure only logs (§3.2.10).
         if vector_alert is not None:
-            await _write_alert_safe(
+            alert_code = vector_alert["alert_code"]
+            written = await _write_alert_safe(
                 pool,
                 schema,
                 item,
@@ -1633,6 +1674,10 @@ async def _route_component(
                 event_id=event_id,
                 details={**build_source_envelope(item=item, attempts=attempts), **vector_alert["details"]},
             )
+
+    if written and alert_code is not None:
+        alert_codes.append(alert_code)
+    return NoesisComponentResult(event_id, alert_codes)
 
 
 async def _ingest_item(
@@ -1646,9 +1691,11 @@ async def _ingest_item(
     config: Any,
     embedding_client: Any,
     identity_spec: IdentitySpec,
-) -> None:
+) -> NoesisItemResult:
     """Process one item; never raises to the batch loop. Only business/dependency
     failures are isolated — cancellation propagates. (R02-04)"""
+    event_ids: list[int] = []
+    alert_codes: list[str] = []
     try:
         try:
             summarize_once = getattr(extract_once, "_noesis_summarize_once", None)
@@ -1661,7 +1708,7 @@ async def _ingest_item(
             )
         except Exception as error:
             logger.error("noesis summary failed for item %s: %s", item.item_index, type(error).__name__)
-            await _item_alert_safe(
+            written = await _item_alert_safe(
                 schema,
                 item,
                 config,
@@ -1677,9 +1724,9 @@ async def _ingest_item(
                     "summary_attempts": 0 if isinstance(error, NoesisConfigError) else 2,
                 },
             )
-            return
+            return NoesisItemResult(item.item_index, "failed", event_ids, ["summary_failed"] if written else [])
         if not extraction_text:
-            return
+            return NoesisItemResult(item.item_index, "empty_summary", event_ids, alert_codes)
         item = replace(item, extraction_text=extraction_text)
         try:
             outcome = await asyncio.to_thread(
@@ -1689,7 +1736,7 @@ async def _ingest_item(
             )
         except Exception as error:
             logger.error("noesis extraction crashed for item %s: %s", item.item_index, type(error).__name__)
-            await _item_alert_safe(
+            written = await _item_alert_safe(
                 schema,
                 item,
                 config,
@@ -1702,7 +1749,7 @@ async def _ingest_item(
                 event_id=None,
                 details=build_source_envelope(item=item, attempts=0),
             )
-            return
+            return NoesisItemResult(item.item_index, "failed", event_ids, ["extraction_failed"] if written else [])
 
         # Validate the outcome shape so an unexpected return type surfaces as an
         # observable per-item failure instead of an AttributeError mid-loop.
@@ -1713,7 +1760,7 @@ async def _ingest_item(
         envelope = build_source_envelope(item=item, attempts=outcome.attempts)
         for alert in outcome.alerts:
             alert_details = alert.details or {}
-            await _write_alert_safe(
+            written = await _write_alert_safe(
                 pool,
                 schema,
                 item,
@@ -1725,9 +1772,11 @@ async def _ingest_item(
                 event_id=None,
                 details={**envelope, **alert_details},
             )
+            if written:
+                alert_codes.append(alert.alert_code)
         for component_index, component in enumerate(outcome.components):
             if component.utterance_type == "hypothesis":
-                await _write_alert_safe(
+                written = await _write_alert_safe(
                     pool,
                     schema,
                     item,
@@ -1742,6 +1791,8 @@ async def _ingest_item(
                     event_id=None,
                     details={**envelope, "component": component.model_dump(mode="json")},
                 )
+                if written:
+                    alert_codes.append("hypothesis_classification_pending")
                 continue
             resolution = resolve_event_time(
                 observed_at=item.observed_at,
@@ -1749,7 +1800,7 @@ async def _ingest_item(
                 analyzer=analyzer,
                 timezone_name=timezone_name,
             )
-            await _route_component(
+            component_result = await _route_component(
                 pool=pool,
                 schema=schema,
                 item=item,
@@ -1772,11 +1823,29 @@ async def _ingest_item(
                     max_overflow=config.noesis_anchor_max_overflow,
                 ),
             )
+            if component_result.event_id is not None:
+                event_ids.append(component_result.event_id)
+            alert_codes.extend(component_result.alert_codes)
+        # Extraction can report a failure without raising an exception.
+        if any(
+            alert.alert_code in {"summary_failed", "extraction_failed", "event_ingest_failed"}
+            for alert in outcome.alerts
+        ):
+            status: NoesisItemStatus = "failed"
+        elif event_ids:
+            status = "ingested"
+        elif outcome.components:
+            status = (
+                "hypothesis_only" if all(c.utterance_type == "hypothesis" for c in outcome.components) else "failed"
+            )
+        else:
+            status = "no_events"
+        return NoesisItemResult(item.item_index, status, event_ids, alert_codes)
     except asyncio.CancelledError:
         raise  # never swallow cancellation semantics
     except Exception as error:
         logger.error("noesis item %s failed: %s", item.item_index, type(error).__name__)
-        await _item_alert_safe(
+        written = await _item_alert_safe(
             schema,
             item,
             config,
@@ -1790,6 +1859,10 @@ async def _ingest_item(
             details=build_source_envelope(item=item, attempts=0),
         )
 
+        if written:
+            alert_codes.append("event_ingest_failed")
+        return NoesisItemResult(item.item_index, "failed", event_ids, alert_codes)
+
 
 async def _item_alert_safe(
     schema: str,
@@ -1797,11 +1870,11 @@ async def _item_alert_safe(
     config: Any,
     pool_factory: Any,
     **kwargs: Any,
-) -> None:
+) -> bool:
     """Best-effort alert for a per-item failure; never raises, never recurses."""
     try:
         pool = await _acquire_pool(config, pool_factory)
-        await _write_alert_safe(pool, schema, item, **kwargs)
+        return await _write_alert_safe(pool, schema, item, **kwargs)
     except Exception as error:
         logger.error(
             "noesis item alert could not be written (%s/%s): %s",
@@ -1809,6 +1882,8 @@ async def _item_alert_safe(
             kwargs.get("alert_code"),
             type(error).__name__,
         )
+
+    return False
 
 
 async def ingest_noesis_batch(
@@ -1824,15 +1899,15 @@ async def ingest_noesis_batch(
     pool_factory: Callable[[Any], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
     embedding_client_factory: Callable[[Any], Any] | None = None,
-) -> None:
+) -> list[NoesisItemResult]:
     """Production entry point: never raises, never blocks the native retain."""
     if not getattr(config, "noesis_enabled", False):
-        return  # deployment switch: a strict no-op, never a fallback to old chains
+        return []  # deployment switch: a strict no-op, never a fallback to old chains
 
     schema = getattr(config, "noesis_schema", DEFAULT_NOESIS_SCHEMA) or DEFAULT_NOESIS_SCHEMA
     if not validate_schema_identifier(schema):
         logger.error("noesis ingest skipped: configured noesis_schema %r is not a valid SQL identifier", schema)
-        return
+        return []
 
     items = await normalize_items(
         contents_dicts,
@@ -1842,7 +1917,7 @@ async def ingest_noesis_batch(
         clock=clock,
     )
     if not items:
-        return
+        return []
 
     identity_spec = _identity_spec_from_config(config)
 
@@ -1855,9 +1930,9 @@ async def ingest_noesis_batch(
         ready_pool = await _acquire_pool(config, pool_factory)
     except Exception as error:
         logger.error("noesis pool unavailable: %s", type(error).__name__)
-        return
+        return [NoesisItemResult(item.item_index, "failed", [], []) for item in items]
     if not await _ensure_schema_ready(ready_pool, schema, expected_dimension=identity_spec.dimension):
-        return
+        return [NoesisItemResult(item.item_index, "failed", [], []) for item in items]
 
     try:
         extract_once = (extract_once_factory or _production_extract_once_factory)(
@@ -1865,9 +1940,10 @@ async def ingest_noesis_batch(
         )
     except Exception as error:
         logger.error("noesis extraction client unavailable: %s", type(error).__name__)
+        written = False
         try:
             pool = await _acquire_pool(config, pool_factory)
-            await _write_alert_safe(
+            written = await _write_alert_safe(
                 pool,
                 schema,
                 items[0],
@@ -1881,7 +1957,12 @@ async def ingest_noesis_batch(
             )
         except Exception as pool_error:
             logger.error("noesis config alert could not be written: %s", type(pool_error).__name__)
-        return
+        return [
+            NoesisItemResult(
+                item.item_index, "failed", [], ["noesis_llm_config_invalid"] if index == 0 and written else []
+            )
+            for index, item in enumerate(items)
+        ]
 
     try:
         if analyzer is None:
@@ -1890,9 +1971,10 @@ async def ingest_noesis_batch(
             analyzer = DateparserQueryAnalyzer()
     except Exception as error:
         logger.error("noesis analyzer construction failed: %s", type(error).__name__)
+        written = False
         try:
             pool = await _acquire_pool(config, pool_factory)
-            await _write_alert_safe(
+            written = await _write_alert_safe(
                 pool,
                 schema,
                 items[0],
@@ -1906,7 +1988,12 @@ async def ingest_noesis_batch(
             )
         except Exception as pool_error:
             logger.error("noesis analyzer alert could not be written: %s", type(pool_error).__name__)
-        return
+        return [
+            NoesisItemResult(
+                item.item_index, "failed", [], ["noesis_llm_config_invalid"] if index == 0 and written else []
+            )
+            for index, item in enumerate(items)
+        ]
 
     # One shared embedding client for the whole batch (lazy singleton in
     # production; factory seam in tests). Construction is trivial and must
@@ -1919,8 +2006,9 @@ async def ingest_noesis_batch(
         embedding_client = None
 
     timezone_name = getattr(config, "noesis_timezone", DEFAULT_NOESIS_TIMEZONE) or DEFAULT_NOESIS_TIMEZONE
+    results: list[NoesisItemResult] = []
     for item in items:
-        await _ingest_item(
+        result = await _ingest_item(
             item=item,
             schema=schema,
             timezone_name=timezone_name,
@@ -1931,3 +2019,6 @@ async def ingest_noesis_batch(
             embedding_client=embedding_client,
             identity_spec=identity_spec,
         )
+
+        results.append(result)
+    return results
