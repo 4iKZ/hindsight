@@ -233,7 +233,7 @@ class FakeStore:
         self.embedding_anchor_sample_stage: dict[tuple[int, int, int], bool] = {}
         self.embedding_anchor_stage: dict[int, tuple[tuple[float, ...], int]] = {}
         # Requirement 05: anchors keyed by anchor_id; locked_atoms records the
-        # FOR UPDATE atom row locks taken inside the fact transaction.
+        # FOR NO KEY UPDATE atom row locks taken inside the fact transaction.
         self.anchors: dict[int, dict[str, Any]] = {}
         self.locked_atoms: list[int] = []
         # Requirement 06: the two write-maintenance bitmap tables, emulating
@@ -294,7 +294,7 @@ class FakeStore:
         # Requirement 05 dispatches. The atom row lock must precede the generic
         # ".atoms" branch or the single-arg lock SQL would be misrouted into
         # the three-arg upsert unpack.
-        if "FOR UPDATE" in sql and ".atoms" in sql:
+        if "FOR NO KEY UPDATE" in sql and ".atoms" in sql:
             return self._lock_atom(args)
         if ".anchors" in sql and upper.startswith("INSERT"):
             return self._insert_anchor(args)
@@ -654,7 +654,7 @@ class FakeStore:
         return {"alert_id": alert["alert_id"]}
 
     def _lock_atom(self, args: tuple) -> dict[str, Any] | None:
-        # SELECT ... FROM {s}.atoms WHERE atom_id = $1 FOR UPDATE — a missing
+        # SELECT ... FROM {s}.atoms WHERE atom_id = $1 FOR NO KEY UPDATE — a missing
         # atom row returns None exactly like PostgreSQL would.
         atom_id = args[0]
         if any(atom["atom_id"] == atom_id for atom in self.atoms.values()):
