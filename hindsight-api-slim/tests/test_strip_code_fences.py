@@ -1,8 +1,16 @@
 """Tests for _strip_code_fences helper in OpenAI-compatible LLM provider."""
 
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
+import pytest
+from pydantic import BaseModel
+
+from hindsight_api.engine.providers.openai_compatible_llm import (
+    OpenAICompatibleLLM,
+    _drop_stub_prefix,
+    _strip_code_fences,
+)
 
 
 class TestStripCodeFences:
@@ -119,3 +127,121 @@ class TestStripCodeFences:
         parsed = json.loads(result)
         assert len(parsed["facts"]) == 1
         assert parsed["facts"][0]["who"] == "Sebastian"
+
+
+class TestDropStubPrefix:
+    """Gateway glitch: a stub of the JSON opening precedes the real, complete object."""
+
+    FACTS = '{"facts": [{"what": "x"}]}'
+
+    @pytest.mark.parametrize("stub", ["{\n", '{\n  "', '{\n  "w', "{ ", '{"', '"facts{ \n'])
+    def test_stub_is_dropped(self, stub):
+        result = _strip_code_fences(stub + self.FACTS)
+        assert json.loads(result) == {"facts": [{"what": "x"}]}
+
+    def test_nested_object_after_stub_is_kept_whole(self):
+        content = '{\n{"creates": [], "updates": [{"id": "a", "text": "{b}"}], "deletes": []}'
+        assert json.loads(_strip_code_fences(content)) == {
+            "creates": [],
+            "updates": [{"id": "a", "text": "{b}"}],
+            "deletes": [],
+        }
+
+    def test_stub_inside_a_code_fence_is_dropped(self):
+        result = _strip_code_fences("```json\n{\n" + self.FACTS + "\n```")
+        assert json.loads(result) == {"facts": [{"what": "x"}]}
+
+    def test_valid_json_is_never_touched(self):
+        assert _strip_code_fences(self.FACTS) == self.FACTS
+        assert _drop_stub_prefix(self.FACTS) is None
+
+    def test_prefix_with_colon_is_not_repaired(self):
+        """A prefix holding a key/value pair is real content, not a stub: leave it for the retry."""
+        content = '{"a": 1, {"facts": []}'
+        assert _drop_stub_prefix(content) is None
+        assert _strip_code_fences(content) == content
+
+    def test_prefix_length_limit_is_40_chars(self):
+        assert _drop_stub_prefix("{" + " " * 39 + self.FACTS) == self.FACTS
+        assert _drop_stub_prefix("{" + " " * 40 + self.FACTS) is None
+
+    @pytest.mark.parametrize("content", ['[ {"a": 1}', '[{"a": 1}, {"facts": []}', '{}\n{"facts": []}'])
+    def test_prefix_holding_array_or_finished_object_is_not_repaired(self, content):
+        """A truncated array or a complete first object must not be 'recovered' by dropping real content."""
+        assert _drop_stub_prefix(content) is None
+
+    def test_recovery_is_logged(self, caplog):
+        with caplog.at_level("WARNING"):
+            _drop_stub_prefix("{\n" + self.FACTS)
+        assert "Dropped 2-char garbled prefix" in caplog.text
+
+    def test_truncated_object_is_not_repaired(self):
+        content = '{\n{"facts": [{"what": "x"'
+        assert _drop_stub_prefix(content) is None
+        assert _strip_code_fences(content) == content
+
+    def test_damaged_tail_is_not_repaired(self):
+        assert _drop_stub_prefix('{\n{"facts": []} trailing') is None
+
+    def test_non_object_is_not_accepted(self):
+        assert _drop_stub_prefix("{\n[1, 2]") is None
+
+    def test_empty_and_plain_text(self):
+        assert _drop_stub_prefix("") is None
+        assert _drop_stub_prefix("no json here") is None
+
+
+def _chat_response(content: str) -> MagicMock:
+    """Mock OpenAI chat response; see test_openrouter_null_content for why each field is set."""
+    choice = MagicMock()
+    choice.finish_reason = "stop"
+    choice.message.content = content
+    choice.message.tool_calls = None
+    choice.message.refusal = None
+    response = MagicMock()
+    response.error = None
+    response.model_dump.return_value = {}
+    response.usage.prompt_tokens = 10
+    response.usage.completion_tokens = 5
+    response.usage.total_tokens = 15
+    response.usage.completion_tokens_details = None
+    response.usage.cached_tokens = 0
+    response.usage.prompt_tokens_details = None
+    response.choices = [choice]
+    return response
+
+
+class _Answer(BaseModel):
+    answer: str
+
+
+class TestCallWithGarbledOpening:
+    """End to end through OpenAICompatibleLLM.call: recovery saves the call, unrecoverable output still retries."""
+
+    @staticmethod
+    def _llm() -> OpenAICompatibleLLM:
+        return OpenAICompatibleLLM(provider="openai", api_key="sk-test", base_url="", model="test-model")
+
+    @pytest.mark.asyncio
+    async def test_stub_prefix_is_recovered_without_a_retry(self):
+        llm = self._llm()
+        with patch.object(llm._client.chat.completions, "create", new_callable=AsyncMock) as create:
+            create.return_value = _chat_response('{\n{"answer": "ok"}')
+            result = await llm.call(messages=[{"role": "user", "content": "x"}], response_format=_Answer, max_retries=2)
+        assert result == _Answer(answer="ok")
+        assert create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unrecoverable_output_still_uses_the_retry_budget(self):
+        llm = self._llm()
+        with patch.object(llm._client.chat.completions, "create", new_callable=AsyncMock) as create:
+            create.return_value = _chat_response('{"answer": "cut off')
+            with pytest.raises(json.JSONDecodeError):
+                await llm.call(
+                    messages=[{"role": "user", "content": "x"}],
+                    response_format=_Answer,
+                    max_retries=1,
+                    initial_backoff=0.0,
+                    max_backoff=0.0,
+                )
+        assert create.await_count == 2
