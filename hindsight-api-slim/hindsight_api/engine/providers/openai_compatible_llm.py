@@ -150,6 +150,35 @@ def _outer_json_span(content: str) -> str | None:
     return candidate if _is_json(candidate) else None
 
 
+# Some gateways emit a stub of the JSON opening ('{\n', '{\n  "w') and then restart the whole object,
+# so the content reads '{\n{"facts": [...]}'. The stub never holds a complete key/value pair.
+_STUB_PREFIX_MAX_CHARS = 40
+
+
+def _drop_stub_prefix(content: str) -> str | None:
+    """Return the JSON object that follows a short garbled stub, else None.
+
+    Conservative on purpose: only a prefix of at most 40 chars containing none of ``: [ ] }`` is
+    dropped (so it cannot hold a key/value pair, an array element or a finished object), the rest
+    must parse as a JSON object, and nothing inside the JSON is edited. Anything else (truncation,
+    damage in the middle) is left for the caller's retry.
+    """
+    for i, ch in enumerate(content[: _STUB_PREFIX_MAX_CHARS + 1]):
+        if ch in ":[]}":
+            return None
+        if ch != "{" or not content[:i].strip():
+            continue
+        candidate = content[i:].strip()
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            logger.warning("Dropped %d-char garbled prefix %r before the JSON object", i, content[:i])
+            return candidate
+    return None
+
+
 def _strip_code_fences(content: str) -> str:
     """Strip markdown code fences from LLM response if present.
 
@@ -159,8 +188,9 @@ def _strip_code_fences(content: str) -> str:
     ``` must sit alone on its line) so triple-backticks *inside* JSON string
     values do not truncate the payload. When the stripped candidate is not
     valid JSON (partial fence, prose-wrapped output, truncated response), fall
-    back to the outermost parseable JSON span. Returns the original content
-    unchanged if no better candidate is found.
+    back to the outermost parseable JSON span, then to dropping a short garbled
+    ``{`` stub in front of the object. Returns the original content unchanged
+    if no better candidate is found.
     """
     candidate = content
     if "```" in content:
@@ -183,6 +213,10 @@ def _strip_code_fences(content: str) -> str:
     span = _outer_json_span(content)
     if span is not None:
         return span
+
+    stripped = _drop_stub_prefix(candidate)
+    if stripped is not None:
+        return stripped
 
     return candidate
 
