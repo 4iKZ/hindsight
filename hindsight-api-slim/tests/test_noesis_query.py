@@ -258,20 +258,39 @@ class FakePool:
         self.calls.append((sql, texts, types))
         if self.fail:
             raise RuntimeError("db down")
-        wanted = set(zip(texts, types, strict=True))
-        return [{"atom_id": i, "text": t, "atom_type": ty} for i, t, ty in self.rows if (t, ty) in wanted]
+        keys = [(t.lower(), ty) for t, ty in zip(texts, types, strict=True)]
+        hits = [(n, i) for n, (qt, qty) in enumerate(keys) for i, t, ty in self.rows if (t.lower(), ty) == (qt, qty)]
+        return [{"atom_id": i} for _, i in sorted(hits)]
 
 
-STORE = [(3316, "连接池", "E"), (123, "打满", "P"), (2270, "连接池", "P")]
+STORE = [
+    (3316, "连接池", "E"),
+    (123, "打满", "P"),
+    (2270, "连接池", "P"),
+    (2868, "CPU", "E"),
+    (68, "Redis", "E"),
+    (15949, "redis", "E"),
+]
 
 
-async def test_resolve_atom_ids_is_exact_deduped_and_in_utterance_order():
+async def test_resolve_atom_ids_is_deduped_and_in_utterance_order():
     pool = FakePool(STORE)
     atoms = [atom("打满", "P"), atom("连接池", role="patient"), atom("没见过"), atom("连接池", role="agent")]
     assert await resolve_atom_ids(atoms, schema="noesis_core", pool=pool) == [123, 3316]
     sql, texts, types = pool.calls[0]
     assert "noesis_core.atoms" in sql and "status = 'A'" in sql
     assert (texts, types) == (["打满", "连接池", "没见过"], ["P", "E", "E"])
+
+
+async def test_resolve_atom_ids_ignores_case_and_returns_every_variant():
+    pool = FakePool(STORE)
+    assert await resolve_atom_ids([atom("cpu"), atom("redis"), atom("连接池")], schema="noesis_core", pool=pool) == [
+        2868,
+        68,
+        15949,
+        3316,
+    ]
+    assert "lower(a.text) = lower(q.text)" in pool.calls[0][0]
 
 
 async def test_resolve_atom_ids_keeps_same_text_of_other_type_apart():
