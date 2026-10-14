@@ -1692,6 +1692,13 @@ class NoesisRecallRequest(BaseModel):
     query: str = Field(max_length=2000, description="One utterance to recall matching Noesis rules for.")
     top_n: int = Field(default=3, ge=1, le=10, description="How many best-matching rules to return.")
     restore_limit: int = Field(default=5, ge=0, le=20, description="Positive example events restored per rule.")
+    include: list[Literal["source_text", "tree", "atom_ids"]] = Field(
+        default_factory=list,
+        description=(
+            "Debug extras, off by default: `source_text` and `tree` on every event, `atom_ids` (the stored atoms "
+            "the query resolved to) at the top level."
+        ),
+    )
 
     @field_validator("query")
     @classmethod
@@ -1702,10 +1709,12 @@ class NoesisRecallRequest(BaseModel):
 
 
 class NoesisRecallResponse(BaseModel):
-    query: str = Field(description="The request query, echoed.")
-    count: int = Field(description="Number of rules returned.")
-    atom_ids: list[int] = Field(description="Stored atoms the query was resolved to; empty means nothing matched.")
-    rules: list[RecallRule] = Field(description="Best-matching rules first.")
+    results: list[RecallRule] = Field(
+        description="Best-matching rules first; rules without a positive example are dropped."
+    )
+    atom_ids: list[int] | None = Field(
+        default=None, description="Stored atoms the query resolved to; only with include=atom_ids."
+    )
 
 
 class DryRunExtractRequest(BaseModel):
@@ -4644,8 +4653,10 @@ def _register_routes(app: FastAPI):
         description=(
             "Resolves the utterance to stored atoms (one LLM call, as in query-atoms), runs the abduction "
             "engine to find the best-matching rules and their positive example events, and polishes one "
-            "sentence per rule with the Noesis LLM. Nothing is written. No match is `rules: []`, not an error. "
-            "Typically 10-20 seconds; allow client timeouts of 60 seconds or more."
+            "sentence per rule with the Noesis LLM (`polished: false` marks a rule whose polish failed and whose "
+            "`text` is the engine's keyword text). Nothing is written. No match is `results: []`, not an error. "
+            "Typically 10-30 seconds; a slow polish adds up to 40 seconds per rule (rules are polished "
+            "concurrently), so allow client timeouts of 90 seconds or more."
         ),
         operation_id="noesis_recall",
         tags=["Memory"],
@@ -4658,7 +4669,11 @@ def _register_routes(app: FastAPI):
     ) -> NoesisRecallResponse:
         from hindsight_api.engine.memory_engine import NoesisDisabledError
         from hindsight_api.engine.retain.noesis_query import NoesisQueryError
-        from hindsight_api.engine.retain.noesis_recall import NoesisRecallError, NoesisRecallUnavailableError
+        from hindsight_api.engine.retain.noesis_recall import (
+            NoesisRecallError,
+            NoesisRecallUnavailableError,
+            select_debug_fields,
+        )
 
         try:
             result = await app.state.memory.recall_noesis(
@@ -4669,7 +4684,8 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             return NoesisRecallResponse(
-                query=body.query, count=len(result.rules), atom_ids=result.atom_ids, rules=result.rules
+                results=select_debug_fields(result.rules, body.include),
+                atom_ids=result.atom_ids if "atom_ids" in body.include else None,
             )
         except NoesisDisabledError as e:
             raise HTTPException(status_code=503, detail={"error": e.code})

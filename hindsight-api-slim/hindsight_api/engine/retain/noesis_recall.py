@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 # shortcut: fixed caps; make them config if one deployment needs different numbers.
 _MAX_CONCURRENT_ENGINES = 4
-_POLISH_TIMEOUT_SECONDS = 20
+# Raised from 20 s: one rule's polish regularly ran past 20 s on a slow gateway and silently fell back to
+# the keyword text (observed 2026-10-14). The cap is per rule; rules are polished concurrently.
+_POLISH_TIMEOUT_SECONDS = 40
 _STDERR_LOG_CHARS = 500
 
 _engine_slots = asyncio.Semaphore(_MAX_CONCURRENT_ENGINES)
@@ -57,23 +60,38 @@ class NoesisRecallUnavailableError(NoesisRecallError):
 
 class RecallEvent(BaseModel):
     event_id: int = Field(description="Noesis event id of a positive example of the rule.")
-    event_time: str | None = Field(default=None, description="Event time, ISO 8601 text.")
-    restored: str = Field(default="", description="The event rebuilt from its atoms only.")
-    source_text: str = Field(default="", description="Original text stored with the event, if any.")
-    tree: list[str] = Field(default_factory=list, description="Predicate hierarchy, one line per predicate.")
+    time: str | None = Field(default=None, description="Event time, ISO 8601 text.")
+    text: str = Field(default="", description="The event rebuilt from its atoms only.")
+    source_text: str | None = Field(default=None, description="Original text stored with the event (include).")
+    tree: list[str] | None = Field(default=None, description="Predicate hierarchy, one line per predicate (include).")
 
 
 class RecallRule(BaseModel):
     rule_id: int
-    rule_nl: str = Field(description="One-sentence natural language of the rule.")
-    natural_text: str = Field(description="rule_nl followed by the positive/negative example counts.")
+    text: str = Field(description="One-sentence natural language of the rule; the keyword text if not polished.")
+    polished: bool = Field(description="False when the polish step failed and `text` is the engine's keyword text.")
     positive_count: int
     negative_count: int
     events: list[RecallEvent] = Field(description="Restored positive examples, at most restore_limit.")
 
 
-class _EngineRule(RecallRule):
+class _EngineEvent(BaseModel):
+    event_id: int
+    event_time: str | None = None
+    restored: str = ""
+    source_text: str = ""
+    tree: list[str] = Field(default_factory=list)
+
+
+class _EngineRule(BaseModel):
+    """One rule as ``abduction.recall_cli`` prints it; ``natural_text`` is ignored (counts are separate fields)."""
+
+    rule_id: int
+    rule_nl: str
+    positive_count: int
+    negative_count: int
     keywords: list[str] = Field(default_factory=list)
+    events: list[_EngineEvent] = Field(default_factory=list)
 
 
 class _EngineOutput(BaseModel):
@@ -145,14 +163,6 @@ async def run_engine(
         raise NoesisRecallError("recall_engine_bad_output") from error
 
 
-def _with_counts(text: str, positive: int, negative: int) -> str:
-    """Same rule as the engine's ``_nl_with_counts``: append the counts unless the text already has them."""
-    text = text.strip()
-    if text and ("正例" in text or "反例" in text):
-        return text
-    return f"{text}（正例 {positive} 个，反例 {negative} 个）"
-
-
 def _build_polish_client(llm_config: Any, config: Any) -> Any | None:
     """Chat client on the resolved Noesis LLM; None (= keyword fallback) when it cannot be built."""
     provider, model, base_url, api_key = _resolve_llm_spec(resolve_noesis_llm(llm_config, config))
@@ -180,8 +190,36 @@ async def _polish_sentence(client: Any | None, keywords: list[str]) -> str | Non
     try:
         return await asyncio.wait_for(asyncio.to_thread(invoke), _POLISH_TIMEOUT_SECONDS) or None
     except Exception as error:
-        logger.warning("noesis recall polish failed (%s), keeping keyword text", type(error).__name__)
+        logger.warning("noesis recall polish failed (%s), keeping keyword text (polished=false)", type(error).__name__)
         return None
+
+
+_ENGINE_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2}) (?=\d)")
+
+
+def _iso_time(value: str | None) -> str | None:
+    """Engine times are ``2026-08-20 13:40:00+00:00``; hand out the ISO ``T`` form. Anything else stays as is."""
+    return _ENGINE_TIME.sub(r"\1T", value) if value else value
+
+
+def _public_rule(rule: _EngineRule, text: str, *, polished: bool) -> RecallRule:
+    return RecallRule(
+        rule_id=rule.rule_id,
+        text=text,
+        polished=polished,
+        positive_count=rule.positive_count,
+        negative_count=rule.negative_count,
+        events=[
+            RecallEvent(
+                event_id=event.event_id,
+                time=_iso_time(event.event_time),
+                text=event.restored,
+                source_text=event.source_text,
+                tree=event.tree,
+            )
+            for event in rule.events
+        ],
+    )
 
 
 async def polish_rules(rules: list[_EngineRule], *, llm_config: Any, config: Any) -> list[RecallRule]:
@@ -192,14 +230,10 @@ async def polish_rules(rules: list[_EngineRule], *, llm_config: Any, config: Any
         except Exception as error:
             logger.warning("noesis recall polish client unavailable (%s)", type(error).__name__)
     sentences = await asyncio.gather(*(_polish_sentence(client, rule.keywords) for rule in rules))
-    polished: list[RecallRule] = []
-    for rule, sentence in zip(rules, sentences, strict=True):
-        data = rule.model_dump(exclude={"keywords"})
-        if sentence:
-            data["rule_nl"] = sentence
-            data["natural_text"] = _with_counts(sentence, rule.positive_count, rule.negative_count)
-        polished.append(RecallRule.model_validate(data))
-    return polished
+    return [
+        _public_rule(rule, sentence or rule.rule_nl, polished=bool(sentence))
+        for rule, sentence in zip(rules, sentences, strict=True)
+    ]
 
 
 async def recall_rules(
@@ -208,4 +242,16 @@ async def recall_rules(
     if not atom_ids:
         return NoesisRecallResult(atom_ids=[], rules=[])
     rules = await run_engine(atom_ids, query, top_n=top_n, restore_limit=restore_limit, config=config)
+    # A rule with no positive example carries no evidence for the caller (and a polished sentence would hide
+    # that), so it is dropped; hence the result may hold fewer than top_n rules. atom_ids still says whether
+    # the query matched any atoms (include=atom_ids).
+    rules = [rule for rule in rules if rule.positive_count > 0]
     return NoesisRecallResult(atom_ids=atom_ids, rules=await polish_rules(rules, llm_config=llm_config, config=config))
+
+
+def select_debug_fields(rules: list[RecallRule], include: list[str]) -> list[RecallRule]:
+    """Copies of ``rules`` where events keep ``source_text`` / ``tree`` only if requested via ``include``."""
+    drop = {name: None for name in ("source_text", "tree") if name not in include}
+    return [
+        rule.model_copy(update={"events": [event.model_copy(update=drop) for event in rule.events]}) for rule in rules
+    ]

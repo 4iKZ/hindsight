@@ -22,6 +22,7 @@ from hindsight_api.engine.retain.noesis_recall import (
     NoesisRecallUnavailableError,
     RecallEvent,
     RecallRule,
+    _EngineEvent,
     _EngineRule,
 )
 from hindsight_api.extensions import AuthenticationError, OperationValidationError
@@ -92,7 +93,7 @@ async def test_engine_success_parses_rules(engine_dir):
     assert (rule.rule_id, rule.positive_count, rule.negative_count) == (7, 2, 0)
     assert rule.keywords == ["甲", "乙"]
     assert rule.events == [
-        RecallEvent(event_id=169, event_time="2027-09-30", restored="还原。", source_text="原文", tree=["行"])
+        _EngineEvent(event_id=169, event_time="2027-09-30", restored="还原。", source_text="原文", tree=["行"])
     ]
 
 
@@ -142,7 +143,6 @@ def engine_rule(**overrides):
     data = {
         "rule_id": 7,
         "rule_nl": "甲，乙",
-        "natural_text": "甲，乙（正例 2 个，反例 1 个）",
         "positive_count": 2,
         "negative_count": 1,
         "keywords": ["甲", "乙"],
@@ -168,42 +168,89 @@ async def polish(monkeypatch, rules, client):
     return await noesis_recall.polish_rules(rules, llm_config=llm_config(), config=noesis_config())
 
 
-async def test_polish_replaces_sentence_and_adds_counts(monkeypatch):
+async def test_polish_replaces_sentence_and_marks_polished(monkeypatch):
     client = FakeClient()
     (rule,) = await polish(monkeypatch, [engine_rule()], client)
-    assert rule.rule_nl == "甲导致乙。"
-    assert rule.natural_text == "甲导致乙。（正例 2 个，反例 1 个）"
-    assert not hasattr(rule, "keywords")
+    assert (rule.text, rule.polished) == ("甲导致乙。", True)
+    assert (rule.positive_count, rule.negative_count) == (2, 1)
+    assert not hasattr(rule, "keywords") and not hasattr(rule, "natural_text")
     system, human = client.calls[0]
     assert system[0] == "system" and "技术表达助手" in system[1]
     assert human == ("human", "关键词：甲，乙")
 
 
-async def test_polish_does_not_duplicate_counts(monkeypatch):
-    (rule,) = await polish(monkeypatch, [engine_rule()], FakeClient("共 2 个正例，1 个反例"))
-    assert rule.natural_text == "共 2 个正例，1 个反例"
-
-
 @pytest.mark.parametrize(
     "client", [FakeClient(error=RuntimeError("down")), FakeClient(reply=""), None], ids=["error", "empty", "no-client"]
 )
-async def test_polish_failure_keeps_keyword_text(monkeypatch, client):
+async def test_polish_failure_keeps_keyword_text_and_marks_unpolished(monkeypatch, client):
     (rule,) = await polish(monkeypatch, [engine_rule()], client)
-    assert (rule.rule_nl, rule.natural_text) == ("甲，乙", "甲，乙（正例 2 个，反例 1 个）")
+    assert (rule.text, rule.polished) == ("甲，乙", False)
 
 
-async def test_polish_timeout_keeps_keyword_text(monkeypatch):
+async def test_polish_timeout_keeps_keyword_text_and_marks_unpolished(monkeypatch):
     monkeypatch.setattr(noesis_recall, "_POLISH_TIMEOUT_SECONDS", 0.2)
     (rule,) = await polish(monkeypatch, [engine_rule()], FakeClient(delay=1.0))
-    assert rule.rule_nl == "甲，乙"
+    assert (rule.text, rule.polished) == ("甲，乙", False)
+
+
+def test_polish_timeout_is_forty_seconds():
+    assert noesis_recall._POLISH_TIMEOUT_SECONDS == 40
 
 
 async def test_polish_skips_rules_without_keywords_and_is_per_rule(monkeypatch):
     client = FakeClient()
     rules = [engine_rule(rule_id=1, keywords=[]), engine_rule(rule_id=2)]
     first, second = await polish(monkeypatch, rules, client)
-    assert (first.rule_nl, second.rule_nl) == ("甲，乙", "甲导致乙。")
+    assert [(first.text, first.polished), (second.text, second.polished)] == [("甲，乙", False), ("甲导致乙。", True)]
     assert len(client.calls) == 1
+
+
+async def recall_with_engine_rules(monkeypatch, rules):
+    monkeypatch.setattr(noesis_recall, "run_engine", AsyncMock(return_value=rules))
+    monkeypatch.setattr(noesis_recall, "_build_polish_client", lambda llm, cfg: FakeClient())
+    return await noesis_recall.recall_rules(
+        [3, 5], "q", top_n=3, restore_limit=5, llm_config=llm_config(), config=noesis_config()
+    )
+
+
+async def test_recall_rules_drops_rules_without_positive_examples(monkeypatch):
+    rules = [engine_rule(rule_id=1, positive_count=0, negative_count=0), engine_rule(rule_id=2)]
+    result = await recall_with_engine_rules(monkeypatch, rules)
+    assert [rule.rule_id for rule in result.rules] == [2]
+    assert result.atom_ids == [3, 5]  # the atoms matched even if no rule had evidence
+
+
+async def test_recall_rules_keeps_rules_when_no_events_were_restored(monkeypatch):
+    # restore_limit=0 yields events=[] for every rule; only the positive count says a rule has evidence.
+    result = await recall_with_engine_rules(monkeypatch, [engine_rule(events=[])])
+    assert [(rule.rule_id, rule.events) for rule in result.rules] == [(7, [])]
+
+
+async def test_polish_maps_events_to_public_names_and_iso_time(monkeypatch):
+    events = [
+        {
+            "event_id": 1,
+            "event_time": "2026-08-20 13:40:00+00:00",
+            "restored": "还原一。",
+            "source_text": "原文",
+            "tree": ["行"],
+        },
+        {"event_id": 2, "event_time": "2027-09-30", "restored": "还原二。"},
+        {"event_id": 3, "event_time": "not a time", "restored": "还原三。"},
+        {"event_id": 4, "event_time": None, "restored": "还原四。"},
+        {"event_id": 5, "event_time": "2026-08-21 01:02:03", "restored": "还原五。"},
+    ]
+    (rule,) = await polish(monkeypatch, [engine_rule(events=events)], FakeClient())
+    assert [event.time for event in rule.events] == [
+        "2026-08-20T13:40:00+00:00",
+        "2027-09-30",
+        "not a time",
+        None,
+        "2026-08-21T01:02:03",
+    ]
+    assert rule.events[0] == RecallEvent(
+        event_id=1, time="2026-08-20T13:40:00+00:00", text="还原一。", source_text="原文", tree=["行"]
+    )
 
 
 async def test_polish_with_no_rules_builds_no_client(monkeypatch):
@@ -242,7 +289,7 @@ def test_polish_client_uses_low_effort_on_glm(monkeypatch):
     assert noesis_recall._build_polish_client(glm_llm(), noesis_config()) is not None
     assert "extra_body" not in captured["spec"]
     assert captured["kwargs"] == {"api_key": "k", "temperature": 0}
-    assert captured["bind"] == {"max_tokens": 2048, "timeout": 20, "reasoning_effort": "low"}
+    assert captured["bind"] == {"max_tokens": 2048, "timeout": 40, "reasoning_effort": "low"}
 
 
 def test_polish_client_leaves_other_providers_alone(monkeypatch):
@@ -277,7 +324,7 @@ async def test_recall_rules_runs_engine_then_polish(engine_dir, monkeypatch):
         [3, 5], "ok", top_n=3, restore_limit=5, llm_config=llm_config(), config=recall_config(engine_dir)
     )
     assert result.atom_ids == [3, 5]
-    assert [rule.rule_nl for rule in result.rules] == ["甲导致乙。"]
+    assert [(rule.text, rule.polished) for rule in result.rules] == [("甲导致乙。", True)]
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +370,19 @@ async def test_engine_method_gates_before_any_llm_call(monkeypatch, kwargs, erro
         )
 
 
+def test_select_debug_fields_filters_without_mutating():
+    event = RecallEvent(event_id=1, time="t", text="还原。", source_text="原文", tree=["行"])
+    rule = RecallRule(rule_id=7, text="甲", polished=True, positive_count=1, negative_count=0, events=[event])
+    none, only_tree, both = (
+        noesis_recall.select_debug_fields([rule], include)[0].events[0]
+        for include in ([], ["tree"], ["source_text", "tree"])
+    )
+    assert (none.source_text, none.tree) == (None, None)
+    assert (only_tree.source_text, only_tree.tree) == (None, ["行"])
+    assert (both.source_text, both.tree) == ("原文", ["行"])
+    assert (event.source_text, event.tree) == ("原文", ["行"])  # the input rule is untouched
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -330,7 +390,7 @@ async def test_engine_method_gates_before_any_llm_call(monkeypatch, kwargs, erro
 
 def test_request_defaults_and_bounds():
     body = NoesisRecallRequest(query="磁盘写满")
-    assert (body.top_n, body.restore_limit) == (3, 5)
+    assert (body.top_n, body.restore_limit, body.include) == (3, 5, [])
     for bad in (
         {"query": " "},
         {"query": "x" * 2001},
@@ -338,6 +398,7 @@ def test_request_defaults_and_bounds():
         {"query": "q", "top_n": 11},
         {"query": "q", "restore_limit": -1},
         {"query": "q", "restore_limit": 21},
+        {"query": "q", "include": ["everything"]},
     ):
         with pytest.raises(ValueError):
             NoesisRecallRequest(**bad)
@@ -354,33 +415,75 @@ async def http_post(engine, body):
         return await client.post("/v1/default/banks/bank/noesis/recall", json=body)
 
 
-async def test_http_success_shape(http_engine):
+def sample_result():
     rule = RecallRule(
         rule_id=7,
-        rule_nl="甲导致乙。",
-        natural_text="甲导致乙。（正例 2 个，反例 0 个）",
+        text="甲导致乙。",
+        polished=True,
         positive_count=2,
         negative_count=0,
-        events=[RecallEvent(event_id=169, event_time="2027-09-30", restored="还原。", source_text="原文", tree=["行"])],
+        events=[RecallEvent(event_id=169, time="2027-09-30", text="还原。", source_text="原文", tree=["行"])],
     )
-    http_engine.recall_noesis.return_value = NoesisRecallResult(atom_ids=[3, 5], rules=[rule])
+    return NoesisRecallResult(atom_ids=[3, 5], rules=[rule])
+
+
+async def test_http_default_response_is_slim(http_engine):
+    http_engine.recall_noesis.return_value = sample_result()
     response = await http_post(http_engine, {"query": "磁盘写满", "top_n": 2, "restore_limit": 1})
     assert response.status_code == 200
     assert response.json() == {
-        "query": "磁盘写满",
-        "count": 1,
-        "atom_ids": [3, 5],
-        "rules": [rule.model_dump()],
+        "results": [
+            {
+                "rule_id": 7,
+                "text": "甲导致乙。",
+                "polished": True,
+                "positive_count": 2,
+                "negative_count": 0,
+                "events": [{"event_id": 169, "time": "2027-09-30", "text": "还原。"}],
+            }
+        ]
     }
     assert http_engine.recall_noesis.call_args.kwargs["top_n"] == 2
     assert http_engine.recall_noesis.call_args.kwargs["restore_limit"] == 1
 
 
-async def test_http_no_match_is_200_with_empty_rules(http_engine):
+async def test_http_unpolished_rule_is_flagged(http_engine):
+    result = sample_result()
+    result.rules[0].text, result.rules[0].polished = "甲，乙", False
+    http_engine.recall_noesis.return_value = result
+    body = (await http_post(http_engine, {"query": "q"})).json()
+    assert (body["results"][0]["text"], body["results"][0]["polished"]) == ("甲，乙", False)
+
+
+@pytest.mark.parametrize(
+    "include,event_extra,atom_ids",
+    [
+        (["source_text"], {"source_text": "原文"}, None),
+        (["tree"], {"tree": ["行"]}, None),
+        (["atom_ids"], {}, [3, 5]),
+        (["source_text", "tree", "atom_ids"], {"source_text": "原文", "tree": ["行"]}, [3, 5]),
+    ],
+)
+async def test_http_include_opts_in_debug_fields(http_engine, include, event_extra, atom_ids):
+    http_engine.recall_noesis.return_value = sample_result()
+    body = (await http_post(http_engine, {"query": "q", "include": include})).json()
+    assert body["results"][0]["events"] == [{"event_id": 169, "time": "2027-09-30", "text": "还原。", **event_extra}]
+    assert body.get("atom_ids") == atom_ids
+
+
+async def test_http_event_without_time_omits_the_key(http_engine):
+    result = sample_result()
+    result.rules[0].events[0].time = None
+    http_engine.recall_noesis.return_value = result
+    body = (await http_post(http_engine, {"query": "q"})).json()
+    assert body["results"][0]["events"] == [{"event_id": 169, "text": "还原。"}]
+
+
+async def test_http_no_match_is_200_with_empty_results(http_engine):
     http_engine.recall_noesis.return_value = NoesisRecallResult(atom_ids=[], rules=[])
     response = await http_post(http_engine, {"query": "你好"})
     assert response.status_code == 200
-    assert response.json() == {"query": "你好", "count": 0, "atom_ids": [], "rules": []}
+    assert response.json() == {"results": []}
 
 
 @pytest.mark.parametrize(
@@ -403,7 +506,16 @@ async def test_http_error_mapping(http_engine, error, status, detail):
         assert response.json()["detail"] == detail
 
 
-@pytest.mark.parametrize("body", [{}, {"query": " "}, {"query": "q", "top_n": 0}, {"query": "q", "restore_limit": 99}])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"query": " "},
+        {"query": "q", "top_n": 0},
+        {"query": "q", "restore_limit": 99},
+        {"query": "q", "include": ["x"]},
+    ],
+)
 async def test_http_validation_does_not_call_engine(http_engine, body):
     response = await http_post(http_engine, body)
     assert response.status_code == 422
