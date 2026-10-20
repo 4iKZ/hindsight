@@ -156,6 +156,9 @@ async def test_retain_batch_passes_operation_and_document_ids(memory, request_co
 def _hermes_kwargs_payload(occurred_at: str) -> dict:
     """Invoke Hermes's real payload builder in its own project environment."""
     hermes_root = Path(__file__).resolve().parents[3] / "hermes-agent"
+    # The wxs-noesis workspace no longer vendors Hermes; run this contract only where a checkout sits beside us.
+    if not hermes_root.is_dir():
+        pytest.skip(f"Hermes checkout not found at {hermes_root}")
     script = f"""
 import json
 from plugins.memory.hindsight import HindsightMemoryProvider
