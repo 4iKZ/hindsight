@@ -105,7 +105,7 @@ dependencies = [
 hypergraph = [
     # Requirement-01 authoritative Noesis contract. Production resolution is
     # immutable and intentionally has no sibling editable source override.
-    "hyperextract @ git+https://github.com/4iKZ/Hyper-Extract.git@64c3bd4b21c67a3a581263441feb7ee79702887f",
+    "hyperextract @ git+https://github.com/4iKZ/Hyper-Extract.git@2ce493fe8ec6f4d460f2ecbac3b9c2d9891f66d1",
 ]
 local-ml = [
     # Local ML models for embeddings/reranking
